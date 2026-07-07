@@ -5651,11 +5651,11 @@ func (wh *WorkflowHandler) StartBatchOperation(
 		return nil, errBatchAPINotAllowed
 	}
 
-	if !wh.config.EnableBatchActivityOperators(request.Namespace) {
-		switch op := request.Operation.(type) {
-		case *workflowservice.StartBatchOperationRequest_TerminateActivitiesOperation,
-			*workflowservice.StartBatchOperationRequest_DeleteActivitiesOperation,
-			*workflowservice.StartBatchOperationRequest_CancelActivitiesOperation:
+	switch op := request.Operation.(type) {
+	case *workflowservice.StartBatchOperationRequest_TerminateActivitiesOperation,
+		*workflowservice.StartBatchOperationRequest_DeleteActivitiesOperation,
+		*workflowservice.StartBatchOperationRequest_CancelActivitiesOperation:
+		if !wh.config.EnableBatchActivityOperators(request.Namespace) || !wh.IsStandaloneActivityEnabled(request.Namespace) {
 			return nil, serviceerror.NewInvalidArgumentf("The operation type %T is not supported for this namespace", op)
 		}
 	}
@@ -5782,6 +5782,13 @@ func (wh *WorkflowHandler) StartBatchOperation(
 			batcher.BatchOperationVisibilityQueryMemo: payload.EncodeString(visibilityQuery),
 		},
 	}
+	if executions := batchOperationExecutionsFromRequest(request); len(executions) > 0 {
+		executionsPayload, err := payload.Encode(executions)
+		if err != nil {
+			return nil, err
+		}
+		memo.Fields[batcher.BatchOperationExecutionsMemo] = executionsPayload
+	}
 
 	// Add predefined search attributes
 	var searchAttributes *commonpb.SearchAttributes
@@ -5857,6 +5864,30 @@ func snakeCaseBatchType(batchType enumspb.BatchOperationType) string {
 	default:
 		return ""
 	}
+}
+
+// batchOperationExecutionsFromRequest normalizes the explicit target executions
+// on a batch request (if any) into the unified Execution representation used by
+// DescribeBatchOperation. It prefers ArchetypeExecutions and falls back to the
+// deprecated Executions field, converting WorkflowExecution to Execution.
+func batchOperationExecutionsFromRequest(request *workflowservice.StartBatchOperationRequest) []*commonpb.Execution {
+	if archetypeExecutions := request.GetArchetypeExecutions(); len(archetypeExecutions) > 0 {
+		return archetypeExecutions
+	}
+	//nolint:staticcheck // SA1019: Executions is deprecated but still needed for backward compatibility
+	executions := request.GetExecutions()
+	if len(executions) == 0 {
+		return nil
+	}
+	result := make([]*commonpb.Execution, 0, len(executions))
+	for _, execution := range executions {
+		result = append(result, &commonpb.Execution{
+			Type:       enumspb.EXECUTION_TYPE_WORKFLOW,
+			BusinessId: execution.GetWorkflowId(),
+			RunId:      execution.GetRunId(),
+		})
+	}
+	return result
 }
 
 func (wh *WorkflowHandler) StopBatchOperation(
@@ -5943,7 +5974,6 @@ func (wh *WorkflowHandler) DescribeBatchOperation(
 	executionInfo := resp.GetWorkflowExecutionInfo()
 	operationState := getBatchOperationState(executionInfo.GetStatus())
 	memo := executionInfo.GetMemo().GetFields()
-	typePayload := memo[batcher.BatchOperationTypeMemo]
 	operationReason := memo[batcher.BatchReasonMemo]
 	var reason string
 	err = payload.Decode(operationReason, &reason)
@@ -5956,14 +5986,19 @@ func (wh *WorkflowHandler) DescribeBatchOperation(
 	if err != nil {
 		return nil, err
 	}
-	var operationTypeString string
-	err = payload.Decode(typePayload, &operationTypeString)
-	if err != nil {
-		return nil, err
-	}
-	operationType := batchOperationTypeFromString(operationTypeString)
-	if operationType == enumspb.BATCH_OPERATION_TYPE_UNSPECIFIED {
-		wh.throttledLogger.Warn("Unknown batch operation type", tag.String("batch-operation-type", operationTypeString))
+	// Batch operations started before the operation type was recorded in the
+	// memo do not have this field, so they default to the zero value
+	// BATCH_OPERATION_TYPE_UNSPECIFIED.
+	var operationType enumspb.BatchOperationType
+	if typePayload, ok := memo[batcher.BatchOperationTypeMemo]; ok {
+		var operationTypeString string
+		if err = payload.Decode(typePayload, &operationTypeString); err != nil {
+			return nil, err
+		}
+		operationType = batchOperationTypeFromString(operationTypeString)
+		if operationType == enumspb.BATCH_OPERATION_TYPE_UNSPECIFIED {
+			wh.throttledLogger.Warn("Unknown batch operation type", tag.String("batch-operation-type", operationTypeString))
+		}
 	}
 
 	// The visibility query is recorded in the memo at start time. Batch operations
@@ -5972,6 +6007,15 @@ func (wh *WorkflowHandler) DescribeBatchOperation(
 	var visibilityQuery string
 	if queryPayload, ok := memo[batcher.BatchOperationVisibilityQueryMemo]; ok {
 		if err = payload.Decode(queryPayload, &visibilityQuery); err != nil {
+			return nil, err
+		}
+	}
+
+	// The explicit target executions are recorded in the memo at start time for
+	// batch operations started by execution list rather than visibility query.
+	var executions []*commonpb.Execution
+	if executionsPayload, ok := memo[batcher.BatchOperationExecutionsMemo]; ok {
+		if err = payload.Decode(executionsPayload, &executions); err != nil {
 			return nil, err
 		}
 	}
@@ -5985,6 +6029,7 @@ func (wh *WorkflowHandler) DescribeBatchOperation(
 		Identity:      identity,
 		Reason:        reason,
 		Query:         visibilityQuery,
+		Executions:    executions,
 	}
 	if executionInfo.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED {
 		stats, err := wh.getCompletedBatchOperationStats(memo)
