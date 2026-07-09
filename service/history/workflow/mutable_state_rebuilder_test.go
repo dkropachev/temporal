@@ -12,14 +12,18 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/chasm"
+	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/definition"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
@@ -2184,6 +2188,8 @@ func (s *stateBuilderSuite) TestApplyEvents_HSMRegistry() {
 	}
 	s.mockMutableState.EXPECT().ClearStickyTaskQueue()
 	s.mockUpdateVersion(event)
+	// CHASM disabled -> the create event is routed to the HSM tree (legacy behavior).
+	s.mockMutableState.EXPECT().ChasmEnabled().Return(false).AnyTimes()
 
 	_, err := s.stateRebuilder.ApplyEvents(context.Background(), tests.NamespaceID, requestID, execution, s.toHistory(event), nil, "")
 	s.NoError(err)
@@ -2191,6 +2197,56 @@ func (s *stateBuilderSuite) TestApplyEvents_HSMRegistry() {
 	sm, err := nexusoperations.MachineCollection(s.mockMutableState.HSM()).Data("5")
 	s.NoError(err)
 	s.Equal(enumsspb.NEXUS_OPERATION_STATE_SCHEDULED, sm.State())
+}
+
+// TestApplyEvents_NexusScheduled_ChasmCreateSurfacesError verifies that when the creation-policy flag
+// is ON, rebuild commits to the CHASM tree and surfaces a failure to create the op there rather than
+// silently falling back to the HSM tree. Rebuild picks a framework by dynamic config; it is not an
+// error-fallback, so a CHASM failure must fail the rebuild instead of producing an HSM op.
+func (s *stateBuilderSuite) TestApplyEvents_NexusScheduled_ChasmCreateSurfacesError() {
+	version := int64(1)
+	requestID := uuid.NewString()
+	execution := &commonpb.WorkflowExecution{
+		WorkflowId: "wf-id",
+		RunId:      tests.RunID,
+	}
+	event := &historypb.HistoryEvent{
+		TaskId:    rand.Int63(),
+		Version:   version,
+		EventId:   5,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED,
+		Attributes: &historypb.HistoryEvent_NexusOperationScheduledEventAttributes{
+			NexusOperationScheduledEventAttributes: &historypb.NexusOperationScheduledEventAttributes{
+				EndpointId:                   "endpoint-id",
+				Endpoint:                     "endpoint",
+				Service:                      "service",
+				Operation:                    "operation",
+				WorkflowTaskCompletedEventId: 4,
+				RequestId:                    "request-id",
+			},
+		},
+	}
+
+	// Flag ON + a non-nil CHASM workflow registry so the create is routed to the CHASM tree.
+	s.mockShard.GetConfig().EnableChasmNexusWorkflowOperations = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true)
+	s.mockShard.SetChasmWorkflowRegistry(chasmworkflow.NewRegistry())
+
+	// Only expect the calls that run before the state-rebuild fails; the terminal task-generation and
+	// history-builder calls (set up by mockUpdateVersion) are never reached because the op create errors.
+	s.mockMutableState.EXPECT().ClearStickyTaskQueue().AnyTimes()
+	s.mockMutableState.EXPECT().UpdateCurrentVersion(gomock.Any(), true).AnyTimes()
+	s.mockMutableState.EXPECT().ChasmEnabled().Return(true).AnyTimes()
+	s.mockMutableState.EXPECT().GetNamespaceEntry().Return(tests.GlobalNamespaceEntry).AnyTimes()
+	s.mockMutableState.EXPECT().EnsureChasmWorkflowComponent(gomock.Any()).AnyTimes()
+	s.mockMutableState.EXPECT().ChasmWorkflowComponent(gomock.Any()).
+		Return(nil, nil, serviceerror.NewInternal("chasm unavailable")).AnyTimes()
+
+	_, err := s.stateRebuilder.ApplyEvents(context.Background(), tests.NamespaceID, requestID, execution, s.toHistory(event), nil, "")
+	s.Error(err)
+	// The op must NOT have been created in the HSM tree (no error-fallback).
+	_, hsmErr := nexusoperations.MachineCollection(s.mockMutableState.HSM()).Data("5")
+	s.Error(hsmErr)
 }
 
 func (p *testTaskGeneratorProvider) NewTaskGenerator(
@@ -2208,4 +2264,219 @@ func (p *testTaskGeneratorProvider) NewTaskGenerator(
 		shardContext.GetArchivalMetadata(),
 		shardContext.GetLogger(),
 	)
+}
+
+// --- applyStateMachineEvent (HSM<->CHASM dispatch) coverage -------------------------------------
+//
+// These exercise the probe-and-fallback dispatch added for rebuilding Nexus operations that may live
+// in either the HSM or CHASM tree.
+
+type fakeChasmEventDefinition struct {
+	eventType enumspb.EventType
+	applyErr  error
+	applied   *bool
+}
+
+func (d *fakeChasmEventDefinition) Type() enumspb.EventType     { return d.eventType }
+func (d *fakeChasmEventDefinition) IsWorkflowTaskTrigger() bool { return false }
+func (d *fakeChasmEventDefinition) Apply(chasm.MutableContext, *chasmworkflow.Workflow, *historypb.HistoryEvent) error {
+	if d.applied != nil {
+		*d.applied = true
+	}
+	return d.applyErr
+}
+
+func (d *fakeChasmEventDefinition) CherryPick(chasm.MutableContext, *chasmworkflow.Workflow, *historypb.HistoryEvent, map[enumspb.ResetReapplyExcludeType]struct{}) error {
+	return nil
+}
+
+type fakeChasmLibrary struct {
+	defs []chasmworkflow.EventDefinition
+}
+
+func (l fakeChasmLibrary) CommandHandlers() map[enumspb.CommandType]chasmworkflow.CommandHandler {
+	return nil
+}
+
+func (l fakeChasmLibrary) EventDefinitions() []chasmworkflow.EventDefinition { return l.defs }
+
+func newFakeChasmRegistry(def *fakeChasmEventDefinition) *chasmworkflow.Registry {
+	reg := chasmworkflow.NewRegistry()
+	var defs []chasmworkflow.EventDefinition
+	if def != nil {
+		defs = append(defs, def)
+	}
+	_ = reg.Register(fakeChasmLibrary{defs: defs})
+	return reg
+}
+
+type fakeHSMEventDefinition struct {
+	eventType enumspb.EventType
+	applyErr  error
+	applied   *bool
+}
+
+func (d *fakeHSMEventDefinition) Type() enumspb.EventType     { return d.eventType }
+func (d *fakeHSMEventDefinition) IsWorkflowTaskTrigger() bool { return false }
+func (d *fakeHSMEventDefinition) Apply(*hsm.Node, *historypb.HistoryEvent) error {
+	if d.applied != nil {
+		*d.applied = true
+	}
+	return d.applyErr
+}
+
+func (d *fakeHSMEventDefinition) CherryPick(*hsm.Node, *historypb.HistoryEvent, map[enumspb.ResetReapplyExcludeType]struct{}) error {
+	return nil
+}
+
+func newFakeHSMRegistry(def *fakeHSMEventDefinition) *hsm.Registry {
+	reg := hsm.NewRegistry()
+	if def != nil {
+		_ = reg.RegisterEventDefinition(def)
+	}
+	return reg
+}
+
+type nexusRebuildCase struct {
+	chasmEnabled      bool
+	flagOn            bool
+	chasmHasDef       bool
+	hsmApplyErr       error
+	chasmApplyErr     error
+	chasmComponentErr error
+}
+
+// runApplyStateMachineEvent wires fake HSM/CHASM registries onto the shard, drives applyStateMachineEvent for the given
+// event, and reports which tree's Apply ran plus the returned error.
+func (s *stateBuilderSuite) runApplyStateMachineEvent(
+	event *historypb.HistoryEvent,
+	tc nexusRebuildCase,
+) (chasmApplied bool, hsmApplied bool, err error) {
+	s.mockShard.SetStateMachineRegistry(newFakeHSMRegistry(&fakeHSMEventDefinition{
+		eventType: event.GetEventType(),
+		applyErr:  tc.hsmApplyErr,
+		applied:   &hsmApplied,
+	}))
+	var def *fakeChasmEventDefinition
+	if tc.chasmHasDef {
+		def = &fakeChasmEventDefinition{
+			eventType: event.GetEventType(),
+			applyErr:  tc.chasmApplyErr,
+			applied:   &chasmApplied,
+		}
+	}
+	s.mockShard.SetChasmWorkflowRegistry(newFakeChasmRegistry(def))
+	s.mockShard.GetConfig().EnableChasmNexusWorkflowOperations = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(tc.flagOn)
+
+	ms := historyi.NewMockMutableState(s.controller)
+	ms.EXPECT().HSM().Return(nil).AnyTimes()
+	ms.EXPECT().ChasmEnabled().Return(tc.chasmEnabled).AnyTimes()
+	ms.EXPECT().GetNamespaceEntry().Return(tests.GlobalNamespaceEntry).AnyTimes()
+	ms.EXPECT().EnsureChasmWorkflowComponent(gomock.Any()).AnyTimes()
+	ms.EXPECT().ChasmWorkflowComponent(gomock.Any()).
+		Return(&chasmworkflow.Workflow{}, nil, tc.chasmComponentErr).AnyTimes()
+
+	rebuilder := NewMutableStateRebuilder(s.mockShard, s.logger, ms)
+	err = rebuilder.applyStateMachineEvent(context.Background(), event)
+	return chasmApplied, hsmApplied, err
+}
+
+func nexusScheduledEvent() *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{EventId: 5, EventType: enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED}
+}
+
+func nexusCompletedEvent() *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{EventId: 6, EventType: enumspb.EVENT_TYPE_NEXUS_OPERATION_COMPLETED}
+}
+
+func (s *stateBuilderSuite) TestApplyStateMachineEvent() {
+	hsmErr := serviceerror.NewInternal("hsm apply failed")
+	chasmErr := serviceerror.NewInternal("chasm unavailable")
+
+	testCases := []struct {
+		name             string
+		event            *historypb.HistoryEvent
+		tc               nexusRebuildCase
+		wantChasmApplied bool
+		wantHSMApplied   bool
+		wantErr          error
+		wantAnyErr       bool
+	}{
+		{
+			name:             "nexus scheduled, flag on, creates in chasm",
+			event:            nexusScheduledEvent(),
+			tc:               nexusRebuildCase{chasmEnabled: true, flagOn: true, chasmHasDef: true},
+			wantChasmApplied: true,
+		},
+		{
+			name:           "nexus scheduled, flag off, routes to hsm",
+			event:          nexusScheduledEvent(),
+			tc:             nexusRebuildCase{chasmEnabled: true, flagOn: false, chasmHasDef: true},
+			wantHSMApplied: true,
+		},
+		{
+			name:           "nexus scheduled, chasm disabled, routes to hsm",
+			event:          nexusScheduledEvent(),
+			tc:             nexusRebuildCase{chasmEnabled: false, flagOn: true, chasmHasDef: true},
+			wantHSMApplied: true,
+		},
+		{
+			// Flag on selects the CHASM tree; if CHASM doesn't own the event there is no HSM
+			// error-fallback, so the rebuild fails rather than creating the op in HSM.
+			name:       "nexus scheduled, flag on, chasm does not claim, errors without hsm fallback",
+			event:      nexusScheduledEvent(),
+			tc:         nexusRebuildCase{chasmEnabled: true, flagOn: true, chasmHasDef: false},
+			wantAnyErr: true,
+		},
+		{
+			// Flag on selects the CHASM tree; a CHASM apply error is surfaced, not fallen back to HSM.
+			name:    "nexus scheduled, flag on, chasm apply error surfaced without hsm fallback",
+			event:   nexusScheduledEvent(),
+			tc:      nexusRebuildCase{chasmEnabled: true, flagOn: true, chasmHasDef: true, chasmComponentErr: chasmErr},
+			wantErr: chasmErr,
+		},
+		{
+			name:           "non-create, hsm owns and applies",
+			event:          nexusCompletedEvent(),
+			tc:             nexusRebuildCase{chasmEnabled: true, chasmHasDef: true},
+			wantHSMApplied: true,
+		},
+		{
+			name:             "non-create, hsm not found, falls back to chasm",
+			event:            nexusCompletedEvent(),
+			tc:               nexusRebuildCase{chasmEnabled: true, chasmHasDef: true, hsmApplyErr: hsm.ErrStateMachineNotFound},
+			wantChasmApplied: true,
+			wantHSMApplied:   true,
+		},
+		{
+			name:           "non-create, neither tree owns, returns original hsm error",
+			event:          nexusCompletedEvent(),
+			tc:             nexusRebuildCase{chasmEnabled: true, chasmHasDef: false, hsmApplyErr: hsm.ErrStateMachineNotFound},
+			wantHSMApplied: true,
+			wantErr:        hsm.ErrStateMachineNotFound,
+		},
+		{
+			name:           "non-create, non-not-found hsm error returned as-is",
+			event:          nexusCompletedEvent(),
+			tc:             nexusRebuildCase{chasmEnabled: true, chasmHasDef: true, hsmApplyErr: hsmErr},
+			wantHSMApplied: true,
+			wantErr:        hsmErr,
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			chasmApplied, hsmApplied, err := s.runApplyStateMachineEvent(tc.event, tc.tc)
+			switch {
+			case tc.wantErr != nil:
+				s.ErrorIs(err, tc.wantErr)
+			case tc.wantAnyErr:
+				s.Error(err)
+			default:
+				s.NoError(err)
+			}
+			s.Equal(tc.wantChasmApplied, chasmApplied)
+			s.Equal(tc.wantHSMApplied, hsmApplied)
+		})
+	}
 }
