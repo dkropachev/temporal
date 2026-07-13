@@ -34,6 +34,7 @@ import (
 	"go.temporal.io/server/common/persistence"
 	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
+	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/rpc"
 	"go.temporal.io/server/common/searchattribute"
@@ -46,6 +47,7 @@ import (
 	"go.temporal.io/server/common/testing/testtelemetry"
 	"go.temporal.io/server/common/testing/updateutils"
 	"go.temporal.io/server/components/nexusoperations"
+	"go.uber.org/fx"
 )
 
 type (
@@ -103,6 +105,7 @@ type (
 		EnableHistoryTaskRecorder       bool
 		CustomHistoryArchiverFactory    provider.CustomHistoryArchiverFactory
 		CustomVisibilityArchiverFactory provider.CustomVisibilityArchiverFactory
+		ServiceFxOptions                map[primitives.ServiceName][]fx.Option
 	}
 	TestClusterOption func(params *testClusterParams)
 )
@@ -183,6 +186,17 @@ func WithSharedCluster() TestClusterOption {
 func WithCustomHistoryArchiverFactory(factory provider.CustomHistoryArchiverFactory) TestClusterOption {
 	return func(params *testClusterParams) {
 		params.CustomHistoryArchiverFactory = factory
+	}
+}
+
+// WithFxOptionsForService injects additional Fx options into the given service's dependency graph.
+// This implies a dedicated cluster since Fx options cannot be shared across tests.
+func WithFxOptionsForService(service primitives.ServiceName, opts ...fx.Option) TestClusterOption {
+	return func(params *testClusterParams) {
+		if params.ServiceFxOptions == nil {
+			params.ServiceFxOptions = make(map[primitives.ServiceName][]fx.Option)
+		}
+		params.ServiceFxOptions[service] = append(params.ServiceFxOptions[service], opts...)
 	}
 }
 
@@ -313,6 +327,7 @@ func (s *FunctionalTestBase) setupCluster(options ...TestClusterOption) {
 		EnableHistoryTaskRecorder:       params.EnableHistoryTaskRecorder,
 		CustomHistoryArchiverFactory:    params.CustomHistoryArchiverFactory,
 		CustomVisibilityArchiverFactory: params.CustomVisibilityArchiverFactory,
+		ServiceFxOptions:                params.ServiceFxOptions,
 		WorkerConfig:                    WorkerConfig{DisableWorker: !params.EnableWorkerService},
 	}
 
