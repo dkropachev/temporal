@@ -82,6 +82,50 @@ func (s *mapRequestRateLimiterSuite) TestCleanup() {
 	s.Empty(rateLimiter.rateLimiters)
 }
 
+func (s *mapRequestRateLimiterSuite) TestLazyCleanupOnAccess() {
+	rateLimiter := NewMapRequestRateLimiter(
+		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		func(req Request) string { return req.Caller },
+	)
+	rateLimiter.ttlNano = int64(100 * time.Millisecond)
+	rateLimiter.cleanupIntervalNano = int64(50 * time.Millisecond)
+
+	now := time.Now()
+	req1 := Request{Caller: "namespace1"}
+	req2 := Request{Caller: "namespace2"}
+
+	rateLimiter.Allow(now, req1)
+	s.Len(rateLimiter.rateLimiters, 1)
+
+	// A later access past both the cleanup interval and req1's TTL evicts req1
+	// inline, with no background goroutine involved.
+	rateLimiter.Allow(now.Add(200*time.Millisecond), req2)
+	s.Len(rateLimiter.rateLimiters, 1)
+	_, exists := rateLimiter.rateLimiters["namespace1"]
+	s.False(exists)
+	_, exists = rateLimiter.rateLimiters["namespace2"]
+	s.True(exists)
+}
+
+func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
+	rateLimiter := NewMapRequestRateLimiter(
+		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		func(req Request) string { return req.Caller },
+	)
+	rateLimiter.ttlNano = int64(10 * time.Millisecond)
+	rateLimiter.cleanupIntervalNano = int64(time.Hour)
+
+	now := time.Now()
+	req1 := Request{Caller: "namespace1"}
+	req2 := Request{Caller: "namespace2"}
+
+	rateLimiter.Allow(now, req1)
+	// req1 is now past its TTL, but the cleanup interval has not elapsed, so the
+	// next access must not evict it.
+	rateLimiter.Allow(now.Add(50*time.Millisecond), req2)
+	s.Len(rateLimiter.rateLimiters, 2)
+}
+
 func (s *mapRequestRateLimiterSuite) TestAccessRefreshesTTL() {
 	createCount := 0
 	rateLimiter := NewMapRequestRateLimiter(

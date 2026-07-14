@@ -2,7 +2,6 @@ package quotas
 
 import (
 	"context"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,8 +22,10 @@ type (
 	}
 
 	// MapRequestRateLimiterImpl is a generic wrapper rate limiter for a set of rate limiters
-	// identified by a key. It periodically evicts entries that have not been accessed for
-	// longer than the TTL.
+	// identified by a key. It evicts entries that have not been accessed for longer than the
+	// TTL. Eviction is driven lazily by request traffic rather than a background goroutine, so
+	// an idle limiter retains its entries until the next request; this keeps the limiter free
+	// of any lifecycle to stop.
 	MapRequestRateLimiterImpl[K comparable] struct {
 		rateLimiterGenFn RequestRateLimiterFn
 		rateLimiterKeyFn RequestRateLimiterKeyFn[K]
@@ -32,7 +33,9 @@ type (
 		sync.RWMutex
 		rateLimiters map[K]*rateLimiterEntry
 		ttlNano      int64 // TTL in nanoseconds
-		stopCh       chan struct{}
+
+		cleanupIntervalNano int64
+		lastCleanupNano     atomic.Int64
 	}
 )
 
@@ -40,26 +43,13 @@ func NewMapRequestRateLimiter[K comparable](
 	rateLimiterGenFn RequestRateLimiterFn,
 	rateLimiterKeyFn RequestRateLimiterKeyFn[K],
 ) *MapRequestRateLimiterImpl[K] {
-	// Create channel before struct to pass to AddCleanup without capturing r
-	stopCh := make(chan struct{})
-
-	r := &MapRequestRateLimiterImpl[K]{
-		rateLimiterGenFn: rateLimiterGenFn,
-		rateLimiterKeyFn: rateLimiterKeyFn,
-		rateLimiters:     make(map[K]*rateLimiterEntry),
-		ttlNano:          int64(rateLimiterTTL),
-		stopCh:           stopCh,
+	return &MapRequestRateLimiterImpl[K]{
+		rateLimiterGenFn:    rateLimiterGenFn,
+		rateLimiterKeyFn:    rateLimiterKeyFn,
+		rateLimiters:        make(map[K]*rateLimiterEntry),
+		ttlNano:             int64(rateLimiterTTL),
+		cleanupIntervalNano: int64(rateLimiterCleanupInterval),
 	}
-
-	// Start background cleanup goroutine
-	go r.cleanupLoop()
-
-	// Register cleanup to stop goroutine when r is GC'd
-	runtime.AddCleanup(r, func(ch chan struct{}) {
-		close(ch)
-	}, stopCh)
-
-	return r
 }
 
 func namespaceRequestRateLimiterKeyFn(req Request) string {
@@ -107,8 +97,10 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	now time.Time,
 	req Request,
 ) RequestRateLimiter {
-	key := r.rateLimiterKeyFn(req)
 	nowNano := now.UnixNano()
+	r.maybeCleanup(now, nowNano)
+
+	key := r.rateLimiterKeyFn(req)
 
 	r.RLock()
 	entry, ok := r.rateLimiters[key]
@@ -134,17 +126,14 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	return newRateLimiter
 }
 
-func (r *MapRequestRateLimiterImpl[K]) cleanupLoop() {
-	ticker := time.NewTicker(rateLimiterCleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-r.stopCh:
-			return
-		case now := <-ticker.C:
-			r.cleanup(now)
-		}
+// maybeCleanup runs cleanup at most once per cleanup interval. The CompareAndSwap
+// ensures a single caller performs the eviction while concurrent callers proceed
+// without blocking. It must be called before acquiring the map lock, since cleanup
+// takes the lock itself.
+func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time, nowNano int64) {
+	last := r.lastCleanupNano.Load()
+	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
+		r.cleanup(now)
 	}
 }
 
