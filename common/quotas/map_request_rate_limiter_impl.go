@@ -23,9 +23,10 @@ type (
 
 	// MapRequestRateLimiterImpl is a generic wrapper rate limiter for a set of rate limiters
 	// identified by a key. It evicts entries that have not been accessed for longer than the
-	// TTL. Eviction is driven lazily by request traffic rather than a background goroutine, so
-	// an idle limiter retains its entries until the next request; this keeps the limiter free
-	// of any lifecycle to stop.
+	// TTL. Eviction is triggered by request traffic, throttled to once per cleanup interval,
+	// and the sweep runs in a short-lived goroutine so requests are never blocked by it. There
+	// is no long-lived background goroutine, so the limiter needs no lifecycle to stop; an idle
+	// limiter retains its entries until the next request.
 	MapRequestRateLimiterImpl[K comparable] struct {
 		rateLimiterGenFn RequestRateLimiterFn
 		rateLimiterKeyFn RequestRateLimiterKeyFn[K]
@@ -131,15 +132,24 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	return newRateLimiter
 }
 
-// maybeCleanup runs cleanup at most once per cleanup interval. The CompareAndSwap
-// ensures a single caller performs the eviction while concurrent callers proceed
-// without blocking. It must be called before acquiring the map lock, since cleanup
-// takes the lock itself.
+// maybeCleanup triggers a cleanup sweep at most once per cleanup interval. The
+// CompareAndSwap elects a single caller, which runs the O(n) sweep in a short-lived
+// goroutine so the request path is never blocked by it. Winning the CAS advances
+// lastCleanupNano before the sweep starts, so concurrent callers within the interval
+// do not spawn additional sweeps; on panic the sweep is skipped until the next interval.
 func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time, nowNano int64) {
 	last := r.lastCleanupNano.Load()
 	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
-		r.cleanup(now)
+		go r.cleanupAsync(now)
 	}
+}
+
+func (r *MapRequestRateLimiterImpl[K]) cleanupAsync(now time.Time) {
+	// The sweep only touches the in-memory map, so a panic here would signal a
+	// bug rather than a transient fault; recover so it cannot crash the process.
+	// The next interval retries.
+	defer func() { _ = recover() }()
+	r.cleanup(now)
 }
 
 // cleanup uses a two-phase approach to minimize lock contention:

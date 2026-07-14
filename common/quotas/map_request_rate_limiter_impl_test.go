@@ -99,14 +99,17 @@ func (s *mapRequestRateLimiterSuite) TestLazyCleanupOnAccess() {
 	rateLimiter.Allow(now, req1)
 	s.Len(rateLimiter.rateLimiters, 1)
 
-	// A later access past both the cleanup interval and req1's TTL evicts req1
-	// inline, with no background goroutine involved.
+	// A later access past both the cleanup interval and req1's TTL triggers the
+	// eviction sweep, which runs in a short-lived goroutine.
 	rateLimiter.Allow(now.Add(200*time.Millisecond), req2)
-	s.Len(rateLimiter.rateLimiters, 1)
-	_, exists := rateLimiter.rateLimiters["namespace1"]
-	s.False(exists)
-	_, exists = rateLimiter.rateLimiters["namespace2"]
-	s.True(exists)
+
+	s.Eventually(func() bool {
+		rateLimiter.RLock()
+		defer rateLimiter.RUnlock()
+		_, has1 := rateLimiter.rateLimiters["namespace1"]
+		_, has2 := rateLimiter.rateLimiters["namespace2"]
+		return !has1 && has2
+	}, time.Second, time.Millisecond)
 }
 
 func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
@@ -129,27 +132,45 @@ func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
 }
 
 // TestConcurrentAccessAndCleanup drives many goroutines through the access path
-// while cleanup runs on every access (interval 0), exercising the RLock refresh
-// against the write-locked eviction. It guards the changed path against data
-// races; run with -race.
+// (which refreshes lastAccess under the read lock) while a dedicated goroutine
+// runs cleanup (which deletes under the write lock), exercising that interaction.
+// It guards the changed path against data races; run with -race. The cleanup
+// interval is set high so the access path does not also spawn its own sweeps,
+// keeping the concurrency driven by the explicit cleanup goroutine below.
 func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 	rateLimiter := NewMapRequestRateLimiter(
 		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
 		func(req Request) string { return req.Caller },
 	)
 	rateLimiter.ttlNano = int64(time.Millisecond)
-	rateLimiter.cleanupIntervalNano = 0
+	rateLimiter.cleanupIntervalNano = int64(time.Hour)
 
 	const (
 		workers = 8
 		iters   = 5000
 		keys    = 16
 	)
-	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var cleanerWG sync.WaitGroup
+	cleanerWG.Add(1)
+	go func() {
+		defer cleanerWG.Done()
+		base := time.Now()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rateLimiter.cleanup(base.Add(time.Duration(i) * time.Millisecond))
+		}
+	}()
+
+	var accessWG sync.WaitGroup
 	for w := range workers {
-		wg.Add(1)
+		accessWG.Add(1)
 		go func(w int) {
-			defer wg.Done()
+			defer accessWG.Done()
 			now := time.Now()
 			for i := range iters {
 				req := Request{Caller: fmt.Sprintf("ns-%d", (w+i)%keys)}
@@ -157,7 +178,10 @@ func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 			}
 		}(w)
 	}
-	wg.Wait()
+	accessWG.Wait()
+
+	close(stop)
+	cleanerWG.Wait()
 }
 
 func (s *mapRequestRateLimiterSuite) TestAccessRefreshesTTL() {
