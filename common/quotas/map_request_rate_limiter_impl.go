@@ -140,16 +140,15 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time, nowNano int64) {
 	last := r.lastCleanupNano.Load()
 	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
-		go r.cleanupAsync(now)
+		go func() {
+			// recover must run on the sweep's own goroutine. The sweep only
+			// touches the in-memory map, so a panic here signals a bug rather
+			// than a transient fault; recover so it cannot crash the process.
+			// The next interval retries.
+			defer func() { _ = recover() }()
+			r.cleanup(now)
+		}()
 	}
-}
-
-func (r *MapRequestRateLimiterImpl[K]) cleanupAsync(now time.Time) {
-	// The sweep only touches the in-memory map, so a panic here would signal a
-	// bug rather than a transient fault; recover so it cannot crash the process.
-	// The next interval retries.
-	defer func() { _ = recover() }()
-	r.cleanup(now)
 }
 
 // cleanup uses a two-phase approach to minimize lock contention:
