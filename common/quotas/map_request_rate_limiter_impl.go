@@ -21,12 +21,9 @@ type (
 		lastAccess  atomic.Int64
 	}
 
-	// MapRequestRateLimiterImpl is a generic wrapper rate limiter for a set of rate limiters
-	// identified by a key. It evicts entries that have not been accessed for longer than the
-	// TTL. Eviction is triggered by request traffic, throttled to once per cleanup interval,
-	// and the sweep runs in a short-lived goroutine so requests are never blocked by it. There
-	// is no long-lived background goroutine, so the limiter needs no lifecycle to stop; an idle
-	// limiter retains its entries until the next request.
+	// MapRequestRateLimiterImpl holds rate limiters keyed by K, evicting entries idle
+	// past the TTL. Eviction is traffic-triggered (once per interval) and swept in a
+	// short-lived goroutine, so there is no long-lived goroutine or lifecycle to stop.
 	MapRequestRateLimiterImpl[K comparable] struct {
 		rateLimiterGenFn RequestRateLimiterFn
 		rateLimiterKeyFn RequestRateLimiterKeyFn[K]
@@ -103,9 +100,8 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 
 	key := r.rateLimiterKeyFn(req)
 
-	// Refresh lastAccess while still holding the read lock so a concurrent
-	// cleanup (which deletes only under the write lock, after re-checking
-	// lastAccess) cannot evict an entry between this lookup and its refresh.
+	// Refresh lastAccess under the read lock so a concurrent cleanup can't evict
+	// the entry between lookup and refresh.
 	r.RLock()
 	entry, ok := r.rateLimiters[key]
 	if ok {
@@ -132,34 +128,25 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	return newRateLimiter
 }
 
-// maybeCleanup triggers a cleanup sweep at most once per cleanup interval. The
-// CompareAndSwap elects a single caller, which runs the O(n) sweep in a short-lived
-// goroutine so the request path is never blocked by it. Winning the CAS advances
-// lastCleanupNano before the sweep starts, so concurrent callers within the interval
-// do not spawn additional sweeps; on panic the sweep is skipped until the next interval.
+// maybeCleanup sweeps at most once per interval, off the request path. The CAS
+// elects a single sweeper and advances lastCleanupNano before it starts.
 func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time, nowNano int64) {
 	last := r.lastCleanupNano.Load()
 	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
 		go func() {
-			// recover must run on the sweep's own goroutine. The sweep only
-			// touches the in-memory map, so a panic here signals a bug rather
-			// than a transient fault; recover so it cannot crash the process.
-			// The next interval retries.
+			// recover on the sweep's own goroutine so a panic can't crash the process.
 			defer func() { _ = recover() }()
 			r.cleanup(now)
 		}()
 	}
 }
 
-// cleanup uses a two-phase approach to minimize lock contention:
-// 1. RLock: collect candidates for eviction
-// 2. For each candidate: Lock, re-check, delete, Unlock
-// This ensures read operations are only briefly blocked during actual deletions.
+// cleanup collects expired keys under the read lock, then deletes each under the
+// write lock with a re-check, so reads are only briefly blocked.
 func (r *MapRequestRateLimiterImpl[K]) cleanup(now time.Time) {
 	nowNano := now.UnixNano()
 	ttlNano := r.ttlNano
 
-	// Phase 1: collect expired keys under read lock
 	var expiredKeys []K
 	r.RLock()
 	for k, e := range r.rateLimiters {
@@ -169,7 +156,6 @@ func (r *MapRequestRateLimiterImpl[K]) cleanup(now time.Time) {
 	}
 	r.RUnlock()
 
-	// Phase 2: delete each expired key individually
 	for _, k := range expiredKeys {
 		r.Lock()
 		if e, ok := r.rateLimiters[k]; ok && nowNano-e.lastAccess.Load() > ttlNano {

@@ -99,8 +99,7 @@ func (s *mapRequestRateLimiterSuite) TestLazyCleanupOnAccess() {
 	rateLimiter.Allow(now, req1)
 	s.Len(rateLimiter.rateLimiters, 1)
 
-	// A later access past both the cleanup interval and req1's TTL triggers the
-	// eviction sweep, which runs in a short-lived goroutine.
+	// A later access past the interval and req1's TTL triggers the async sweep.
 	rateLimiter.Allow(now.Add(200*time.Millisecond), req2)
 
 	s.Eventually(func() bool {
@@ -131,12 +130,9 @@ func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
 	s.Len(rateLimiter.rateLimiters, 2)
 }
 
-// TestConcurrentAccessAndCleanup drives many goroutines through the access path
-// (which refreshes lastAccess under the read lock) while a dedicated goroutine
-// runs cleanup (which deletes under the write lock), exercising that interaction.
-// It guards the changed path against data races; run with -race. The cleanup
-// interval is set high so the access path does not also spawn its own sweeps,
-// keeping the concurrency driven by the explicit cleanup goroutine below.
+// TestConcurrentAccessAndCleanup races the access path against cleanup to guard
+// against data races; run with -race. The interval is set high so only the
+// explicit cleanup goroutine below sweeps.
 func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 	rateLimiter := NewMapRequestRateLimiter(
 		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
