@@ -33,7 +33,7 @@ type (
 		ttlNano      int64 // TTL in nanoseconds
 
 		cleanupIntervalNano int64
-		lastCleanupNano     atomic.Int64
+		lastCleanupStartNano     atomic.Int64
 	}
 )
 
@@ -132,8 +132,8 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 // one sweeper starts even if many callers reach here at once.
 func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time) {
 	nowNano := now.UnixNano()
-	last := r.lastCleanupNano.Load()
-	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
+	last := r.lastCleanupStartNano.Load()
+	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupStartNano.CompareAndSwap(last, nowNano) {
 		go func() {
 			// recover on the sweep's own goroutine so a panic can't crash the process.
 			defer func() { _ = recover() }()

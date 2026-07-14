@@ -1,7 +1,6 @@
 package quotas
 
 import (
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -86,8 +85,8 @@ func (s *mapRequestRateLimiterSuite) TestCleanup() {
 
 func (s *mapRequestRateLimiterSuite) TestLazyCleanupOnAccess() {
 	rateLimiter := NewMapRequestRateLimiter(
-		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
-		func(req Request) string { return req.Caller },
+		func(_ Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		namespaceRequestRateLimiterKeyFn,
 	)
 	rateLimiter.ttlNano = int64(100 * time.Millisecond)
 	rateLimiter.cleanupIntervalNano = int64(50 * time.Millisecond)
@@ -113,8 +112,8 @@ func (s *mapRequestRateLimiterSuite) TestLazyCleanupOnAccess() {
 
 func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
 	rateLimiter := NewMapRequestRateLimiter(
-		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
-		func(req Request) string { return req.Caller },
+		func(_ Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		namespaceRequestRateLimiterKeyFn,
 	)
 	rateLimiter.ttlNano = int64(10 * time.Millisecond)
 	rateLimiter.cleanupIntervalNano = int64(time.Hour)
@@ -135,11 +134,16 @@ func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
 // explicit cleanup goroutine below sweeps.
 func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 	rateLimiter := NewMapRequestRateLimiter(
-		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
-		func(req Request) string { return req.Caller },
+		func(_ Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		func(req Request) int { return req.Token },
 	)
 	rateLimiter.ttlNano = int64(time.Millisecond)
 	rateLimiter.cleanupIntervalNano = int64(time.Hour)
+
+	// Seed the throttle to now so worker accesses stay within the interval and
+	// only the explicit cleanup goroutine below sweeps.
+	base := time.Now()
+	rateLimiter.lastCleanupStartNano.Store(base.UnixNano())
 
 	const (
 		workers = 8
@@ -151,7 +155,6 @@ func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 	cleanerWG.Add(1)
 	go func() {
 		defer cleanerWG.Done()
-		base := time.Now()
 		for i := 0; ; i++ {
 			select {
 			case <-stop:
@@ -167,10 +170,9 @@ func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
 		accessWG.Add(1)
 		go func(w int) {
 			defer accessWG.Done()
-			now := time.Now()
 			for i := range iters {
-				req := Request{Caller: fmt.Sprintf("ns-%d", (w+i)%keys)}
-				rateLimiter.Allow(now.Add(time.Duration(i)*time.Microsecond), req)
+				req := Request{Token: (w + i) % keys}
+				rateLimiter.Allow(base.Add(time.Duration(i)*time.Microsecond), req)
 			}
 		}(w)
 	}
