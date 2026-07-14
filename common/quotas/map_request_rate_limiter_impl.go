@@ -95,9 +95,9 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	now time.Time,
 	req Request,
 ) RequestRateLimiter {
-	nowNano := now.UnixNano()
-	r.maybeCleanup(now, nowNano)
+	r.maybeCleanup(now)
 
+	nowNano := now.UnixNano()
 	key := r.rateLimiterKeyFn(req)
 
 	// Refresh lastAccess under the read lock so a concurrent cleanup can't evict
@@ -128,9 +128,10 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 	return newRateLimiter
 }
 
-// maybeCleanup sweeps at most once per interval, off the request path. The CAS
-// elects a single sweeper and advances lastCleanupNano before it starts.
-func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time, nowNano int64) {
+// maybeCleanup sweeps at most once per interval, off the request path, and only
+// one sweeper starts even if many callers reach here at once.
+func (r *MapRequestRateLimiterImpl[K]) maybeCleanup(now time.Time) {
+	nowNano := now.UnixNano()
 	last := r.lastCleanupNano.Load()
 	if nowNano-last > r.cleanupIntervalNano && r.lastCleanupNano.CompareAndSwap(last, nowNano) {
 		go func() {
