@@ -21,9 +21,10 @@ type (
 		lastAccess  atomic.Int64
 	}
 
-	// MapRequestRateLimiterImpl holds rate limiters keyed by K, evicting entries idle
-	// past the TTL. Eviction is traffic-triggered (once per interval) and swept in a
-	// short-lived goroutine, so there is no long-lived goroutine or lifecycle to stop.
+	// MapRequestRateLimiterImpl is a generic wrapper rate limiter for a set of rate limiters
+	// identified by a key. It evicts entries idle past the TTL; eviction is traffic-triggered
+	// (once per interval) and swept in a short-lived goroutine, so there is no long-lived
+	// goroutine or lifecycle to stop.
 	MapRequestRateLimiterImpl[K comparable] struct {
 		rateLimiterGenFn RequestRateLimiterFn
 		rateLimiterKeyFn RequestRateLimiterKeyFn[K]
@@ -32,8 +33,8 @@ type (
 		rateLimiters map[K]*rateLimiterEntry
 		ttlNano      int64 // TTL in nanoseconds
 
-		cleanupIntervalNano int64
-		lastCleanupStartNano     atomic.Int64
+		cleanupIntervalNano  int64
+		lastCleanupStartNano atomic.Int64
 	}
 )
 
