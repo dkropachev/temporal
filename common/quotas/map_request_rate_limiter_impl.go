@@ -102,12 +102,17 @@ func (r *MapRequestRateLimiterImpl[K]) getOrInitRateLimiter(
 
 	key := r.rateLimiterKeyFn(req)
 
+	// Refresh lastAccess while still holding the read lock so a concurrent
+	// cleanup (which deletes only under the write lock, after re-checking
+	// lastAccess) cannot evict an entry between this lookup and its refresh.
 	r.RLock()
 	entry, ok := r.rateLimiters[key]
+	if ok {
+		entry.lastAccess.Store(nowNano)
+	}
 	r.RUnlock()
 
 	if ok {
-		entry.lastAccess.Store(nowNano)
 		return entry.rateLimiter
 	}
 

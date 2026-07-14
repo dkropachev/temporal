@@ -1,6 +1,8 @@
 package quotas
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +126,38 @@ func (s *mapRequestRateLimiterSuite) TestCleanupThrottledByInterval() {
 	// next access must not evict it.
 	rateLimiter.Allow(now.Add(50*time.Millisecond), req2)
 	s.Len(rateLimiter.rateLimiters, 2)
+}
+
+// TestConcurrentAccessAndCleanup drives many goroutines through the access path
+// while cleanup runs on every access (interval 0), exercising the RLock refresh
+// against the write-locked eviction. It guards the changed path against data
+// races; run with -race.
+func (s *mapRequestRateLimiterSuite) TestConcurrentAccessAndCleanup() {
+	rateLimiter := NewMapRequestRateLimiter(
+		func(req Request) RequestRateLimiter { return NoopRequestRateLimiter },
+		func(req Request) string { return req.Caller },
+	)
+	rateLimiter.ttlNano = int64(time.Millisecond)
+	rateLimiter.cleanupIntervalNano = 0
+
+	const (
+		workers = 8
+		iters   = 5000
+		keys    = 16
+	)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			now := time.Now()
+			for i := range iters {
+				req := Request{Caller: fmt.Sprintf("ns-%d", (w+i)%keys)}
+				rateLimiter.Allow(now.Add(time.Duration(i)*time.Microsecond), req)
+			}
+		}(w)
+	}
+	wg.Wait()
 }
 
 func (s *mapRequestRateLimiterSuite) TestAccessRefreshesTTL() {
