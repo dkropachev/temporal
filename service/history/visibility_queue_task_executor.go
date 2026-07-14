@@ -430,19 +430,26 @@ func (t *visibilityQueueTaskExecutor) processChasmTask(
 		return err
 	}
 
+	// chasmMapper carries the archetype's search attribute registration, including which CHASM
+	// system search attributes (e.g. ExecutionTime) this archetype overrides with its own value.
+	var chasmMapper *chasm.VisibilitySearchAttributesMapper
+	if rc, ok := t.shardContext.ChasmRegistry().ComponentByID(tree.ArchetypeID()); ok {
+		chasmMapper = rc.SearchAttributesMapper()
+	}
+
 	var chasmTaskQueue string
-	var chasmExecutionTime time.Time
+	// systemOverrides holds CHASM-provided values for registered system search attribute
+	// overrides, applied to the request base below (preserving the system column name).
+	systemOverrides := make(map[string]chasm.VisibilityValue)
 	if chasmSAProvider, ok := rootComponent.(chasm.VisibilitySearchAttributesProvider); ok {
 		for _, chasmSA := range chasmSAProvider.SearchAttributes(visTaskContext) {
-			switch chasmSA.Field {
-			case sadefs.TaskQueue:
+			switch {
+			case chasmSA.Field == sadefs.TaskQueue:
 				if strVal, ok := chasmSA.Value.Value().(string); ok {
 					chasmTaskQueue = strVal
 				}
-			case sadefs.ExecutionTime:
-				if timeVal, ok := chasmSA.Value.Value().(time.Time); ok {
-					chasmExecutionTime = timeVal
-				}
+			case chasmMapper.IsSystemOverride(chasmSA.Field):
+				systemOverrides[chasmSA.Field] = chasmSA.Value
 			default:
 				searchAttributes[chasmSA.Field] = chasmSA.Value.MustEncode()
 			}
@@ -488,11 +495,10 @@ func (t *visibilityQueueTaskExecutor) processChasmTask(
 	if chasmTaskQueue != "" {
 		requestBase.TaskQueue = chasmTaskQueue
 	}
-	// CHASM executions initialize mutable state ExecutionTime to creation time.
-	// Components may override it with their semantic execution time.
-	if !chasmExecutionTime.IsZero() {
-		requestBase.ExecutionTime = chasmExecutionTime
-	}
+	// Apply registered CHASM system search attribute overrides (e.g. ExecutionTime). CHASM
+	// executions initialize these system columns to a default (e.g. creation time) in the
+	// request base; a component may override them with its own semantic value.
+	applyChasmSystemOverrides(requestBase, systemOverrides)
 
 	if mutableState.IsWorkflowExecutionRunning() {
 		release(nil)
@@ -560,6 +566,24 @@ func (t *visibilityQueueTaskExecutor) getVisibilityRequestBase(
 			WorkflowId: executionInfo.RootWorkflowId,
 			RunId:      executionInfo.RootRunId,
 		},
+	}
+}
+
+// applyChasmSystemOverrides applies CHASM-provided values for registered system search
+// attribute overrides onto the visibility request base, preserving the system column name.
+// Only fields with a dedicated column on VisibilityRequestBase are supported.
+func applyChasmSystemOverrides(
+	requestBase *manager.VisibilityRequestBase,
+	overrides map[string]chasm.VisibilityValue,
+) {
+	for field, value := range overrides {
+		switch field {
+		case sadefs.ExecutionTime:
+			if timeVal, ok := value.Value().(time.Time); ok && !timeVal.IsZero() {
+				requestBase.ExecutionTime = timeVal
+			}
+		default:
+		}
 	}
 }
 

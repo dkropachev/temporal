@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
@@ -46,15 +47,35 @@ func TestVisibilityManagerSuite(t *testing.T) {
 	suite.Run(t, new(VisibilityManagerSuite))
 }
 
+// testChasmComponent is a minimal component used to build a search attribute mapper.
+type testChasmComponent struct {
+	chasm.UnimplementedComponent
+}
+
+func (testChasmComponent) LifecycleState(chasm.Context) chasm.LifecycleState {
+	return chasm.LifecycleStateRunning
+}
+
 func TestConvertToChasmExecutionInfoExecutionTime(t *testing.T) {
 	executionTime := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+
+	// A mapper for an archetype that registers ExecutionTime as a system search attribute override.
+	overrideMapper := chasm.NewRegistrableComponent[*testChasmComponent](
+		"test_component",
+		chasm.WithSearchAttributes(chasm.SearchAttributeExecutionTime),
+	).SearchAttributesMapper()
+
 	testCases := []struct {
 		name          string
 		executionTime time.Time
+		mapper        *chasm.VisibilitySearchAttributesMapper
 		wantPresent   bool
 	}{
-		{name: "nonzero", executionTime: executionTime, wantPresent: true},
-		{name: "zero"},
+		{name: "override registered, nonzero", executionTime: executionTime, mapper: overrideMapper, wantPresent: true},
+		{name: "override registered, zero", mapper: overrideMapper, wantPresent: false},
+		// Without registration the archetype keeps the default base ExecutionTime; it is not
+		// surfaced as a CHASM search attribute.
+		{name: "no override registered, nonzero", executionTime: executionTime, mapper: nil, wantPresent: false},
 	}
 
 	visibilityManager := &visibilityManagerImpl{
@@ -66,7 +87,7 @@ func TestConvertToChasmExecutionInfoExecutionTime(t *testing.T) {
 				StartTime:        executionTime.Add(-time.Minute),
 				ExecutionTime:    tc.executionTime,
 				SearchAttributes: &commonpb.SearchAttributes{},
-			}, nil, testNamespace)
+			}, tc.mapper, testNamespace)
 			require.NoError(t, err)
 
 			payload, ok := info.GetChasmSearchAttributes().GetIndexedFields()[sadefs.ExecutionTime]
