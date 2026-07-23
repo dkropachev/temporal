@@ -35,13 +35,16 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     permissions: {} # uses the Temporal CI/CD Bot app token, not GITHUB_TOKEN
+    env:
+      AI_REVIEW_APP_CONFIGURED: ${{ secrets.TEMPORAL_AI_REVIEW_APP_ID != '' && secrets.TEMPORAL_AI_REVIEW_APP_PRIVATE_KEY != '' }}
     outputs:
-      should_review: ${{ steps.decision.outputs.should_review }}
+      should_review: ${{ steps.missing_app_config.outputs.should_review || steps.decision.outputs.should_review }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
       - name: Generate app token
         id: generate_token
+        if: env.AI_REVIEW_APP_CONFIGURED == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.TEMPORAL_AI_REVIEW_APP_ID }}
@@ -71,7 +74,14 @@ jobs:
             echo "author=${author}"
             echo "head_sha=${head_sha}"
           } >> "$GITHUB_OUTPUT"
+      - name: Skip review when app credentials are unavailable
+        id: missing_app_config
+        if: env.AI_REVIEW_APP_CONFIGURED != 'true'
+        run: |
+          echo "Skipping Claude review for PR #${{ steps.resolve.outputs.pr_number }}: app credentials are not configured"
+          echo "should_review=false" >> "$GITHUB_OUTPUT"
       - id: decision
+        if: env.AI_REVIEW_APP_CONFIGURED == 'true'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
           AUTHOR: ${{ steps.resolve.outputs.author }}
