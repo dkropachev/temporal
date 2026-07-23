@@ -124,7 +124,11 @@ func initSession(
 }
 
 func shouldRetryWithoutInitialHostLookup(cluster *gocql.ClusterConfig, err error) bool {
-	return err != nil && !cluster.DisableInitialHostLookup && strings.Contains(err.Error(), missingPeersV2Table)
+	return !cluster.DisableInitialHostLookup && isMissingPeersV2TableError(err)
+}
+
+func isMissingPeersV2TableError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), missingPeersV2Table)
 }
 
 func (s *session) Query(
@@ -178,7 +182,13 @@ func (s *session) AwaitSchemaAgreement(
 ) (retError error) {
 	defer func() { s.handleError(retError) }()
 
-	return s.Value.Load().(*gocql.Session).AwaitSchemaAgreement(ctx)
+	if err := s.Value.Load().(*gocql.Session).AwaitSchemaAgreement(ctx); err != nil {
+		if isMissingPeersV2TableError(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *session) Close() {

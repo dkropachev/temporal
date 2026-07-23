@@ -63,8 +63,11 @@ func TestShouldRetryWithoutInitialHostLookup(t *testing.T) {
 	missingPeersV2Err := errors.New("gocql: unable to create session: unable to fetch peer host info: unconfigured table peers_v2")
 
 	require.True(t, shouldRetryWithoutInitialHostLookup(cluster, missingPeersV2Err))
+	require.True(t, isMissingPeersV2TableError(missingPeersV2Err))
 	require.False(t, shouldRetryWithoutInitialHostLookup(cluster, errors.New("some other error")))
+	require.False(t, isMissingPeersV2TableError(errors.New("some other error")))
 	require.False(t, shouldRetryWithoutInitialHostLookup(cluster, nil))
+	require.False(t, isMissingPeersV2TableError(nil))
 
 	cluster.DisableInitialHostLookup = true
 	require.False(t, shouldRetryWithoutInitialHostLookup(cluster, missingPeersV2Err))
