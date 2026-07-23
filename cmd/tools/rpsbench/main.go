@@ -248,11 +248,8 @@ func setupMode(
 	var failed atomic.Uint64
 	var firstErr atomic.Value
 	var wg sync.WaitGroup
-	workers := concurrency
-	if workers > 64 {
-		workers = 64
-	}
-	for worker := 0; worker < workers; worker++ {
+	workers := min(concurrency, 64)
+	for range workers {
 		wg.Go(func() {
 			for {
 				idx := int(next.Add(1)) - 1
@@ -298,7 +295,7 @@ func run(
 	var firstErr atomic.Value
 	var phases phaseTimings
 
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		worker := i
 		wg.Go(func() {
 			pollerGroupID := ""
