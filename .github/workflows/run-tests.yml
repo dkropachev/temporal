@@ -24,7 +24,9 @@ env:
   DOCKER_COMPOSE_FILE: ./develop/github/docker-compose.yml
   TEMPORAL_VERSION_CHECK_DISABLED: 1
   MAX_TEST_ATTEMPTS: 3
-  SHARD_COUNT: 3 # NOTE: must match shard count in optimize-test-sharding.yml
+  # Keep temporalio runs aligned with optimize-test-sharding.yml. Fork runners
+  # have less memory, so split functional tests into smaller shards there.
+  SHARD_COUNT: ${{ github.repository_owner == 'temporalio' && 3 || 5 }}
 
 jobs:
   test-setup:
