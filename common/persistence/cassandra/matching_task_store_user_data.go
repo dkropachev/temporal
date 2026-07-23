@@ -38,7 +38,8 @@ const (
 )
 
 type userDataStore struct {
-	Session gocql.Session
+	Session    gocql.Session
+	compressor *blobCompressor
 }
 
 func (d *userDataStore) GetTaskQueueUserData(
@@ -55,10 +56,14 @@ func (d *userDataStore) GetTaskQueueUserData(
 	if err := query.Scan(&userDataBytes, &encoding, &version); err != nil {
 		return nil, gocql.ConvertError("GetTaskQueueData", err)
 	}
+	userData, err := d.compressor.newDataBlob(userDataBytes, encoding)
+	if err != nil {
+		return nil, err
+	}
 
 	return &p.InternalGetTaskQueueUserDataResponse{
 		Version:  version,
-		UserData: p.NewDataBlob(userDataBytes, encoding),
+		UserData: userData,
 	}, nil
 }
 
@@ -69,17 +74,21 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 
 	for taskQueue, update := range request.Updates {
+		data, encoding, err := d.compressor.compressBlob(update.UserData)
+		if err != nil {
+			return err
+		}
 		if update.Version == 0 {
 			batch.Query(templateInsertTaskQueueUserDataQuery,
 				request.NamespaceID,
 				taskQueue,
-				update.UserData.Data,
-				update.UserData.EncodingType.String(),
+				data,
+				encoding,
 			)
 		} else {
 			batch.Query(templateUpdateTaskQueueUserDataQuery,
-				update.UserData.Data,
-				update.UserData.EncodingType.String(),
+				data,
+				encoding,
 				update.Version+1,
 				request.NamespaceID,
 				taskQueue,
@@ -156,8 +165,12 @@ func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, reques
 		if err != nil {
 			return nil, err
 		}
+		blob, err := d.compressor.newDataBlob(data, dataEncoding)
+		if err != nil {
+			return nil, err
+		}
 
-		response.Entries = append(response.Entries, p.InternalTaskQueueUserDataEntry{TaskQueue: taskQueue, Data: p.NewDataBlob(data, dataEncoding), Version: version})
+		response.Entries = append(response.Entries, p.InternalTaskQueueUserDataEntry{TaskQueue: taskQueue, Data: blob, Version: version})
 
 		row = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
 	}

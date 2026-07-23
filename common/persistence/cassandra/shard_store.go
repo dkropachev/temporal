@@ -42,6 +42,7 @@ type (
 		ClusterName string
 		Session     gocql.Session
 		Logger      log.Logger
+		compressor  *blobCompressor
 	}
 )
 
@@ -49,11 +50,13 @@ func NewShardStore(
 	clusterName string,
 	session gocql.Session,
 	logger log.Logger,
+	compressors ...*blobCompressor,
 ) *ShardStore {
 	return &ShardStore{
 		ClusterName: clusterName,
 		Session:     session,
 		Logger:      logger,
+		compressor:  selectBlobCompressor(compressors),
 	}
 }
 
@@ -75,8 +78,12 @@ func (d *ShardStore) GetOrCreateShard(
 	var encoding string
 	err := query.Scan(&data, &encoding)
 	if err == nil {
+		shardInfo, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		return &p.InternalGetOrCreateShardResponse{
-			ShardInfo: p.NewDataBlob(data, encoding),
+			ShardInfo: shardInfo,
 		}, nil
 	} else if !gocql.IsNotFoundError(err) || request.CreateShardInfo == nil {
 		return nil, gocql.ConvertError("GetOrCreateShard", err)
@@ -84,6 +91,10 @@ func (d *ShardStore) GetOrCreateShard(
 
 	// shard was not found and we should create it
 	rangeID, shardInfo, err := request.CreateShardInfo()
+	if err != nil {
+		return nil, err
+	}
+	data, encoding, err = d.compressor.compressBlob(shardInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -96,8 +107,8 @@ func (d *ShardStore) GetOrCreateShard(
 		rowTypeShardRunID,
 		defaultVisibilityTimestamp,
 		rowTypeShardTaskID,
-		shardInfo.Data,
-		shardInfo.EncodingType.String(),
+		data,
+		encoding,
 		rangeID,
 	).WithContext(ctx)
 
@@ -120,9 +131,13 @@ func (d *ShardStore) UpdateShard(
 	ctx context.Context,
 	request *p.InternalUpdateShardRequest,
 ) error {
+	data, encoding, err := d.compressor.compressBlob(request.ShardInfo)
+	if err != nil {
+		return err
+	}
 	query := d.Session.Query(templateUpdateShardQuery,
-		request.ShardInfo.Data,
-		request.ShardInfo.EncodingType.String(),
+		data,
+		encoding,
 		request.RangeID,
 		request.ShardID,
 		rowTypeShard,
