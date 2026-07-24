@@ -140,6 +140,11 @@ for signal / start / signal with start API if namespace is not active`,
 		primitives.DefaultTransactionSizeLimit,
 		`TransactionSizeLimit is the largest allowed transaction size to persistence`,
 	)
+	CassandraBlobCompressionEnabled = NewGlobalBoolSetting(
+		"persistence.cassandra.blobCompression.enabled",
+		false,
+		`CassandraBlobCompressionEnabled controls whether Cassandra persistence compresses blob column values before writing them.`,
+	)
 	DisallowQuery = NewNamespaceBoolSetting(
 		"system.disallowQuery",
 		false,

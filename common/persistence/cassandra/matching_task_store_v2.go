@@ -46,15 +46,19 @@ type matchingTaskStoreV2 struct {
 	Session gocql.Session
 	userDataStore
 	taskQueueStore
+	compressor *blobCompressor
 }
 
 func newMatchingTaskStoreV2(
 	session gocql.Session,
+	compressors ...*blobCompressor,
 ) *matchingTaskStoreV2 {
+	compressor := selectBlobCompressor(compressors)
 	return &matchingTaskStoreV2{
 		Session:        session,
-		userDataStore:  userDataStore{Session: session},
-		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion2},
+		userDataStore:  userDataStore{Session: session, compressor: compressor},
+		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion2, compressor: compressor},
+		compressor:     compressor,
 	}
 }
 
@@ -72,6 +76,10 @@ func (d *matchingTaskStoreV2) CreateTasks(
 		if task.TaskPass == 0 {
 			return nil, serviceerror.NewInternal("invalid fair queue task missing pass number")
 		}
+		taskData, taskEncoding, err := d.compressor.compressBlob(task.Task)
+		if err != nil {
+			return nil, err
+		}
 
 		batch.Query(templateCreateTaskQuery_v2,
 			namespaceID,
@@ -80,18 +88,22 @@ func (d *matchingTaskStoreV2) CreateTasks(
 			rowTypeTaskInSubqueue(task.Subqueue),
 			task.TaskPass,
 			task.TaskId,
-			task.Task.Data,
-			task.Task.EncodingType.String())
+			taskData,
+			taskEncoding)
 	}
 
 	// The following query is used to ensure that range_id didn't change.
 	// When UpdateMetadata is true, we also write the metadata blob (backlog counts, etc.).
 	// When false, we only check the range_id for write fencing.
 	if request.UpdateMetadata {
+		taskQueueData, taskQueueEncoding, err := d.compressor.compressBlob(request.TaskQueueInfo)
+		if err != nil {
+			return nil, err
+		}
 		batch.Query(switchTasksTable(templateUpdateTaskQueueQuery, matchingTaskVersion2),
 			request.RangeID,
-			request.TaskQueueInfo.Data,
-			request.TaskQueueInfo.EncodingType.String(),
+			taskQueueData,
+			taskQueueEncoding,
 			namespaceID,
 			taskQueue,
 			taskQueueType,
@@ -198,7 +210,11 @@ func (d *matchingTaskStoreV2) GetTasks(
 			var byteSliceType []byte
 			return nil, newPersistedTypeMismatchError("task_encoding", byteSliceType, rawEncoding, task)
 		}
-		response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
+		blob, err := d.compressor.newDataBlob(taskVal, encodingVal)
+		if err != nil {
+			return nil, err
+		}
+		response.Tasks = append(response.Tasks, blob)
 
 		task = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
 	}

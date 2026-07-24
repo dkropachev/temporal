@@ -46,16 +46,19 @@ type (
 	HistoryStore struct {
 		Session gocql.Session
 		p.HistoryBranchUtil
+		compressor *blobCompressor
 	}
 )
 
 func NewHistoryStore(
 	session gocql.Session,
 	serializer serialization.Serializer,
+	compressors ...*blobCompressor,
 ) *HistoryStore {
 	return &HistoryStore{
 		Session:           session,
 		HistoryBranchUtil: p.NewHistoryBranchUtil(serializer),
+		compressor:        selectBlobCompressor(compressors),
 	}
 }
 
@@ -67,6 +70,10 @@ func (h *HistoryStore) AppendHistoryNodes(
 ) error {
 	branchInfo := request.BranchInfo
 	node := request.Node
+	nodeData, nodeEncoding, err := h.compressor.compressBlob(node.Events)
+	if err != nil {
+		return err
+	}
 
 	if !request.IsNewBranch {
 		query := h.Session.Query(v2templateUpsertHistoryNode,
@@ -75,8 +82,8 @@ func (h *HistoryStore) AppendHistoryNodes(
 			node.NodeID,
 			node.PrevTransactionID,
 			node.TransactionID,
-			node.Events.Data,
-			node.Events.EncodingType.String(),
+			nodeData,
+			nodeEncoding,
 		).WithContext(ctx)
 		if err := query.Exec(); err != nil {
 			return convertTimeoutError(gocql.ConvertError("AppendHistoryNodes", err))
@@ -85,12 +92,16 @@ func (h *HistoryStore) AppendHistoryNodes(
 	}
 
 	treeInfoDataBlob := request.TreeInfo
+	treeInfoData, treeInfoEncoding, err := h.compressor.compressBlob(treeInfoDataBlob)
+	if err != nil {
+		return err
+	}
 	batch := h.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.Query(v2templateInsertTree,
 		branchInfo.TreeId,
 		branchInfo.BranchId,
-		treeInfoDataBlob.Data,
-		treeInfoDataBlob.EncodingType.String(),
+		treeInfoData,
+		treeInfoEncoding,
 	)
 	batch.Query(v2templateUpsertHistoryNode,
 		branchInfo.TreeId,
@@ -98,8 +109,8 @@ func (h *HistoryStore) AppendHistoryNodes(
 		node.NodeID,
 		node.PrevTransactionID,
 		node.TransactionID,
-		node.Events.Data,
-		node.Events.EncodingType.String(),
+		nodeData,
+		nodeEncoding,
 	)
 	if err := h.Session.ExecuteBatch(batch); err != nil {
 		return convertTimeoutError(gocql.ConvertError("AppendHistoryNodes", err))
@@ -177,7 +188,11 @@ func (h *HistoryStore) ReadHistoryBranch(
 	nodes := make([]p.InternalHistoryNode, 0, request.PageSize)
 	message := make(map[string]any)
 	for iter.MapScan(message) {
-		nodes = append(nodes, convertHistoryNode(message))
+		node, err := h.convertHistoryNode(message)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
 		message = make(map[string]any)
 	}
 
@@ -255,7 +270,11 @@ func (h *HistoryStore) ForkHistoryBranch(
 	if err != nil {
 		return serviceerror.NewInternalf("ForkHistoryBranch - Gocql NewBranchID UUID cast failed. Error: %v", err)
 	}
-	query := h.Session.Query(v2templateInsertTree, cqlTreeID, cqlNewBranchID, datablob.Data, datablob.EncodingType.String()).WithContext(ctx)
+	data, encoding, err := h.compressor.compressBlob(datablob)
+	if err != nil {
+		return err
+	}
+	query := h.Session.Query(v2templateInsertTree, cqlTreeID, cqlNewBranchID, data, encoding).WithContext(ctx)
 	err = query.Exec()
 	if err != nil {
 		return gocql.ConvertError("ForkHistoryBranch", err)
@@ -319,10 +338,14 @@ func (h *HistoryStore) GetAllHistoryTreeBranches(
 	var encoding string
 
 	for iter.Scan(&treeUUID, &branchUUID, &data, &encoding) {
+		branchData, err := h.compressor.decompressData(data)
+		if err != nil {
+			return nil, err
+		}
 		branch := p.InternalHistoryBranchDetail{
 			TreeID:   treeUUID,
 			BranchID: branchUUID,
-			Data:     data,
+			Data:     branchData,
 			Encoding: encoding,
 		}
 		branches = append(branches, branch)
@@ -375,7 +398,11 @@ func (h *HistoryStore) GetHistoryTreeContainingBranch(
 		var data []byte
 		var encoding string
 		for iter.Scan(&branchUUID, &data, &encoding) {
-			treeInfos = append(treeInfos, p.NewDataBlob(data, encoding))
+			blob, err := h.compressor.newDataBlob(data, encoding)
+			if err != nil {
+				return nil, err
+			}
+			treeInfos = append(treeInfos, blob)
 
 			branchUUID = ""
 			data = []byte{}
@@ -400,9 +427,9 @@ func (h *HistoryStore) GetHistoryBranchUtil() p.HistoryBranchUtil {
 	return h.HistoryBranchUtil
 }
 
-func convertHistoryNode(
+func (h *HistoryStore) convertHistoryNode(
 	message map[string]any,
-) p.InternalHistoryNode {
+) (p.InternalHistoryNode, error) {
 	nodeID := message["node_id"].(int64)
 	prevTxnID := message["prev_txn_id"].(int64)
 	txnID := message["txn_id"].(int64)
@@ -410,7 +437,11 @@ func convertHistoryNode(
 	var data []byte
 	var dataEncoding string
 	if _, ok := message["data"]; ok {
-		data = message["data"].([]byte)
+		var err error
+		data, err = h.compressor.decompressData(message["data"].([]byte))
+		if err != nil {
+			return p.InternalHistoryNode{}, err
+		}
 		dataEncoding = message["data_encoding"].(string)
 	}
 	return p.InternalHistoryNode{
@@ -418,7 +449,7 @@ func convertHistoryNode(
 		PrevTransactionID: prevTxnID,
 		TransactionID:     txnID,
 		Events:            p.NewDataBlob(data, dataEncoding),
-	}
+	}, nil
 }
 
 func convertTimeoutError(err error) error {

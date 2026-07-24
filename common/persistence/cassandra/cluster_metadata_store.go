@@ -42,8 +42,9 @@ WHERE membership_partition = ?`
 
 type (
 	ClusterMetadataStore struct {
-		session gocql.Session
-		logger  log.Logger
+		session    gocql.Session
+		logger     log.Logger
+		compressor *blobCompressor
 	}
 )
 
@@ -53,10 +54,12 @@ var _ p.ClusterMetadataStore = (*ClusterMetadataStore)(nil)
 func NewClusterMetadataStore(
 	session gocql.Session,
 	logger log.Logger,
+	compressors ...*blobCompressor,
 ) (p.ClusterMetadataStore, error) {
 	return &ClusterMetadataStore{
-		session: session,
-		logger:  logger,
+		session:    session,
+		logger:     logger,
+		compressor: selectBlobCompressor(compressors),
 	}, nil
 }
 
@@ -79,10 +82,14 @@ func (m *ClusterMetadataStore) ListClusterMetadata(
 			&version) {
 			break
 		}
+		blob, err := m.compressor.newDataBlob(clusterMetadata, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.ClusterMetadata = append(
 			response.ClusterMetadata,
 			&p.InternalGetClusterMetadataResponse{
-				ClusterMetadata: p.NewDataBlob(clusterMetadata, encoding),
+				ClusterMetadata: blob,
 				Version:         version,
 			},
 		)
@@ -111,9 +118,13 @@ func (m *ClusterMetadataStore) GetClusterMetadata(
 	if err != nil {
 		return nil, gocql.ConvertError("GetClusterMetadata", err)
 	}
+	blob, err := m.compressor.newDataBlob(clusterMetadata, encoding)
+	if err != nil {
+		return nil, err
+	}
 
 	return &p.InternalGetClusterMetadataResponse{
-		ClusterMetadata: p.NewDataBlob(clusterMetadata, encoding),
+		ClusterMetadata: blob,
 		Version:         version,
 	}, nil
 }
@@ -123,20 +134,24 @@ func (m *ClusterMetadataStore) SaveClusterMetadata(
 	request *p.InternalSaveClusterMetadataRequest,
 ) (bool, error) {
 	var query gocql.Query
+	data, encoding, err := m.compressor.compressBlob(request.ClusterMetadata)
+	if err != nil {
+		return false, err
+	}
 	if request.Version == 0 {
 		query = m.session.Query(
 			templateCreateClusterMetadata,
 			constMetadataPartition,
 			request.ClusterName,
-			request.ClusterMetadata.Data,
-			request.ClusterMetadata.EncodingType.String(),
+			data,
+			encoding,
 			1,
 		).WithContext(ctx)
 	} else {
 		query = m.session.Query(
 			templateUpdateClusterMetadata,
-			request.ClusterMetadata.Data,
-			request.ClusterMetadata.EncodingType.String(),
+			data,
+			encoding,
 			request.Version+1,
 			constMetadataPartition,
 			request.ClusterName,

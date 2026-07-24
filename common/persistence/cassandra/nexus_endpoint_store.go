@@ -37,18 +37,21 @@ const (
 
 type (
 	NexusEndpointStore struct {
-		session gocql.Session
-		logger  log.Logger
+		session    gocql.Session
+		logger     log.Logger
+		compressor *blobCompressor
 	}
 )
 
 func NewNexusEndpointStore(
 	session gocql.Session,
 	logger log.Logger,
+	compressors ...*blobCompressor,
 ) p.NexusEndpointStore {
 	return &NexusEndpointStore{
-		session: session,
-		logger:  logger,
+		session:    session,
+		logger:     logger,
+		compressor: selectBlobCompressor(compressors),
 	}
 }
 
@@ -67,19 +70,23 @@ func (s *NexusEndpointStore) CreateOrUpdateNexusEndpoint(
 	request *p.InternalCreateOrUpdateNexusEndpointRequest,
 ) error {
 	batch := s.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	data, encoding, err := s.compressor.compressBlob(request.Endpoint.Data)
+	if err != nil {
+		return err
+	}
 
 	if request.Endpoint.Version == 0 {
 		batch.Query(templateCreateEndpointQuery,
 			rowTypeNexusEndpoint,
 			request.Endpoint.ID,
-			request.Endpoint.Data.Data,
-			request.Endpoint.Data.EncodingType.String(),
+			data,
+			encoding,
 			1,
 		)
 	} else {
 		batch.Query(templateUpdateEndpointQuery,
-			request.Endpoint.Data.Data,
-			request.Endpoint.Data.EncodingType.String(),
+			data,
+			encoding,
 			request.Endpoint.Version+1,
 			rowTypeNexusEndpoint,
 			request.Endpoint.ID,
@@ -180,11 +187,15 @@ func (s *NexusEndpointStore) GetNexusEndpoint(
 	if err != nil {
 		return nil, gocql.ConvertError("GetNexusEndpoint", err)
 	}
+	blob, err := s.compressor.newDataBlob(data, dataEncoding)
+	if err != nil {
+		return nil, err
+	}
 
 	return &p.InternalNexusEndpoint{
 		ID:      request.ID,
 		Version: version,
-		Data:    p.NewDataBlob(data, dataEncoding),
+		Data:    blob,
 	}, nil
 }
 
@@ -361,11 +372,15 @@ func (s *NexusEndpointStore) getEndpointList(iter gocql.Iter) ([]p.InternalNexus
 		if err != nil {
 			return nil, err
 		}
+		blob, err := s.compressor.newDataBlob(data, dataEncoding)
+		if err != nil {
+			return nil, err
+		}
 
 		endpoints = append(endpoints, p.InternalNexusEndpoint{
 			ID:      gocql.UUIDToString(id),
 			Version: version,
-			Data:    p.NewDataBlob(data, dataEncoding),
+			Data:    blob,
 		})
 
 		row = make(map[string]any)

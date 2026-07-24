@@ -369,14 +369,21 @@ type (
 		Session    gocql.Session
 		serializer serialization.Serializer
 		logger     log.Logger
+		compressor *blobCompressor
 	}
 )
 
-func NewMutableStateStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *MutableStateStore {
+func NewMutableStateStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	compressors ...*blobCompressor,
+) *MutableStateStore {
 	return &MutableStateStore{
 		Session:    session,
 		serializer: serializer,
 		logger:     logger,
+		compressor: selectBlobCompressor(compressors),
 	}
 }
 
@@ -395,6 +402,10 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 
 	var requestCurrentRunID string
 	currentRecordRunID := d.getCurrentRecordRunID(request.ArchetypeID)
+	executionStateData, executionStateEncoding, err := d.compressor.compressBlob(newWorkflow.ExecutionStateBlob)
+	if err != nil {
+		return nil, err
+	}
 
 	switch request.Mode {
 	case p.CreateWorkflowModeBypassCurrent:
@@ -403,8 +414,8 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 	case p.CreateWorkflowModeUpdateCurrent:
 		batch.Query(templateUpdateCurrentWorkflowExecutionForNewQuery,
 			runID,
-			newWorkflow.ExecutionStateBlob.Data,
-			newWorkflow.ExecutionStateBlob.EncodingType.String(),
+			executionStateData,
+			executionStateEncoding,
 			lastWriteVersion,
 			newWorkflow.ExecutionState.State,
 			shardID,
@@ -431,8 +442,8 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 			defaultVisibilityTimestamp,
 			rowTypeExecutionTaskID,
 			runID,
-			newWorkflow.ExecutionStateBlob.Data,
-			newWorkflow.ExecutionStateBlob.EncodingType.String(),
+			executionStateData,
+			executionStateEncoding,
 			lastWriteVersion,
 			newWorkflow.ExecutionState.State,
 		)
@@ -446,6 +457,7 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 	if err := applyWorkflowSnapshotBatchAsNew(batch,
 		request.ShardID,
 		&newWorkflow,
+		d.compressor,
 	); err != nil {
 		return nil, err
 	}
@@ -511,7 +523,7 @@ func (d *MutableStateStore) GetWorkflowExecution(
 		return nil, gocql.ConvertError("GetWorkflowExecution", err)
 	}
 
-	state, err := mutableStateFromRow(result)
+	state, err := mutableStateFromRow(result, d.compressor)
 	if err != nil {
 		return nil, serviceerror.NewUnavailablef("GetWorkflowExecution operation failed. Error: %v", err)
 	}
@@ -520,7 +532,11 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	aMap := result["activity_map"].(map[int64][]byte)
 	aMapEncoding := result["activity_map_encoding"].(string)
 	for key, value := range aMap {
-		activityInfos[key] = p.NewDataBlob(value, aMapEncoding)
+		blob, err := d.compressor.newDataBlob(value, aMapEncoding)
+		if err != nil {
+			return nil, err
+		}
+		activityInfos[key] = blob
 	}
 	state.ActivityInfos = activityInfos
 
@@ -528,7 +544,11 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	tMapEncoding := result["timer_map_encoding"].(string)
 	tMap := result["timer_map"].(map[string][]byte)
 	for key, value := range tMap {
-		timerInfos[key] = p.NewDataBlob(value, tMapEncoding)
+		blob, err := d.compressor.newDataBlob(value, tMapEncoding)
+		if err != nil {
+			return nil, err
+		}
+		timerInfos[key] = blob
 	}
 	state.TimerInfos = timerInfos
 
@@ -536,7 +556,11 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	cMap := result["child_executions_map"].(map[int64][]byte)
 	cMapEncoding := result["child_executions_map_encoding"].(string)
 	for key, value := range cMap {
-		childExecutionInfos[key] = p.NewDataBlob(value, cMapEncoding)
+		blob, err := d.compressor.newDataBlob(value, cMapEncoding)
+		if err != nil {
+			return nil, err
+		}
+		childExecutionInfos[key] = blob
 	}
 	state.ChildExecutionInfos = childExecutionInfos
 
@@ -544,7 +568,11 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	rMapEncoding := result["request_cancel_map_encoding"].(string)
 	rMap := result["request_cancel_map"].(map[int64][]byte)
 	for key, value := range rMap {
-		requestCancelInfos[key] = p.NewDataBlob(value, rMapEncoding)
+		blob, err := d.compressor.newDataBlob(value, rMapEncoding)
+		if err != nil {
+			return nil, err
+		}
+		requestCancelInfos[key] = blob
 	}
 	state.RequestCancelInfos = requestCancelInfos
 
@@ -552,7 +580,11 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	sMapEncoding := result["signal_map_encoding"].(string)
 	sMap := result["signal_map"].(map[int64][]byte)
 	for key, value := range sMap {
-		signalInfos[key] = p.NewDataBlob(value, sMapEncoding)
+		blob, err := d.compressor.newDataBlob(value, sMapEncoding)
+		if err != nil {
+			return nil, err
+		}
+		signalInfos[key] = blob
 	}
 	state.SignalInfos = signalInfos
 	state.SignalRequestedIDs = gocql.UUIDsToStringSlice(result["signal_requested"])
@@ -567,8 +599,12 @@ func (d *MutableStateStore) GetWorkflowExecution(
 		return nil, serviceerror.NewInternal("GetWorkflowExecution failed: unknown chasm_node_map type")
 	}
 	for key, value := range chasmNodeBytes {
+		blob, err := d.compressor.newDataBlob(value, chasmNodeEncoding)
+		if err != nil {
+			return nil, err
+		}
 		chasmNodeBlobs[key] = p.InternalChasmNode{
-			CassandraBlob: p.NewDataBlob(value, chasmNodeEncoding),
+			CassandraBlob: blob,
 		}
 	}
 	state.ChasmNodes = chasmNodeBlobs
@@ -576,12 +612,18 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	eList := result["buffered_events_list"].([]map[string]any) //nolint:revive // unchecked-type-assertion: consistent with surrounding Cassandra result parsing
 	bufferedEventsBlobs := make([]*commonpb.DataBlob, 0, len(eList))
 	for _, v := range eList {
-		blob := createHistoryEventBatchBlob(v)
+		blob, err := createHistoryEventBatchBlob(v, d.compressor)
+		if err != nil {
+			return nil, err
+		}
 		bufferedEventsBlobs = append(bufferedEventsBlobs, blob)
 	}
 	state.BufferedEvents = bufferedEventsBlobs
 
-	state.Checksum = p.NewDataBlob(result["checksum"].([]byte), result["checksum_encoding"].(string))
+	state.Checksum, err = d.compressor.newDataBlob(result["checksum"].([]byte), result["checksum_encoding"].(string))
+	if err != nil {
+		return nil, err
+	}
 
 	dbVersion := int64(0)
 	if dbRecordVersion, ok := result["db_record_version"]; ok {
@@ -639,11 +681,15 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 			if namespaceID != newNamespaceID {
 				return serviceerror.NewInternal("UpdateWorkflowExecution: cannot continue as new to another namespace")
 			}
+			executionStateData, executionStateEncoding, err := d.compressor.compressBlob(newWorkflow.ExecutionStateBlob)
+			if err != nil {
+				return err
+			}
 
 			batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
 				newRunID,
-				newWorkflow.ExecutionStateBlob.Data,
-				newWorkflow.ExecutionStateBlob.EncodingType.String(),
+				executionStateData,
+				executionStateEncoding,
 				newLastWriteVersion,
 				newWorkflow.ExecutionState.State,
 				shardID,
@@ -664,11 +710,15 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 			if err != nil {
 				return err
 			}
+			executionStateData, executionStateEncoding, err := d.compressor.compressBlob(executionStateDatablob)
+			if err != nil {
+				return err
+			}
 
 			batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
 				runID,
-				executionStateDatablob.Data,
-				executionStateDatablob.EncodingType.String(),
+				executionStateData,
+				executionStateEncoding,
 				lastWriteVersion,
 				updateWorkflow.ExecutionState.State,
 				request.ShardID,
@@ -686,13 +736,14 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 		return serviceerror.NewInternalf("UpdateWorkflowExecution: unknown mode: %v", request.Mode)
 	}
 
-	if err := applyWorkflowMutationBatch(batch, shardID, &updateWorkflow); err != nil {
+	if err := applyWorkflowMutationBatch(batch, shardID, &updateWorkflow, d.compressor); err != nil {
 		return err
 	}
 	if newWorkflow != nil {
 		if err := applyWorkflowSnapshotBatchAsNew(batch,
 			request.ShardID,
 			newWorkflow,
+			d.compressor,
 		); err != nil {
 			return err
 		}
@@ -794,11 +845,15 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 			// reset workflow is current
 			currentRunID = resetWorkflow.ExecutionState.RunId
 		}
+		executionStateData, executionStateEncoding, err := d.compressor.compressBlob(executionStateBlob)
+		if err != nil {
+			return err
+		}
 
 		batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
 			executionState.RunId,
-			executionStateBlob.Data,
-			executionStateBlob.EncodingType.String(),
+			executionStateData,
+			executionStateEncoding,
 			lastWriteVersion,
 			executionState.State,
 			shardID,
@@ -815,17 +870,17 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 		return serviceerror.NewInternalf("ConflictResolveWorkflowExecution: unknown mode: %v", request.Mode)
 	}
 
-	if err := applyWorkflowSnapshotBatchAsReset(batch, shardID, &resetWorkflow); err != nil {
+	if err := applyWorkflowSnapshotBatchAsReset(batch, shardID, &resetWorkflow, d.compressor); err != nil {
 		return err
 	}
 
 	if currentWorkflow != nil {
-		if err := applyWorkflowMutationBatch(batch, shardID, currentWorkflow); err != nil {
+		if err := applyWorkflowMutationBatch(batch, shardID, currentWorkflow, d.compressor); err != nil {
 			return err
 		}
 	}
 	if newWorkflow != nil {
-		if err := applyWorkflowSnapshotBatchAsNew(batch, shardID, newWorkflow); err != nil {
+		if err := applyWorkflowSnapshotBatchAsNew(batch, shardID, newWorkflow, d.compressor); err != nil {
 			return err
 		}
 	}
@@ -975,7 +1030,7 @@ func (d *MutableStateStore) GetCurrentExecution(
 	}
 
 	currentRunID := gocql.UUIDToString(result["current_run_id"])
-	executionStateBlob, err := executionStateBlobFromRow(result)
+	executionStateBlob, err := executionStateBlobFromRow(result, d.compressor)
 	if err != nil {
 		return nil, serviceerror.NewUnavailablef("GetCurrentExecution operation failed. Error: %v", err)
 	}
@@ -1001,7 +1056,7 @@ func (d *MutableStateStore) SetWorkflowExecution(
 	shardID := request.ShardID
 	setSnapshot := request.SetWorkflowSnapshot
 
-	if err := applyWorkflowSnapshotBatchAsReset(batch, shardID, &setSnapshot); err != nil {
+	if err := applyWorkflowSnapshotBatchAsReset(batch, shardID, &setSnapshot, d.compressor); err != nil {
 		return err
 	}
 
@@ -1074,7 +1129,7 @@ func (d *MutableStateStore) ListConcreteExecutions(
 				continue
 			}
 
-			state, err := mutableStateFromRow(result)
+			state, err := mutableStateFromRow(result, d.compressor)
 			if err != nil {
 				return nil, err
 			}
@@ -1109,10 +1164,15 @@ func (d *MutableStateStore) getCurrentRecordRunID(
 
 func mutableStateFromRow(
 	result map[string]any,
+	compressor *blobCompressor,
 ) (*p.InternalWorkflowMutableState, error) {
 	eiBytes, ok := result["execution"].([]byte)
 	if !ok {
 		return nil, newPersistedTypeMismatchError("execution", "", eiBytes, result)
+	}
+	eiBytes, err := compressor.decompressData(eiBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	eiEncoding, ok := result["execution_encoding"].(string)
@@ -1125,7 +1185,7 @@ func mutableStateFromRow(
 		return nil, newPersistedTypeMismatchError("next_event_id", "", nextEventID, result)
 	}
 
-	protoState, err := executionStateBlobFromRow(result)
+	protoState, err := executionStateBlobFromRow(result, compressor)
 	if err != nil {
 		return nil, err
 	}
@@ -1140,6 +1200,7 @@ func mutableStateFromRow(
 
 func executionStateBlobFromRow(
 	result map[string]any,
+	compressor *blobCompressor,
 ) (*commonpb.DataBlob, error) {
 	state, ok := result["execution_state"].([]byte)
 	if !ok {
@@ -1151,5 +1212,5 @@ func executionStateBlobFromRow(
 		return nil, newPersistedTypeMismatchError("execution_state_encoding", "", stateEncoding, result)
 	}
 
-	return p.NewDataBlob(state, stateEncoding), nil
+	return compressor.newDataBlob(state, stateEncoding)
 }
