@@ -440,6 +440,10 @@ jobs:
           TEMPORAL_TEST_LOG_FILE: ${{ github.workspace }}/.testoutput/debug.log
           TEMPORAL_TEST_LOG_LEVEL: warn
           TEMPORAL_TEST_CLUSTER_EVENTS_FILE: ${{ github.workspace }}/.testoutput/test-cluster-events.jsonl
+          # Keep long race+coverage functional test processes below fork-runner RSS limits.
+          GOMEMLIMIT: 8GiB
+          GOGC: 50
+          GODEBUG: madvdontneed=1
 
       - name: Dump container logs
         if: ${{ failure() && toJson(matrix.containers) != '[]' }}
