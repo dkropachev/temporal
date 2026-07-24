@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,21 +33,74 @@ type counters struct {
 	started uint64
 }
 
+type payloadTemplate struct {
+	data []byte
+}
+
+type benchmarkSummary struct {
+	caseName    string
+	mode        string
+	payloadName string
+	payloadSize int
+	concurrency int
+	duration    time.Duration
+	result      result
+}
+
+type payloadCase struct {
+	name string
+	size int
+}
+
+type suiteProfile struct {
+	name                     string
+	throughputConcurrency    []int
+	payloadCases             []payloadCase
+	minFinalThroughputRetain float64
+}
+
+var suiteProfiles = map[string]suiteProfile{
+	"default": {
+		name:                     "default",
+		throughputConcurrency:    []int{64, 128, 256, 512, 1024},
+		payloadCases:             []payloadCase{{name: "tiny", size: 0}, {name: "4KB", size: 4 << 10}, {name: "32KB", size: 32 << 10}},
+		minFinalThroughputRetain: 0.30,
+	},
+	"scylla-3x4": {
+		name:                     "scylla-3x4",
+		throughputConcurrency:    []int{1, 2, 4, 8, 16},
+		payloadCases:             []payloadCase{{name: "tiny", size: 0}, {name: "4KB", size: 4 << 10}, {name: "32KB", size: 32 << 10}},
+		minFinalThroughputRetain: 0.30,
+	},
+}
+
+const payloadEncoding = "binary/plain"
+
 func main() {
 	target := flag.String("target", "127.0.0.1:7233", "Temporal frontend address")
 	namespace := flag.String("namespace", "bench", "Temporal namespace")
 	taskQueue := flag.String("task-queue", "bench-task-queue", "Task queue")
 	mode := flag.String("mode", "start", "Benchmark mode: start, signal, history, complete, e2e, e2e-parallel")
-	pollerGroups := flag.Bool("poller-groups", false, "Reuse server-advertised poller group IDs for e2e/e2e-parallel polls")
+	suite := flag.String("suite", "", "Benchmark suite: default, scylla-3x4")
+	pollerGroups := flag.Bool("poller-groups", false, "Reuse server-advertised poller group IDs for e2e/e2e-parallel polls when supported")
 	duration := flag.Duration("duration", 10*time.Second, "Benchmark duration")
+	stageDuration := flag.Duration("stage-duration", 2*time.Minute, "Per-stage duration for suite runs")
 	concurrency := flag.Int("concurrency", 16, "Concurrent callers")
 	starters := flag.Int("starters", 0, "Starter goroutines for e2e-parallel; defaults to concurrency")
 	pollers := flag.Int("pollers", 0, "Poller/completer goroutines for e2e-parallel; defaults to concurrency")
 	maxOutstanding := flag.Int("max-outstanding", 0, "Max started but uncompleted workflows for e2e-parallel; defaults to 4*concurrency")
 	pool := flag.Int("pool", 1024, "Workflow pool size for signal/history modes")
-	timeout := flag.Duration("timeout", 5*time.Second, "Per-RPC timeout")
+	payloadSizeFlag := flag.String("payload-size", "0", "Payload size for single run, in bytes or with K/KB/M/MB suffix")
+	timeout := flag.Duration("timeout", 15*time.Second, "Per-RPC timeout")
 	warmup := flag.Duration("warmup", 0, "Warmup duration")
 	flag.Parse()
+
+	payloadSize, err := parseDataSize(*payloadSizeFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "payload size: %v\n", err)
+		os.Exit(1)
+	}
+	payload := newPayloadTemplate(payloadSize)
 
 	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -63,7 +117,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	workflows, err := setupMode(context.Background(), client, *namespace, *taskQueue, *mode, *pool, *concurrency, *timeout)
+	if *suite != "" {
+		summaries, err := runBenchmarkSuite(client, *namespace, *taskQueue, *suite, *pollerGroups, *stageDuration, *timeout)
+		if len(summaries) != 0 {
+			fmt.Print(formatBenchmarkTable(summaries))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "suite %s: %v\n", *suite, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	workflows, err := setupMode(context.Background(), client, *namespace, *taskQueue, *mode, *pool, *concurrency, *timeout, payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "setup %s: %v\n", *mode, err)
 		os.Exit(1)
@@ -71,17 +137,17 @@ func main() {
 
 	if *warmup > 0 {
 		if *mode == "e2e-parallel" {
-			runParallelE2E(client, *namespace, *taskQueue, *pollerGroups, *warmup, *concurrency, *starters, *pollers, *maxOutstanding, *timeout)
+			runParallelE2E(client, *namespace, *taskQueue, *pollerGroups, *warmup, *concurrency, *starters, *pollers, *maxOutstanding, *timeout, payload)
 		} else {
-			run(client, *namespace, *taskQueue, *mode, workflows, *pollerGroups, *warmup, *concurrency, *timeout)
+			run(client, *namespace, *taskQueue, *mode, workflows, *pollerGroups, *warmup, *concurrency, *timeout, payload)
 		}
 	}
 
 	var benchResult result
 	if *mode == "e2e-parallel" {
-		benchResult = runParallelE2E(client, *namespace, *taskQueue, *pollerGroups, *duration, *concurrency, *starters, *pollers, *maxOutstanding, *timeout)
+		benchResult = runParallelE2E(client, *namespace, *taskQueue, *pollerGroups, *duration, *concurrency, *starters, *pollers, *maxOutstanding, *timeout, payload)
 	} else {
-		benchResult = run(client, *namespace, *taskQueue, *mode, workflows, *pollerGroups, *duration, *concurrency, *timeout)
+		benchResult = run(client, *namespace, *taskQueue, *mode, workflows, *pollerGroups, *duration, *concurrency, *timeout, payload)
 	}
 	elapsed := benchResult.elapsed.Seconds()
 	success := atomic.LoadUint64(&benchResult.counts.success)
@@ -196,6 +262,290 @@ func (p *phaseTimings) format() string {
 	return b.String()
 }
 
+func runBenchmarkSuite(
+	client workflowservice.WorkflowServiceClient,
+	namespace string,
+	taskQueue string,
+	profileName string,
+	usePollerGroups bool,
+	stageDuration time.Duration,
+	timeout time.Duration,
+) ([]benchmarkSummary, error) {
+	profile, err := getSuiteProfile(profileName)
+	if err != nil {
+		return nil, err
+	}
+	if stageDuration <= 0 {
+		return nil, errors.New("stage duration must be positive")
+	}
+
+	var summaries []benchmarkSummary
+	for _, concurrency := range profile.throughputConcurrency {
+		payload := newPayloadTemplate(0)
+		fmt.Fprintf(os.Stderr, "running case=max-throughput mode=e2e-parallel payload=tiny concurrency=%d duration=%s\n", concurrency, stageDuration)
+		benchResult := runParallelE2E(client, namespace, taskQueue, usePollerGroups, stageDuration, concurrency, concurrency, concurrency, 0, timeout, payload)
+		summaries = append(summaries, benchmarkSummary{
+			caseName:    "max-throughput",
+			mode:        "e2e-parallel",
+			payloadName: "tiny",
+			payloadSize: 0,
+			concurrency: concurrency,
+			duration:    stageDuration,
+			result:      benchResult,
+		})
+	}
+	retentionErr := validateFinalThroughputRetention(summaries, profile.minFinalThroughputRetain)
+
+	payloadConcurrency := bestConcurrency(summaries)
+	for _, payloadCase := range profile.payloadCases {
+		payload := newPayloadTemplate(payloadCase.size)
+		fmt.Fprintf(os.Stderr, "running case=payload-sensitivity mode=e2e-parallel payload=%s concurrency=%d duration=%s\n", payloadCase.name, payloadConcurrency, stageDuration)
+		benchResult := runParallelE2E(client, namespace, taskQueue, usePollerGroups, stageDuration, payloadConcurrency, payloadConcurrency, payloadConcurrency, 0, timeout, payload)
+		summaries = append(summaries, benchmarkSummary{
+			caseName:    "payload-sensitivity",
+			mode:        "e2e-parallel",
+			payloadName: payloadCase.name,
+			payloadSize: payloadCase.size,
+			concurrency: payloadConcurrency,
+			duration:    stageDuration,
+			result:      benchResult,
+		})
+	}
+
+	return summaries, retentionErr
+}
+
+func getSuiteProfile(name string) (suiteProfile, error) {
+	profile, ok := suiteProfiles[name]
+	if !ok {
+		return suiteProfile{}, fmt.Errorf("unknown suite %q", name)
+	}
+	return profile, nil
+}
+
+func bestConcurrency(summaries []benchmarkSummary) int {
+	var best benchmarkSummary
+	for _, summary := range summaries {
+		if summary.caseName != "max-throughput" || summary.failed() != 0 {
+			continue
+		}
+		if best.concurrency == 0 || summary.rps() > best.rps() {
+			best = summary
+		}
+	}
+	if best.concurrency != 0 {
+		return best.concurrency
+	}
+	for _, summary := range summaries {
+		if summary.caseName != "max-throughput" {
+			continue
+		}
+		if best.concurrency == 0 || summary.rps() > best.rps() {
+			best = summary
+		}
+	}
+	return best.concurrency
+}
+
+func validateFinalThroughputRetention(summaries []benchmarkSummary, minRetain float64) error {
+	var throughput []benchmarkSummary
+	for _, summary := range summaries {
+		if summary.caseName == "max-throughput" {
+			throughput = append(throughput, summary)
+		}
+	}
+	if len(throughput) < 2 {
+		return nil
+	}
+
+	previous := throughput[len(throughput)-2]
+	final := throughput[len(throughput)-1]
+	previousRPS := previous.rps()
+	if previousRPS == 0 {
+		return nil
+	}
+	retained := final.rps() / previousRPS
+	if retained < minRetain {
+		return fmt.Errorf(
+			"final max-throughput stage retained %.1f%% of previous stage throughput, below %.1f%% minimum",
+			retained*100,
+			minRetain*100,
+		)
+	}
+	return nil
+}
+
+func formatBenchmarkTable(summaries []benchmarkSummary) string {
+	var b strings.Builder
+	b.WriteString("| Case | Mode | Payload | Bytes | Concurrency | Duration | Success | Failed | RPS | RPC RPS | Start RPS | Start p95 ms | Poll p95 ms | WFT S2S p95 ms | Complete p95 ms | First Error |\n")
+	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	for _, summary := range summaries {
+		fmt.Fprintf(
+			&b,
+			"| %s | %s | %s | %d | %d | %s | %d | %d | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %s |\n",
+			summary.caseName,
+			summary.mode,
+			summary.payloadName,
+			summary.payloadSize,
+			summary.concurrency,
+			summary.duration.Round(time.Millisecond),
+			summary.success(),
+			summary.failed(),
+			summary.rps(),
+			summary.rpcRPS(),
+			summary.startRPS(),
+			summary.startP95(),
+			summary.pollP95(),
+			summary.scheduleToStartP95(),
+			summary.completeP95(),
+			sanitizeTable(summary.result.firstErr),
+		)
+	}
+	return b.String()
+}
+
+func (s *benchmarkSummary) success() uint64 {
+	return atomic.LoadUint64(&s.result.counts.success)
+}
+
+func (s *benchmarkSummary) failed() uint64 {
+	return atomic.LoadUint64(&s.result.counts.failed)
+}
+
+func (s *benchmarkSummary) rpc() uint64 {
+	return atomic.LoadUint64(&s.result.counts.rpc)
+}
+
+func (s *benchmarkSummary) started() uint64 {
+	return atomic.LoadUint64(&s.result.counts.started)
+}
+
+func (s *benchmarkSummary) rps() float64 {
+	return rate(s.success(), s.result.elapsed)
+}
+
+func (s *benchmarkSummary) rpcRPS() float64 {
+	return rate(s.rpc(), s.result.elapsed)
+}
+
+func (s *benchmarkSummary) startRPS() float64 {
+	return rate(s.started(), s.result.elapsed)
+}
+
+func (s *benchmarkSummary) startP95() float64 {
+	if s.result.phases == nil {
+		return 0
+	}
+	return percentile(s.result.phases.start.snapshot(), 0.95)
+}
+
+func (s *benchmarkSummary) pollP95() float64 {
+	if s.result.phases == nil {
+		return 0
+	}
+	return percentile(s.result.phases.poll.snapshot(), 0.95)
+}
+
+func (s *benchmarkSummary) scheduleToStartP95() float64 {
+	if s.result.phases == nil {
+		return 0
+	}
+	return percentile(s.result.phases.scheduleToStart.snapshot(), 0.95)
+}
+
+func (s *benchmarkSummary) completeP95() float64 {
+	if s.result.phases == nil {
+		return 0
+	}
+	return percentile(s.result.phases.complete.snapshot(), 0.95)
+}
+
+func rate(count uint64, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(count) / elapsed.Seconds()
+}
+
+func sanitizeTable(value string) string {
+	if value == "" {
+		return ""
+	}
+	value = sanitize(value)
+	return strings.ReplaceAll(value, "|", "\\|")
+}
+
+func parseDataSize(value string) (int, error) {
+	original := value
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+
+	normalized := strings.ToUpper(value)
+	multiplier := int64(1)
+	for _, suffix := range []struct {
+		text       string
+		multiplier int64
+	}{
+		{text: "KB", multiplier: 1 << 10},
+		{text: "K", multiplier: 1 << 10},
+		{text: "MB", multiplier: 1 << 20},
+		{text: "M", multiplier: 1 << 20},
+		{text: "B", multiplier: 1},
+	} {
+		if strings.HasSuffix(normalized, suffix.text) {
+			normalized = strings.TrimSpace(strings.TrimSuffix(normalized, suffix.text))
+			multiplier = suffix.multiplier
+			break
+		}
+	}
+
+	size, err := strconv.ParseInt(normalized, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q", original)
+	}
+	if size < 0 {
+		return 0, errors.New("size must be non-negative")
+	}
+	const maxInt = int64(1<<(strconv.IntSize-1) - 1)
+	if size > maxInt/multiplier {
+		return 0, fmt.Errorf("size %q overflows int", original)
+	}
+	return int(size * multiplier), nil
+}
+
+func newPayloadTemplate(size int) payloadTemplate {
+	if size <= 0 {
+		return payloadTemplate{}
+	}
+
+	data := make([]byte, size)
+	for offset, block := 0, uint64(0); offset < len(data); block++ {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("temporal-rpsbench-payload-%d", block)))
+		offset += copy(data[offset:], sum[:])
+	}
+	return payloadTemplate{data: data}
+}
+
+func payloadForSize(size int) *commonpb.Payloads {
+	return newPayloadTemplate(size).payloads()
+}
+
+func (p payloadTemplate) payloads() *commonpb.Payloads {
+	if len(p.data) == 0 {
+		return nil
+	}
+	return &commonpb.Payloads{
+		Payloads: []*commonpb.Payload{
+			{
+				Metadata: map[string][]byte{"encoding": []byte(payloadEncoding)},
+				Data:     p.data,
+			},
+		},
+	}
+}
+
 func ensureNamespace(ctx context.Context, client workflowservice.WorkflowServiceClient, namespace string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -231,6 +581,7 @@ func setupMode(
 	pool int,
 	concurrency int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) ([]string, error) {
 	switch mode {
 	case "start", "e2e", "e2e-parallel":
@@ -257,7 +608,7 @@ func setupMode(
 					return
 				}
 				id := fmt.Sprintf("%s-%d", prefix, idx)
-				err := startWorkflow(client, namespace, taskQueue, id, requestID(fmt.Sprintf("%s-request-%d", prefix, idx)), timeout, time.Minute)
+				err := startWorkflow(client, namespace, taskQueue, id, requestID(fmt.Sprintf("%s-request-%d", prefix, idx)), timeout, time.Minute, payload)
 				if err != nil {
 					failed.Add(1)
 					if firstErr.Load() == nil {
@@ -286,6 +637,7 @@ func run(
 	duration time.Duration,
 	concurrency int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) result {
 	deadline := time.Now().Add(duration)
 	started := time.Now()
@@ -316,6 +668,7 @@ func run(
 					id,
 					pollerGroupID,
 					timeout,
+					payload,
 				)
 				if err != nil {
 					atomic.AddUint64(&counts.failed, 1)
@@ -350,6 +703,7 @@ func runIteration(
 	id uint64,
 	pollerGroupID string,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) (int, string, e2eTimings, error) {
 	requestIDSeed := fmt.Sprintf("request-%d-%d-%d", started.UnixNano(), worker, id)
 	switch mode {
@@ -362,6 +716,7 @@ func runIteration(
 			requestID(requestIDSeed),
 			timeout,
 			time.Minute,
+			payload,
 		)
 	case "signal":
 		return 1, pollerGroupID, e2eTimings{}, signalWorkflow(
@@ -370,6 +725,7 @@ func runIteration(
 			workflows[int(id)%len(workflows)],
 			requestID(requestIDSeed),
 			timeout,
+			payload,
 		)
 	case "history":
 		return 1, pollerGroupID, e2eTimings{}, getHistory(
@@ -389,6 +745,7 @@ func runIteration(
 			usePollerGroups,
 			worker,
 			timeout,
+			payload,
 		)
 		return 3, nextPollerGroupID, timings, err
 	case "complete":
@@ -400,6 +757,7 @@ func runIteration(
 			usePollerGroups,
 			worker,
 			timeout,
+			payload,
 		)
 		return 2, nextPollerGroupID, timings, err
 	default:
@@ -418,6 +776,7 @@ func runParallelE2E(
 	pollers int,
 	maxOutstanding int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) result {
 	if starters <= 0 {
 		starters = concurrency
@@ -473,6 +832,7 @@ func runParallelE2E(
 				recordErr,
 				&counts,
 				&phases,
+				payload,
 			)
 		})
 	}
@@ -494,6 +854,7 @@ func runParallelE2E(
 				recordErr,
 				&counts,
 				&phases,
+				payload,
 			)
 		})
 	}
@@ -522,6 +883,7 @@ func runPoller(
 	recordErr func(error),
 	counts *counters,
 	phases *phaseTimings,
+	payload payloadTemplate,
 ) {
 	pollerGroupID := ""
 	for {
@@ -537,6 +899,7 @@ func runPoller(
 			usePollerGroups,
 			worker,
 			timeout,
+			payload,
 		)
 		if err != nil {
 			if ctx.Err() != nil || status.Code(err) == codes.Canceled {
@@ -574,6 +937,7 @@ func runStarter(
 	recordErr func(error),
 	counts *counters,
 	phases *phaseTimings,
+	payload payloadTemplate,
 ) {
 	for {
 		select {
@@ -586,7 +950,7 @@ func runStarter(
 		workflowID := fmt.Sprintf("bench-e2e-parallel-%d-%d-%d", startedAt.UnixNano(), worker, id)
 		reqID := requestID(fmt.Sprintf("request-e2e-parallel-%d-%d-%d", startedAt.UnixNano(), worker, id))
 		opStarted := time.Now()
-		err := startWorkflow(client, namespace, taskQueue, workflowID, reqID, timeout, 10*time.Second)
+		err := startWorkflow(client, namespace, taskQueue, workflowID, reqID, timeout, 10*time.Second, payload)
 		if err != nil {
 			releaseOutstanding(outstanding)
 			if time.Now().Before(deadline) {
@@ -611,6 +975,7 @@ func startWorkflow(
 	requestID string,
 	timeout time.Duration,
 	workflowTaskTimeout time.Duration,
+	payload payloadTemplate,
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -622,6 +987,7 @@ func startWorkflow(
 		WorkflowExecutionTimeout: durationpb.New(time.Hour),
 		WorkflowRunTimeout:       durationpb.New(time.Hour),
 		WorkflowTaskTimeout:      durationpb.New(workflowTaskTimeout),
+		Input:                    payload.payloads(),
 		Identity:                 "temporal-rpsbench",
 		RequestId:                requestID,
 	})
@@ -634,6 +1000,7 @@ func signalWorkflow(
 	workflowID string,
 	requestID string,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -641,6 +1008,7 @@ func signalWorkflow(
 		Namespace:         namespace,
 		WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: workflowID},
 		SignalName:        "bench-signal",
+		Input:             payload.payloads(),
 		Identity:          "temporal-rpsbench",
 		RequestId:         requestID,
 	})
@@ -676,16 +1044,17 @@ func runE2E(
 	usePollerGroups bool,
 	worker int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) (e2eTimings, string, error) {
 	var timings e2eTimings
 	started := time.Now()
-	if err := startWorkflow(client, namespace, taskQueue, workflowID, requestID, timeout, 10*time.Second); err != nil {
+	if err := startWorkflow(client, namespace, taskQueue, workflowID, requestID, timeout, 10*time.Second, payload); err != nil {
 		timings.start = time.Since(started)
 		return timings, pollerGroupID, err
 	}
 	timings.start = time.Since(started)
 
-	workerTimings, pollerGroupID, err := completeWorkflowTask(client, namespace, taskQueue, pollerGroupID, usePollerGroups, worker, timeout)
+	workerTimings, pollerGroupID, err := completeWorkflowTask(client, namespace, taskQueue, pollerGroupID, usePollerGroups, worker, timeout, payload)
 	timings.poll = workerTimings.poll
 	timings.complete = workerTimings.complete
 	return timings, pollerGroupID, err
@@ -699,8 +1068,9 @@ func completeWorkflowTask(
 	usePollerGroups bool,
 	worker int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) (e2eTimings, string, error) {
-	return completeWorkflowTaskWithContext(context.Background(), client, namespace, taskQueue, pollerGroupID, usePollerGroups, worker, timeout)
+	return completeWorkflowTaskWithContext(context.Background(), client, namespace, taskQueue, pollerGroupID, usePollerGroups, worker, timeout, payload)
 }
 
 func completeWorkflowTaskWithContext(
@@ -712,15 +1082,15 @@ func completeWorkflowTaskWithContext(
 	usePollerGroups bool,
 	worker int,
 	timeout time.Duration,
+	payload payloadTemplate,
 ) (e2eTimings, string, error) {
 	var timings e2eTimings
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	pollResp, err := client.PollWorkflowTaskQueue(ctx, &workflowservice.PollWorkflowTaskQueueRequest{
-		Namespace:     namespace,
-		TaskQueue:     &taskqueuepb.TaskQueue{Name: taskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-		PollerGroupId: pollerGroupID,
-		Identity:      "temporal-rpsbench",
+		Namespace: namespace,
+		TaskQueue: &taskqueuepb.TaskQueue{Name: taskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		Identity:  "temporal-rpsbench",
 	})
 	cancel()
 	if err != nil {
@@ -734,9 +1104,6 @@ func completeWorkflowTaskWithContext(
 	if scheduled, started := pollResp.GetScheduledTime(), pollResp.GetStartedTime(); scheduled != nil && started != nil {
 		timings.scheduleToStart = started.AsTime().Sub(scheduled.AsTime())
 	}
-	if usePollerGroups {
-		pollerGroupID = choosePollerGroupID(pollResp, pollerGroupID, worker)
-	}
 
 	started = time.Now()
 	ctx, cancel = context.WithTimeout(parent, timeout)
@@ -749,7 +1116,9 @@ func completeWorkflowTaskWithContext(
 			{
 				CommandType: enumspb.COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION,
 				Attributes: &commandpb.Command_CompleteWorkflowExecutionCommandAttributes{
-					CompleteWorkflowExecutionCommandAttributes: &commandpb.CompleteWorkflowExecutionCommandAttributes{},
+					CompleteWorkflowExecutionCommandAttributes: &commandpb.CompleteWorkflowExecutionCommandAttributes{
+						Result: payload.payloads(),
+					},
 				},
 			},
 		},
@@ -776,22 +1145,6 @@ func requestID(seed string) string {
 	sum[6] = (sum[6] & 0x0f) | 0x40
 	sum[8] = (sum[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
-}
-
-func choosePollerGroupID(resp *workflowservice.PollWorkflowTaskQueueResponse, current string, worker int) string {
-	groups := resp.GetPollerGroupsInfo().GetPollerGroups()
-	if len(groups) == 0 {
-		//nolint:staticcheck // Older servers only return the deprecated field.
-		groups = resp.GetPollerGroupInfos()
-	}
-	if len(groups) == 0 {
-		return current
-	}
-	group := groups[worker%len(groups)].GetId()
-	if group == "" {
-		return current
-	}
-	return group
 }
 
 func releaseOutstanding(outstanding chan struct{}) {
