@@ -152,8 +152,8 @@ jobs:
           JOB_TYPES: |
             functest:
               cmd: make functional-test-coverage
-              test_timeout: 35m
-              github_timeout: 40
+              test_timeout: 55m
+              github_timeout: 60
               sharded: true
             smoke:
               cmd: make functional-test-coverage
@@ -444,6 +444,9 @@ jobs:
           GOMEMLIMIT: 8GiB
           GOGC: 50
           GODEBUG: madvdontneed=1
+          TEST_PARALLEL_FLAGS: ${{ needs.test-setup.outputs.runner_arm == 'ubuntu-24.04-arm' && '-parallel=2' || '' }}
+          TEMPORAL_TEST_SHARED_CLUSTERS: ${{ needs.test-setup.outputs.runner_arm == 'ubuntu-24.04-arm' && '1' || '' }}
+          TEMPORAL_TEST_DEDICATED_CLUSTERS: ${{ needs.test-setup.outputs.runner_arm == 'ubuntu-24.04-arm' && '1' || '' }}
 
       - name: Dump container logs
         if: ${{ failure() && toJson(matrix.containers) != '[]' }}
