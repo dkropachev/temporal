@@ -11,12 +11,14 @@ import (
 const benchmarkExecutableTrackerTaskCount = 1024
 
 var benchmarkExecutableTrackerSink *executableTracker
+var benchmarkGrouperKeySink any
 
 type benchmarkTrackerExecutable struct {
 	Executable
 
-	key         tasks.Key
-	namespaceID string
+	key          tasks.Key
+	namespaceID  string
+	namespaceKey any
 }
 
 func (e *benchmarkTrackerExecutable) GetKey() tasks.Key {
@@ -25,6 +27,10 @@ func (e *benchmarkTrackerExecutable) GetKey() tasks.Key {
 
 func (e *benchmarkTrackerExecutable) GetNamespaceID() string {
 	return e.namespaceID
+}
+
+func (e *benchmarkTrackerExecutable) namespaceGroupKey() any {
+	return e.namespaceKey
 }
 
 func TestExecutableTrackerSplit(t *testing.T) {
@@ -144,12 +150,27 @@ func BenchmarkExecutableTrackerSplit(b *testing.B) {
 	})
 }
 
+func BenchmarkGrouperNamespaceIDKey(b *testing.B) {
+	grouper := GrouperNamespaceID{}
+	executable := &benchmarkTrackerExecutable{
+		namespaceID:  "namespace",
+		namespaceKey: "namespace",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkGrouperKeySink = grouper.Key(executable)
+	}
+}
+
 func newExecutableTrackerForTest(taskCount int) *executableTracker {
 	tracker := newExecutableTracker(GrouperNamespaceID{})
 	for taskID := 0; taskID < taskCount; taskID++ {
 		tracker.add(&benchmarkTrackerExecutable{
-			key:         tasks.NewImmediateKey(int64(taskID)),
-			namespaceID: "namespace",
+			key:          tasks.NewImmediateKey(int64(taskID)),
+			namespaceID:  "namespace",
+			namespaceKey: "namespace",
 		})
 	}
 	return tracker

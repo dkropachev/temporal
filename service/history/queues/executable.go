@@ -102,6 +102,7 @@ const (
 type (
 	executableImpl struct {
 		tasks.Task
+		namespaceKey any
 
 		sync.Mutex
 		state ctasks.State
@@ -187,8 +188,9 @@ func NewExecutable(
 		opt(&params)
 	}
 	e := &executableImpl{
-		Task:  task,
-		state: ctasks.TaskStatePending,
+		Task:         task,
+		namespaceKey: task.GetNamespaceID(),
+		state:        ctasks.TaskStatePending,
 
 		attempt:             1,
 		executor:            executor,
@@ -224,6 +226,10 @@ func NewExecutable(
 		metrics.QueueReaderIDTag(readerID),
 	)
 	return e
+}
+
+func (e *executableImpl) namespaceGroupKey() any {
+	return e.namespaceKey
 }
 
 func (e *executableImpl) Execute() (retErr error) {

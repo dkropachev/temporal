@@ -16,7 +16,14 @@ type Grouper interface {
 type GrouperNamespaceID struct {
 }
 
+type namespaceGroupKeyProvider interface {
+	namespaceGroupKey() any
+}
+
 func (GrouperNamespaceID) Key(task tasks.Task) (key any) {
+	if provider, ok := task.(namespaceGroupKeyProvider); ok {
+		return provider.namespaceGroupKey()
+	}
 	return task.GetNamespaceID()
 }
 

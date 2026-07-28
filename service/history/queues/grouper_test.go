@@ -10,10 +10,28 @@ import (
 	"go.temporal.io/server/service/history/tasks"
 )
 
+type taskWithNamespaceGroupKey struct {
+	tasks.Task
+	key any
+}
+
+func (t *taskWithNamespaceGroupKey) namespaceGroupKey() any {
+	return t.key
+}
+
 func TestGrouperNamespaceID_Key(t *testing.T) {
 	g := GrouperNamespaceID{}
 	k := g.Key(tasks.NewFakeTask(definition.NewWorkflowKey("nid", "", ""), tasks.CategoryTransfer, time.Now()))
 	require.Equal(t, "nid", k)
+}
+
+func TestGrouperNamespaceID_KeyProvider(t *testing.T) {
+	g := GrouperNamespaceID{}
+	k := g.Key(&taskWithNamespaceGroupKey{
+		Task: tasks.NewFakeTask(definition.NewWorkflowKey("nid", "", ""), tasks.CategoryTransfer, time.Now()),
+		key:  "cached-nid",
+	})
+	require.Equal(t, "cached-nid", k)
 }
 
 func TestGrouperNamespaceID_Predicate(t *testing.T) {
