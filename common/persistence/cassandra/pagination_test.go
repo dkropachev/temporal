@@ -26,6 +26,7 @@ var (
 	benchmarkQueueSink                     *Queue
 	benchmarkExecutionStateSink            []*p.InternalWorkflowMutableState
 	benchmarkConcreteExecutionResponseSink *p.InternalListConcreteExecutionsResponse
+	benchmarkHistoryBranchResponseSink     *p.InternalReadHistoryBranchResponse
 	benchmarkTaskResponseSink              *p.InternalGetTasksResponse
 	benchmarkBoolSink                      bool
 )
@@ -1107,6 +1108,47 @@ func TestReadHistoryBranchReverseUsesBranchPartition(t *testing.T) {
 	require.Len(t, session.queries, 1)
 }
 
+func TestReadHistoryBranchMetadataOnlyUsesTypedScan(t *testing.T) {
+	const (
+		treeID   = "11111111-1111-1111-1111-111111111111"
+		branchID = "22222222-2222-2222-2222-222222222222"
+	)
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, v2templateReadHistoryNodeMetadata, stmt)
+			require.Equal(t, []any{treeID, branchID, int64(1), int64(10)}, args)
+			return &recordingQuery{
+				iter: &recordingIter{
+					scanRows: [][]any{
+						{int64(1), int64(2), int64(3)},
+					},
+				},
+			}
+		},
+	}
+	store := NewHistoryStore(session, serialization.NewSerializer())
+	branchToken, err := store.NewHistoryBranch("", "", "", treeID, util.Ptr(branchID), nil, 0, 0, 0)
+	require.NoError(t, err)
+
+	response, err := store.ReadHistoryBranch(t.Context(), &p.InternalReadHistoryBranchRequest{
+		BranchToken:  branchToken,
+		BranchID:     branchID,
+		MinNodeID:    1,
+		MaxNodeID:    10,
+		PageSize:     1,
+		MetadataOnly: true,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, response.Nodes, 1)
+	require.Equal(t, int64(1), response.Nodes[0].NodeID)
+	require.Equal(t, int64(2), response.Nodes[0].PrevTransactionID)
+	require.Equal(t, int64(3), response.Nodes[0].TransactionID)
+	require.Empty(t, response.Nodes[0].Events.Data)
+	require.Equal(t, enumspb.ENCODING_TYPE_UNSPECIFIED, response.Nodes[0].Events.EncodingType)
+}
+
 func TestReadHistoryBranchReturnsPageTokenAfterScan(t *testing.T) {
 	const (
 		treeID   = "11111111-1111-1111-1111-111111111111"
@@ -1120,13 +1162,13 @@ func TestReadHistoryBranchReturnsPageTokenAfterScan(t *testing.T) {
 			require.Equal(t, []any{treeID, branchID, int64(1), int64(10)}, args)
 			return &recordingQuery{
 				iter: &recordingIter{
-					mapRows: []map[string]any{
+					scanRows: [][]any{
 						{
-							"node_id":       int64(1),
-							"prev_txn_id":   int64(0),
-							"txn_id":        int64(1),
-							"data":          []byte("events"),
-							"data_encoding": enumspb.ENCODING_TYPE_PROTO3.String(),
+							int64(1),
+							int64(0),
+							int64(1),
+							[]byte("events"),
+							enumspb.ENCODING_TYPE_PROTO3.String(),
 						},
 					},
 					pageState:               pageToken,
@@ -1152,18 +1194,13 @@ func TestReadHistoryBranchReturnsPageTokenAfterScan(t *testing.T) {
 	require.Len(t, response.Nodes, 1)
 }
 
-func TestReadHistoryBranchClosesIteratorOnRowError(t *testing.T) {
+func TestReadHistoryBranchClosesIteratorOnScanError(t *testing.T) {
 	const (
 		treeID   = "11111111-1111-1111-1111-111111111111"
 		branchID = "22222222-2222-2222-2222-222222222222"
 	)
 	iter := &recordingIter{
-		mapRows: []map[string]any{
-			{
-				"node_id": int64(1),
-				"txn_id":  int64(1),
-			},
-		},
+		closeErr: errors.New("scan failed"),
 	}
 	session := &recordingSession{
 		t: t,
@@ -1189,7 +1226,54 @@ func TestReadHistoryBranchClosesIteratorOnRowError(t *testing.T) {
 
 	require.Error(t, err)
 	require.Nil(t, response)
+	require.ErrorContains(t, err, "scan failed")
 	require.Equal(t, 1, iter.closeCalls)
+}
+
+func BenchmarkReadHistoryBranchPage(b *testing.B) {
+	const (
+		treeID   = "11111111-1111-1111-1111-111111111111"
+		branchID = "22222222-2222-2222-2222-222222222222"
+	)
+	rows := make([][]any, 100)
+	for i := range rows {
+		rows[i] = []any{
+			int64(i + 1),
+			int64(i),
+			int64(i + 1),
+			[]byte("events"),
+			enumspb.ENCODING_TYPE_PROTO3.String(),
+		}
+	}
+	session := &recordingSession{
+		t: b,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				iter: &recordingIter{
+					scanRows: rows,
+				},
+			}
+		},
+	}
+	store := NewHistoryStore(session, serialization.NewSerializer())
+	branchToken, err := store.NewHistoryBranch("", "", "", treeID, util.Ptr(branchID), nil, 0, 0, 0)
+	require.NoError(b, err)
+	request := &p.InternalReadHistoryBranchRequest{
+		BranchToken: branchToken,
+		BranchID:    branchID,
+		MinNodeID:   1,
+		MaxNodeID:   101,
+		PageSize:    100,
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		response, err := store.ReadHistoryBranch(b.Context(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkHistoryBranchResponseSink = response
+	}
 }
 
 func TestGetAllHistoryTreeBranchesReturnsPageTokenAfterScan(t *testing.T) {

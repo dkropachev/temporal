@@ -171,15 +171,28 @@ func (h *HistoryStore) ReadHistoryBranch(
 	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
 	nodes := make([]p.InternalHistoryNode, 0, request.PageSize)
-	message := make(map[string]any)
-	for iter.MapScan(message) {
-		node, err := convertHistoryNode(message)
-		if err != nil {
-			_ = iter.Close()
-			return nil, err
-		}
-		nodes = append(nodes, node)
-		message = make(map[string]any)
+	var nodeID int64
+	var prevTxnID int64
+	var txnID int64
+	var data []byte
+	var dataEncoding string
+	scanDestinations := []any{&nodeID, &prevTxnID, &txnID}
+	if !request.MetadataOnly {
+		scanDestinations = append(scanDestinations, &data, &dataEncoding)
+	}
+	for iter.Scan(scanDestinations...) {
+		nodes = append(nodes, p.InternalHistoryNode{
+			NodeID:            nodeID,
+			PrevTransactionID: prevTxnID,
+			TransactionID:     txnID,
+			Events:            p.NewDataBlob(data, dataEncoding),
+		})
+
+		nodeID = 0
+		prevTxnID = 0
+		txnID = 0
+		data = nil
+		dataEncoding = ""
 	}
 
 	var pagingToken []byte
@@ -402,42 +415,6 @@ func (h *HistoryStore) GetHistoryTreeContainingBranch(
 
 func (h *HistoryStore) GetHistoryBranchUtil() p.HistoryBranchUtil {
 	return h.HistoryBranchUtil
-}
-
-func convertHistoryNode(
-	message map[string]any,
-) (p.InternalHistoryNode, error) {
-	nodeID, err := getTypedFieldFromRow[int64]("node_id", message)
-	if err != nil {
-		return p.InternalHistoryNode{}, err
-	}
-	prevTxnID, err := getTypedFieldFromRow[int64]("prev_txn_id", message)
-	if err != nil {
-		return p.InternalHistoryNode{}, err
-	}
-	txnID, err := getTypedFieldFromRow[int64]("txn_id", message)
-	if err != nil {
-		return p.InternalHistoryNode{}, err
-	}
-
-	var data []byte
-	var dataEncoding string
-	if _, ok := message["data"]; ok {
-		data, err = getTypedFieldFromRow[[]byte]("data", message)
-		if err != nil {
-			return p.InternalHistoryNode{}, err
-		}
-		dataEncoding, err = getTypedFieldFromRow[string]("data_encoding", message)
-		if err != nil {
-			return p.InternalHistoryNode{}, err
-		}
-	}
-	return p.InternalHistoryNode{
-		NodeID:            nodeID,
-		PrevTransactionID: prevTxnID,
-		TransactionID:     txnID,
-		Events:            p.NewDataBlob(data, dataEncoding),
-	}, nil
 }
 
 func convertTimeoutError(err error) error {

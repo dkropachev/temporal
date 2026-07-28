@@ -110,6 +110,7 @@ CASSANDRA_PORT=9042 \
 CASSANDRA_MAX_CONNS=12 \
 CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE=2 \
 go test -tags test_dep ./common/persistence/tests -run '^$' -bench 'BenchmarkCassandra(HistoryNodeAppendRead|QueueV2EnqueueRead)$' -benchtime=30s -count=3
+go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkReadHistoryBranchPage$' -benchmem -benchtime=10000x -count=3
 ```
 
 Include the legacy namespace-replication queue benchmark when validating queue append changes:
@@ -453,6 +454,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   every task. A focused 100-task V1 read-page benchmark improved from `15.752-16.915 us/op`, `43176-43178 B/op`, and
   308 allocations to `6.016-6.073 us/op`, `14432-14433 B/op`, and 211 allocations. V1 and V2 retain nullable task-ID
   handling so static-only rows are skipped without treating task ID zero as a sentinel.
+- Cassandra history branch reads now use typed scans for both full-node and metadata-only query shapes. A focused
+  100-node page benchmark improved from `20.460-22.430 us/op`, `45896-45897 B/op`, and 311 allocations to
+  `4.624-4.852 us/op`, `12456-12457 B/op`, and 116 allocations. Reverse-order reads retain the same fixed column shape,
+  and metadata-only reads scan only the three selected ID columns.
 - Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without
