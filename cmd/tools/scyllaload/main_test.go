@@ -25,6 +25,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 		"-address=frontend:7233",
 		"-namespace=load-test",
 		"-task-queue=load-task-queue",
+		"-task-queues=5",
+		"-workers-per-task-queue=2",
 		"-workflows=7",
 		"-concurrency=3",
 		"-activities-each=2",
@@ -54,6 +56,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	require.Equal(t, "frontend:7233", cfg.address)
 	require.Equal(t, "load-test", cfg.namespace)
 	require.Equal(t, "load-task-queue", cfg.taskQueue)
+	require.Equal(t, 5, cfg.taskQueues)
+	require.Equal(t, 2, cfg.workersPerTaskQueue)
 	require.Equal(t, 7, cfg.workflows)
 	require.Equal(t, 3, cfg.concurrency)
 	require.Equal(t, 2, cfg.activitiesEach)
@@ -83,6 +87,24 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	}, cfg.profileSummaries)
 	require.Equal(t, "/tmp/scyllaload.result.json", cfg.resultFile)
 	require.Equal(t, "/tmp/scyllaload.metadata.json", cfg.runMetadataFile)
+}
+
+func TestValidateConfigRequiresPositiveTaskQueuesAndWorkers(t *testing.T) {
+	cfg := runConfig{
+		workflows:           1,
+		concurrency:         1,
+		taskQueues:          1,
+		workersPerTaskQueue: 1,
+		serverCPUTime:       time.Second,
+	}
+
+	invalidTaskQueues := cfg
+	invalidTaskQueues.taskQueues = 0
+	require.ErrorContains(t, validateConfig(invalidTaskQueues), "-task-queues")
+
+	invalidWorkers := cfg
+	invalidWorkers.workersPerTaskQueue = 0
+	require.ErrorContains(t, validateConfig(invalidWorkers), "-workers-per-task-queue")
 }
 
 func TestLoadWorkflowRunsActivities(t *testing.T) {
@@ -116,6 +138,17 @@ func TestLoadWorkflowConsumesSignals(t *testing.T) {
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
+}
+
+func TestTaskQueueName(t *testing.T) {
+	require.Equal(t, "load-task-queue", taskQueueName(runConfig{
+		taskQueue:  "load-task-queue",
+		taskQueues: 1,
+	}, 3))
+	require.Equal(t, "load-task-queue-3", taskQueueName(runConfig{
+		taskQueue:  "load-task-queue",
+		taskQueues: 5,
+	}, 3))
 }
 
 func TestRunLoadCountsUnlaunchedWorkflowsAsFailed(t *testing.T) {
@@ -244,18 +277,22 @@ func TestServerProfilesFetchPPROFEndpoints(t *testing.T) {
 
 func TestValidateConfigRequiresServerPPROFForServerProfiles(t *testing.T) {
 	err := validateConfig(runConfig{
-		workflows:     1,
-		concurrency:   1,
-		serverCPU:     "/tmp/server-cpu.pprof",
-		serverCPUTime: time.Second,
+		workflows:           1,
+		concurrency:         1,
+		taskQueues:          1,
+		workersPerTaskQueue: 1,
+		serverCPU:           "/tmp/server-cpu.pprof",
+		serverCPUTime:       time.Second,
 	})
 	require.ErrorContains(t, err, "-server-pprof")
 
 	err = validateConfig(runConfig{
-		workflows:     1,
-		concurrency:   1,
-		serverHeap:    "/tmp/server-heap.pprof",
-		serverCPUTime: time.Second,
+		workflows:           1,
+		concurrency:         1,
+		taskQueues:          1,
+		workersPerTaskQueue: 1,
+		serverHeap:          "/tmp/server-heap.pprof",
+		serverCPUTime:       time.Second,
 	})
 	require.ErrorContains(t, err, "-server-pprof")
 }
@@ -324,18 +361,20 @@ func TestWriteRunMetadata(t *testing.T) {
 
 	outputPath := t.TempDir() + "/metadata.json"
 	require.NoError(t, writeRunMetadata(t.Context(), runConfig{
-		address:         "127.0.0.1:7233",
-		namespace:       "scylla-load",
-		taskQueue:       "scylla-load",
-		workflows:       7,
-		concurrency:     3,
-		activitiesEach:  2,
-		signalsEach:     1,
-		eagerStart:      true,
-		eagerActivities: true,
-		payloadBytes:    512,
-		serverPProf:     server.URL,
-		runMetadataFile: outputPath,
+		address:             "127.0.0.1:7233",
+		namespace:           "scylla-load",
+		taskQueue:           "scylla-load",
+		taskQueues:          5,
+		workersPerTaskQueue: 2,
+		workflows:           7,
+		concurrency:         3,
+		activitiesEach:      2,
+		signalsEach:         1,
+		eagerStart:          true,
+		eagerActivities:     true,
+		payloadBytes:        512,
+		serverPProf:         server.URL,
+		runMetadataFile:     outputPath,
 		metricSnapshotsBefore: metricSnapshotFlags{
 			{url: server.URL + "/metrics", path: "/tmp/temporal.before.metrics"},
 		},
@@ -352,21 +391,23 @@ func TestWriteRunMetadata(t *testing.T) {
 	require.Equal(t, "node1,node2,node3", metadata.Environment["CASSANDRA_SEEDS"])
 	metadata.Environment = nil
 	require.Equal(t, runMetadata{
-		Address:         "127.0.0.1:7233",
-		Namespace:       "scylla-load",
-		TaskQueue:       "scylla-load",
-		Workflows:       7,
-		Concurrency:     3,
-		ActivitiesEach:  2,
-		SignalsEach:     1,
-		EagerStart:      true,
-		EagerActivities: true,
-		PayloadBytes:    512,
-		GoVersion:       runtime.Version(),
-		GOOS:            runtime.GOOS,
-		GOARCH:          runtime.GOARCH,
-		NumCPU:          runtime.NumCPU(),
-		GOMAXPROCS:      runtime.GOMAXPROCS(0),
+		Address:             "127.0.0.1:7233",
+		Namespace:           "scylla-load",
+		TaskQueue:           "scylla-load",
+		TaskQueues:          5,
+		WorkersPerTaskQueue: 2,
+		Workflows:           7,
+		Concurrency:         3,
+		ActivitiesEach:      2,
+		SignalsEach:         1,
+		EagerStart:          true,
+		EagerActivities:     true,
+		PayloadBytes:        512,
+		GoVersion:           runtime.Version(),
+		GOOS:                runtime.GOOS,
+		GOARCH:              runtime.GOARCH,
+		NumCPU:              runtime.NumCPU(),
+		GOMAXPROCS:          runtime.GOMAXPROCS(0),
 		PProfEndpoint: &endpointCheck{
 			Name:   "pprof",
 			URL:    server.URL + "/debug/pprof/",
@@ -424,6 +465,8 @@ func TestWriteResultFile(t *testing.T) {
 		"address": "127.0.0.1:7233",
 		"namespace": "scylla-load",
 		"taskQueue": "",
+		"taskQueues": 0,
+		"workersPerTaskQueue": 0,
 		"workflows": 7,
 		"concurrency": 0,
 		"activitiesEach": 0,

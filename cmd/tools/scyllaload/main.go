@@ -35,6 +35,8 @@ type (
 		address               string
 		namespace             string
 		taskQueue             string
+		taskQueues            int
+		workersPerTaskQueue   int
 		workflows             int
 		concurrency           int
 		activitiesEach        int
@@ -69,6 +71,8 @@ type (
 		Address               string        `json:"address"`
 		Namespace             string        `json:"namespace"`
 		TaskQueue             string        `json:"taskQueue"`
+		TaskQueues            int           `json:"taskQueues"`
+		WorkersPerTaskQueue   int           `json:"workersPerTaskQueue"`
 		Workflows             int           `json:"workflows"`
 		Concurrency           int           `json:"concurrency"`
 		ActivitiesEach        int           `json:"activitiesEach"`
@@ -98,6 +102,8 @@ type (
 		Address                 string            `json:"address"`
 		Namespace               string            `json:"namespace"`
 		TaskQueue               string            `json:"taskQueue"`
+		TaskQueues              int               `json:"taskQueues"`
+		WorkersPerTaskQueue     int               `json:"workersPerTaskQueue"`
 		Workflows               int               `json:"workflows"`
 		Concurrency             int               `json:"concurrency"`
 		ActivitiesEach          int               `json:"activitiesEach"`
@@ -166,13 +172,11 @@ func main() {
 		}
 	}
 
-	w, err := startWorker(c, cfg)
+	workers, err := startWorker(c, cfg)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)
 	}
-	if w != nil {
-		defer w.Stop()
-	}
+	defer stopWorkers(workers)
 
 	stopCPUProfile, err := startCPUProfile(cfg.cpuProfile)
 	if err != nil {
@@ -220,6 +224,8 @@ func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
 	flags.StringVar(&cfg.address, "address", "127.0.0.1:7233", "Temporal frontend host:port")
 	flags.StringVar(&cfg.namespace, "namespace", "scylla-load", "Temporal namespace")
 	flags.StringVar(&cfg.taskQueue, "task-queue", "scylla-load", "Temporal task queue")
+	flags.IntVar(&cfg.taskQueues, "task-queues", 1, "number of task queues to distribute workflow starts across")
+	flags.IntVar(&cfg.workersPerTaskQueue, "workers-per-task-queue", 1, "workers to start for each task queue")
 	flags.IntVar(&cfg.workflows, "workflows", 1000, "number of workflows to execute")
 	flags.IntVar(&cfg.concurrency, "concurrency", 100, "maximum concurrent workflow executions")
 	flags.IntVar(&cfg.activitiesEach, "activities-each", 1, "activities executed by each workflow")
@@ -251,6 +257,12 @@ func validateConfig(cfg runConfig) error {
 	if cfg.concurrency <= 0 {
 		return errors.New("-concurrency must be positive")
 	}
+	if cfg.taskQueues <= 0 {
+		return errors.New("-task-queues must be positive")
+	}
+	if cfg.workersPerTaskQueue <= 0 {
+		return errors.New("-workers-per-task-queue must be positive")
+	}
 	if cfg.activitiesEach < 0 {
 		return errors.New("-activities-each must be non-negative")
 	}
@@ -277,17 +289,33 @@ func (nopLogger) Info(string, ...any)  {}
 func (nopLogger) Warn(string, ...any)  {}
 func (nopLogger) Error(string, ...any) {}
 
-func startWorker(c client.Client, cfg runConfig) (worker.Worker, error) {
+func startWorker(c client.Client, cfg runConfig) ([]worker.Worker, error) {
 	if !cfg.runWorker {
 		return nil, nil
 	}
-	w := worker.New(c, cfg.taskQueue, worker.Options{})
-	w.RegisterWorkflow(loadWorkflow)
-	w.RegisterActivity(loadActivity)
-	if err := w.Start(); err != nil {
-		return nil, err
+	workers := make([]worker.Worker, 0, cfg.taskQueues*cfg.workersPerTaskQueue)
+	for taskQueueIndex := 0; taskQueueIndex < cfg.taskQueues; taskQueueIndex++ {
+		taskQueue := taskQueueName(cfg, taskQueueIndex)
+		for workerIndex := 0; workerIndex < cfg.workersPerTaskQueue; workerIndex++ {
+			w := worker.New(c, taskQueue, worker.Options{})
+			w.RegisterWorkflow(loadWorkflow)
+			w.RegisterActivity(loadActivity)
+			if err := w.Start(); err != nil {
+				for _, started := range workers {
+					started.Stop()
+				}
+				return nil, err
+			}
+			workers = append(workers, w)
+		}
 	}
-	return w, nil
+	return workers, nil
+}
+
+func stopWorkers(workers []worker.Worker) {
+	for _, w := range workers {
+		w.Stop()
+	}
 }
 
 func runLoad(ctx context.Context, c client.Client, cfg runConfig) runResult {
@@ -341,6 +369,8 @@ launch:
 		Address:               cfg.address,
 		Namespace:             cfg.namespace,
 		TaskQueue:             cfg.taskQueue,
+		TaskQueues:            cfg.taskQueues,
+		WorkersPerTaskQueue:   cfg.workersPerTaskQueue,
 		Workflows:             cfg.workflows,
 		Concurrency:           cfg.concurrency,
 		ActivitiesEach:        cfg.activitiesEach,
@@ -379,9 +409,10 @@ func runOneWorkflow(
 ) workflowRunResult {
 	workflowID := fmt.Sprintf("scylla-load-%d-%d", startNanos, workflowIndex)
 	result := workflowRunResult{requests: 1}
+	taskQueue := taskQueueName(cfg, workflowIndex%cfg.taskQueues)
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 		ID:               workflowID,
-		TaskQueue:        cfg.taskQueue,
+		TaskQueue:        taskQueue,
 		EnableEagerStart: cfg.eagerStart,
 	}, loadWorkflow, workflowInput{
 		Activities: cfg.activitiesEach,
@@ -408,6 +439,13 @@ func runOneWorkflow(
 	}
 	result.completed = true
 	return result
+}
+
+func taskQueueName(cfg runConfig, index int) string {
+	if cfg.taskQueues == 1 {
+		return cfg.taskQueue
+	}
+	return fmt.Sprintf("%s-%d", cfg.taskQueue, index)
 }
 
 func makePayload(size int) []byte {
@@ -446,23 +484,25 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 		return nil
 	}
 	metadata := runMetadata{
-		StartedAt:       time.Now().UTC(),
-		Address:         cfg.address,
-		Namespace:       cfg.namespace,
-		TaskQueue:       cfg.taskQueue,
-		Workflows:       cfg.workflows,
-		Concurrency:     cfg.concurrency,
-		ActivitiesEach:  cfg.activitiesEach,
-		SignalsEach:     cfg.signalsEach,
-		EagerStart:      cfg.eagerStart,
-		EagerActivities: cfg.eagerActivities,
-		PayloadBytes:    cfg.payloadBytes,
-		GoVersion:       runtime.Version(),
-		GOOS:            runtime.GOOS,
-		GOARCH:          runtime.GOARCH,
-		NumCPU:          runtime.NumCPU(),
-		GOMAXPROCS:      runtime.GOMAXPROCS(0),
-		Environment:     selectedEnvironment(),
+		StartedAt:           time.Now().UTC(),
+		Address:             cfg.address,
+		Namespace:           cfg.namespace,
+		TaskQueue:           cfg.taskQueue,
+		TaskQueues:          cfg.taskQueues,
+		WorkersPerTaskQueue: cfg.workersPerTaskQueue,
+		Workflows:           cfg.workflows,
+		Concurrency:         cfg.concurrency,
+		ActivitiesEach:      cfg.activitiesEach,
+		SignalsEach:         cfg.signalsEach,
+		EagerStart:          cfg.eagerStart,
+		EagerActivities:     cfg.eagerActivities,
+		PayloadBytes:        cfg.payloadBytes,
+		GoVersion:           runtime.Version(),
+		GOOS:                runtime.GOOS,
+		GOARCH:              runtime.GOARCH,
+		NumCPU:              runtime.NumCPU(),
+		GOMAXPROCS:          runtime.GOMAXPROCS(0),
+		Environment:         selectedEnvironment(),
 	}
 	if cfg.serverPProf != "" {
 		pprofURL, err := serverPProfURL(cfg.serverPProf, "/debug/pprof/", nil)

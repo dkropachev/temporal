@@ -6,7 +6,8 @@ optimization complete.
 ## Current 3 Node x 4 Shard Target
 
 - Use 12 history shards by default for Cassandra/Scylla deployments, matching total Scylla shards in the target cluster.
-- Use 12 matching task queue read/write partitions by default for normal task queues.
+- Use 1 matching task queue read/write partition by default, and opt known hot task queues into higher partition counts
+  through dynamic config after measuring the workload.
 - Keep Scylla gocql shard-aware port enabled. It is enabled by default in the Scylla gocql fork; use
   `maxExcessShardConnectionsRate` to tune per-shard connection reuse/ramp behavior.
 
@@ -365,6 +366,14 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   throughput dropped to `173.08 workflows/sec`, and signal throughput dropped to `239.11 workflows/sec`, compared with
   `187.54` and `291.81 workflows/sec` at `maxConns: 12`. Matching connections to the 12 Scylla shards remains the
   better default for this target.
+- Many task queues with multiple workers do not scale well when every task queue gets 12 matching read/write partitions.
+  A 16-task-queue, 2-worker-per-task-queue activity workload improved from `113.01 workflows/sec` with 12 partitions to
+  `154.25 workflows/sec` with 1 partition, and the signal workload improved from `217.18 workflows/sec` /
+  `434.36 requests/sec` to `900.19 workflows/sec` / `1800.38 requests/sec`. Four partitions was also tested with the
+  same 16-task-queue shape and reached only `115.79 workflows/sec` for activity and `255.63 workflows/sec` /
+  `511.25 requests/sec` for signal. The bottleneck is matching partition fanout and manager/poller overhead across many
+  queues, not Scylla write capacity. The global default is therefore 1 partition; use constrained dynamic config values
+  for specifically measured hot task queues that benefit from more partitioning.
 - Increasing normal matching task queue read/write partitions from `12` to `24` was tested and rejected on the same
   3 node x 4 shard cluster. Activity throughput dropped to `97.82 workflows/sec`, and signal throughput dropped to
   `240.02 workflows/sec` / `480.03 requests/sec`, compared with same-server 12-partition controls of
