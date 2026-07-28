@@ -215,6 +215,33 @@ improves completed workflows/sec without increasing p99 persistence latency, mat
 Scylla shard imbalance at the same cluster size. Reject changes that improve a single hot queue while regressing the
 many-queue worker matrix.
 
+The matrix must use the same server build settings and should randomize cell order across repeated passes. A mismatched
+`CGO_ENABLED=1` candidate initially appeared to regress the 16-queue, 8-worker activity control to
+`155.35-164.09 workflows/sec`; rebuilding it with the baseline's `CGO_ENABLED=0` restored `180.12 workflows/sec`.
+Record build metadata and compare medians from at least three shuffled passes before attributing a matrix difference to
+the persistence change.
+
+The final 3 node x 4 shard activity matrix on `2026-07-28` used `maxConns: 12`, one matching read/write partition,
+3,200 workflows per cell, concurrency 320, one activity per workflow, and a 256-byte payload:
+
+| Task queues | 1 worker/queue | 2 workers/queue | 4 workers/queue | 8 workers/queue |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 186.71 | 175.51 | 179.32 | 178.94 |
+| 4 | 180.75 | 167.20 | 185.71 | 167.25 |
+| 16 | 190.70 | 180.24 | 163.49 | 162.26 |
+
+All 38,400 workflows completed with zero load-generator failures. The shorter cells retain visible order noise, so the
+6,400-workflow controls are the acceptance signal: the original `MapScan` build reached `180.95` and
+`180.65 workflows/sec` at 16 queues and 8 workers; the typed mutable-state read build reached `180.12`, and the
+combined typed mutable-state/current-row build reached `180.75`. The read/write path therefore preserves capacity at
+128 workers rather than showing a repeatable worker-count regression.
+
+The workflow-task-only matrix was more order-sensitive: one ordered pass ranged from `251.58` to
+`853.08 workflows/sec`, and a repeated 6,400-workflow control reversed the apparent 1-queue result
+(`542.19` at 4 workers versus `568.47` at 8 workers). Final combined-build controls reached `511.17 workflows/sec` at
+1 queue and 8 workers and `442.51 workflows/sec` at 16 queues and 8 workers, with all 6,400 workflows completed and no
+failures. Treat one-pass rankings as diagnostic data, not a tuning decision.
+
 Load-generator profiles can be inspected with:
 
 ```bash
@@ -458,6 +485,24 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   100-node page benchmark improved from `20.460-22.430 us/op`, `45896-45897 B/op`, and 311 allocations to
   `4.624-4.852 us/op`, `12456-12457 B/op`, and 116 allocations. Reverse-order reads retain the same fixed column shape,
   and metadata-only reads scan only the three selected ID columns.
+- Cassandra workflow mutable-state reads now scan their 22 fixed columns into a typed row and pre-size decoded
+  activity, timer, child, cancel, signal, and CHASM maps. The focused benchmark improved from
+  `3.599-4.350 us/op`, `5120-5121 B/op`, and 42 allocations to `1.751-1.868 us/op`, `3688-3690 B/op`, and
+  37 allocations. Matched live 6,400-workflow activity controls remained neutral: `193.19 workflows/sec` before and
+  `194.79 workflows/sec` after at 1 queue and 4 workers, and `180.65-180.95` before versus `180.12` after at
+  16 queues and 8 workers.
+- Cassandra current-execution reads now select and scan only `current_run_id`, `execution_state`, and
+  `execution_state_encoding`; the unused execution blob, execution encoding, and last-write version no longer cross
+  the wire. The focused benchmark reduced `1384-1385 B/op` to `1160-1161 B/op`; latency and allocation count were
+  neutral at roughly `0.8 us/op` and 19 allocations because workflow-state protobuf decoding dominates the harness.
+  The combined live build reached `188.21 workflows/sec` at 1 queue and 4 workers and `180.75 workflows/sec` at
+  16 queues and 8 workers, completing all 12,800 workflows with zero failures.
+- The history executable tracker split was isolated in a 1,024-task benchmark after allocation profiles identified it
+  as a major allocator. The retained implementation measures `23.385-24.033 us/op` for no tasks moved,
+  `90.583-91.830 us/op` for half moved, and `127.821-129.592 us/op` for all moved. A two-pass classification variant
+  nearly eliminated allocations for no/all-move cases, but reduced the live activity median from
+  `189.13` to `180.33 workflows/sec`; a one-pass lazy-allocation variant reached `187.98`. Both production changes were
+  rejected, while the correctness cases and benchmark remain as a regression target.
 - Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without

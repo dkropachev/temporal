@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
@@ -26,6 +27,8 @@ var (
 	benchmarkQueueSink                     *Queue
 	benchmarkExecutionStateSink            []*p.InternalWorkflowMutableState
 	benchmarkConcreteExecutionResponseSink *p.InternalListConcreteExecutionsResponse
+	benchmarkCurrentExecutionResponseSink  *p.InternalGetCurrentExecutionResponse
+	benchmarkWorkflowExecutionResponseSink *p.InternalGetWorkflowExecutionResponse
 	benchmarkHistoryBranchResponseSink     *p.InternalReadHistoryBranchResponse
 	benchmarkTaskResponseSink              *p.InternalGetTasksResponse
 	benchmarkBoolSink                      bool
@@ -801,6 +804,194 @@ func BenchmarkListConcreteExecutionsReadPage(b *testing.B) {
 	}
 }
 
+func BenchmarkGetWorkflowExecutionRead(b *testing.B) {
+	row := newWorkflowExecutionTestRow(b)
+	session := &recordingSession{
+		t: b,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				mapScanFn: func(dest map[string]any) error {
+					for key, value := range row {
+						dest[key] = value
+					}
+					return nil
+				},
+				scanFn: func(dest ...any) error {
+					return scanWorkflowExecutionTestRow(row, dest)
+				},
+			}
+		},
+	}
+	store := &MutableStateStore{Session: session}
+	request := &p.GetWorkflowExecutionRequest{
+		ShardID:     7,
+		NamespaceID: "namespace-id",
+		WorkflowID:  "workflow-id",
+		RunID:       "run-id",
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		response, err := store.GetWorkflowExecution(b.Context(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkWorkflowExecutionResponseSink = response
+	}
+}
+
+func BenchmarkGetCurrentExecutionRead(b *testing.B) {
+	serializer := serialization.NewSerializer()
+	executionStateBlob, err := serializer.WorkflowExecutionStateToBlob(&persistencespb.WorkflowExecutionState{
+		RunId: "11111111-1111-1111-1111-111111111111",
+		State: enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
+	})
+	require.NoError(b, err)
+	currentRunID, err := gocql.ParseUUID("11111111-1111-1111-1111-111111111111")
+	require.NoError(b, err)
+	row := map[string]any{
+		"current_run_id":              currentRunID,
+		"execution":                   []byte("execution"),
+		"execution_encoding":          enumspb.ENCODING_TYPE_PROTO3.String(),
+		"execution_state":             executionStateBlob.Data,
+		"execution_state_encoding":    executionStateBlob.EncodingType.String(),
+		"workflow_last_write_version": int64(42),
+	}
+	session := &recordingSession{
+		t: b,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				mapScanFn: func(dest map[string]any) error {
+					for key, value := range row {
+						dest[key] = value
+					}
+					return nil
+				},
+				scanFn: func(dest ...any) error {
+					*dest[0].(*gocql.UUID) = row["current_run_id"].(gocql.UUID)
+					*dest[1].(*[]byte) = row["execution_state"].([]byte)
+					*dest[2].(*string) = row["execution_state_encoding"].(string)
+					return nil
+				},
+			}
+		},
+	}
+	store := NewMutableStateStore(session, serializer, log.NewNoopLogger())
+	request := &p.GetCurrentExecutionRequest{
+		ShardID:     7,
+		NamespaceID: "namespace-id",
+		WorkflowID:  "workflow-id",
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		response, err := store.GetCurrentExecution(b.Context(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkCurrentExecutionResponseSink = response
+	}
+}
+
+func TestGetCurrentExecutionUsesTypedProjection(t *testing.T) {
+	serializer := serialization.NewSerializer()
+	executionState := &persistencespb.WorkflowExecutionState{
+		RunId: "11111111-1111-1111-1111-111111111111",
+		State: enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
+	}
+	executionStateBlob, err := serializer.WorkflowExecutionStateToBlob(executionState)
+	require.NoError(t, err)
+	currentRunID, err := gocql.ParseUUID(executionState.RunId)
+	require.NoError(t, err)
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, _ ...any) cgocql.Query {
+			require.Equal(t, templateGetCurrentExecutionQuery, stmt)
+			require.NotContains(t, stmt, "current_run_id, execution,")
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					require.Len(t, dest, 3)
+					*dest[0].(*gocql.UUID) = currentRunID
+					*dest[1].(*[]byte) = executionStateBlob.Data
+					*dest[2].(*string) = executionStateBlob.EncodingType.String()
+					return nil
+				},
+			}
+		},
+	}
+	store := NewMutableStateStore(session, serializer, log.NewNoopLogger())
+
+	response, err := store.GetCurrentExecution(t.Context(), &p.GetCurrentExecutionRequest{
+		ShardID:     7,
+		NamespaceID: "namespace-id",
+		WorkflowID:  "workflow-id",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, executionState.RunId, response.RunID)
+	require.Equal(t, executionState.RunId, response.ExecutionState.RunId)
+	require.Equal(t, executionState.State, response.ExecutionState.State)
+}
+
+func TestGetWorkflowExecutionTypedScan(t *testing.T) {
+	row := newWorkflowExecutionTestRow(t)
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, _ ...any) cgocql.Query {
+			require.Equal(t, templateGetWorkflowExecutionQuery, stmt)
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					return scanWorkflowExecutionTestRow(row, dest)
+				},
+			}
+		},
+	}
+	store := &MutableStateStore{Session: session}
+
+	response, err := store.GetWorkflowExecution(t.Context(), &p.GetWorkflowExecutionRequest{
+		ShardID:     7,
+		NamespaceID: "namespace-id",
+		WorkflowID:  "workflow-id",
+		RunID:       "run-id",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, int64(7), response.DBRecordVersion)
+	require.Equal(t, p.NewDataBlob([]byte("execution"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.ExecutionInfo)
+	require.Equal(t, p.NewDataBlob([]byte("execution-state"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.ExecutionState)
+	require.Equal(t, int64(42), response.State.NextEventID)
+	require.Equal(t, p.NewDataBlob([]byte("activity"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.ActivityInfos[1])
+	require.Equal(t, p.NewDataBlob([]byte("timer"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.TimerInfos["timer"])
+	require.Equal(t, p.NewDataBlob([]byte("child"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.ChildExecutionInfos[2])
+	require.Equal(t, p.NewDataBlob([]byte("cancel"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.RequestCancelInfos[3])
+	require.Equal(t, p.NewDataBlob([]byte("signal"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.SignalInfos[4])
+	require.Equal(t, []string{"11111111-1111-1111-1111-111111111111"}, response.State.SignalRequestedIDs)
+	require.Equal(t, p.NewDataBlob([]byte("events"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.BufferedEvents[0])
+	require.Equal(t, p.NewDataBlob([]byte("chasm"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.ChasmNodes["node"].CassandraBlob)
+	require.Equal(t, p.NewDataBlob([]byte("checksum"), enumspb.ENCODING_TYPE_PROTO3.String()), response.State.Checksum)
+}
+
+func TestGetWorkflowExecutionTypedScanDefaultsNullDBRecordVersion(t *testing.T) {
+	row := newWorkflowExecutionTestRow(t)
+	delete(row, "db_record_version")
+	session := &recordingSession{
+		t: t,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					return scanWorkflowExecutionTestRow(row, dest)
+				},
+			}
+		},
+	}
+	store := &MutableStateStore{Session: session}
+
+	response, err := store.GetWorkflowExecution(t.Context(), &p.GetWorkflowExecutionRequest{})
+
+	require.NoError(t, err)
+	require.Zero(t, response.DBRecordVersion)
+}
+
 func TestListConcreteExecutionsClosesIteratorOnScanError(t *testing.T) {
 	iter := &recordingIter{
 		closeErr: errors.New("scan failed"),
@@ -826,6 +1017,67 @@ func TestListConcreteExecutionsClosesIteratorOnScanError(t *testing.T) {
 	require.Nil(t, response)
 	require.ErrorContains(t, err, "scan failed")
 	require.Equal(t, 1, iter.closeCalls)
+}
+
+func newWorkflowExecutionTestRow(t testing.TB) map[string]any {
+	t.Helper()
+	signalID, err := gocql.ParseUUID("11111111-1111-1111-1111-111111111111")
+	require.NoError(t, err)
+	return map[string]any{
+		"execution":                     []byte("execution"),
+		"execution_encoding":            enumspb.ENCODING_TYPE_PROTO3.String(),
+		"execution_state":               []byte("execution-state"),
+		"execution_state_encoding":      enumspb.ENCODING_TYPE_PROTO3.String(),
+		"next_event_id":                 int64(42),
+		"activity_map":                  map[int64][]byte{1: []byte("activity")},
+		"activity_map_encoding":         enumspb.ENCODING_TYPE_PROTO3.String(),
+		"timer_map":                     map[string][]byte{"timer": []byte("timer")},
+		"timer_map_encoding":            enumspb.ENCODING_TYPE_PROTO3.String(),
+		"child_executions_map":          map[int64][]byte{2: []byte("child")},
+		"child_executions_map_encoding": enumspb.ENCODING_TYPE_PROTO3.String(),
+		"request_cancel_map":            map[int64][]byte{3: []byte("cancel")},
+		"request_cancel_map_encoding":   enumspb.ENCODING_TYPE_PROTO3.String(),
+		"signal_map":                    map[int64][]byte{4: []byte("signal")},
+		"signal_map_encoding":           enumspb.ENCODING_TYPE_PROTO3.String(),
+		"signal_requested":              []gocql.UUID{signalID},
+		"buffered_events_list":          []map[string]any{{"encoding_type": enumspb.ENCODING_TYPE_PROTO3.String(), "data": []byte("events")}},
+		"chasm_node_map":                map[string][]byte{"node": []byte("chasm")},
+		"chasm_node_map_encoding":       enumspb.ENCODING_TYPE_PROTO3.String(),
+		"checksum":                      []byte("checksum"),
+		"checksum_encoding":             enumspb.ENCODING_TYPE_PROTO3.String(),
+		"db_record_version":             int64(7),
+	}
+}
+
+func scanWorkflowExecutionTestRow(row map[string]any, dest []any) error {
+	*dest[0].(*[]byte) = row["execution"].([]byte)
+	*dest[1].(*string) = row["execution_encoding"].(string)
+	*dest[2].(*[]byte) = row["execution_state"].([]byte)
+	*dest[3].(*string) = row["execution_state_encoding"].(string)
+	*dest[4].(*int64) = row["next_event_id"].(int64)
+	*dest[5].(*map[int64][]byte) = row["activity_map"].(map[int64][]byte)
+	*dest[6].(*string) = row["activity_map_encoding"].(string)
+	*dest[7].(*map[string][]byte) = row["timer_map"].(map[string][]byte)
+	*dest[8].(*string) = row["timer_map_encoding"].(string)
+	*dest[9].(*map[int64][]byte) = row["child_executions_map"].(map[int64][]byte)
+	*dest[10].(*string) = row["child_executions_map_encoding"].(string)
+	*dest[11].(*map[int64][]byte) = row["request_cancel_map"].(map[int64][]byte)
+	*dest[12].(*string) = row["request_cancel_map_encoding"].(string)
+	*dest[13].(*map[int64][]byte) = row["signal_map"].(map[int64][]byte)
+	*dest[14].(*string) = row["signal_map_encoding"].(string)
+	*dest[15].(*[]gocql.UUID) = row["signal_requested"].([]gocql.UUID)
+	*dest[16].(*[]map[string]any) = row["buffered_events_list"].([]map[string]any)
+	*dest[17].(*map[string][]byte) = row["chasm_node_map"].(map[string][]byte)
+	*dest[18].(*string) = row["chasm_node_map_encoding"].(string)
+	*dest[19].(*[]byte) = row["checksum"].([]byte)
+	*dest[20].(*string) = row["checksum_encoding"].(string)
+	if dbRecordVersion, ok := row["db_record_version"]; ok {
+		*dest[21].(*nullableInt64) = nullableInt64{
+			value: dbRecordVersion.(int64),
+			valid: true,
+		}
+	}
+	return nil
 }
 
 func TestListConcreteExecutionsTypedScanSkipsCurrentRow(t *testing.T) {

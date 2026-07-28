@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	driver "github.com/gocql/gocql"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -70,7 +71,7 @@ const (
 		`and visibility_ts = ? ` +
 		`and task_id = ?`
 
-	templateGetCurrentExecutionQuery = `SELECT current_run_id, execution, execution_encoding, execution_state, execution_state_encoding, workflow_last_write_version ` +
+	templateGetCurrentExecutionQuery = `SELECT current_run_id, execution_state, execution_state_encoding ` +
 		`FROM executions ` +
 		`WHERE shard_id = ? ` +
 		`and type = ? ` +
@@ -370,6 +371,37 @@ type (
 		serializer serialization.Serializer
 		logger     log.Logger
 	}
+
+	workflowExecutionRow struct {
+		execution                  []byte
+		executionEncoding          string
+		executionState             []byte
+		executionStateEncoding     string
+		nextEventID                int64
+		activityMap                map[int64][]byte
+		activityMapEncoding        string
+		timerMap                   map[string][]byte
+		timerMapEncoding           string
+		childExecutionsMap         map[int64][]byte
+		childExecutionsMapEncoding string
+		requestCancelMap           map[int64][]byte
+		requestCancelMapEncoding   string
+		signalMap                  map[int64][]byte
+		signalMapEncoding          string
+		signalRequested            []driver.UUID
+		bufferedEventsList         []map[string]any
+		chasmNodeMap               map[string][]byte
+		chasmNodeMapEncoding       string
+		checksum                   []byte
+		checksumEncoding           string
+		dbRecordVersion            nullableInt64
+	}
+
+	currentExecutionRow struct {
+		currentRunID           driver.UUID
+		executionState         []byte
+		executionStateEncoding string
+	}
 )
 
 func NewMutableStateStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *MutableStateStore {
@@ -506,93 +538,91 @@ func (d *MutableStateStore) GetWorkflowExecution(
 		rowTypeExecutionTaskID,
 	).WithContext(ctx)
 
-	result := make(map[string]any)
-	if err := query.MapScan(result); err != nil {
+	var row workflowExecutionRow
+	if err := query.Scan(
+		&row.execution,
+		&row.executionEncoding,
+		&row.executionState,
+		&row.executionStateEncoding,
+		&row.nextEventID,
+		&row.activityMap,
+		&row.activityMapEncoding,
+		&row.timerMap,
+		&row.timerMapEncoding,
+		&row.childExecutionsMap,
+		&row.childExecutionsMapEncoding,
+		&row.requestCancelMap,
+		&row.requestCancelMapEncoding,
+		&row.signalMap,
+		&row.signalMapEncoding,
+		&row.signalRequested,
+		&row.bufferedEventsList,
+		&row.chasmNodeMap,
+		&row.chasmNodeMapEncoding,
+		&row.checksum,
+		&row.checksumEncoding,
+		&row.dbRecordVersion,
+	); err != nil {
 		return nil, gocql.ConvertError("GetWorkflowExecution", err)
 	}
 
-	state, err := mutableStateFromRow(result)
-	if err != nil {
-		return nil, serviceerror.NewUnavailablef("GetWorkflowExecution operation failed. Error: %v", err)
+	state := &p.InternalWorkflowMutableState{
+		ExecutionInfo:  p.NewDataBlob(row.execution, row.executionEncoding),
+		ExecutionState: p.NewDataBlob(row.executionState, row.executionStateEncoding),
+		NextEventID:    row.nextEventID,
 	}
 
-	activityInfos := make(map[int64]*commonpb.DataBlob)
-	aMap := result["activity_map"].(map[int64][]byte)
-	aMapEncoding := result["activity_map_encoding"].(string)
-	for key, value := range aMap {
-		activityInfos[key] = p.NewDataBlob(value, aMapEncoding)
+	activityInfos := make(map[int64]*commonpb.DataBlob, len(row.activityMap))
+	for key, value := range row.activityMap {
+		activityInfos[key] = p.NewDataBlob(value, row.activityMapEncoding)
 	}
 	state.ActivityInfos = activityInfos
 
-	timerInfos := make(map[string]*commonpb.DataBlob)
-	tMapEncoding := result["timer_map_encoding"].(string)
-	tMap := result["timer_map"].(map[string][]byte)
-	for key, value := range tMap {
-		timerInfos[key] = p.NewDataBlob(value, tMapEncoding)
+	timerInfos := make(map[string]*commonpb.DataBlob, len(row.timerMap))
+	for key, value := range row.timerMap {
+		timerInfos[key] = p.NewDataBlob(value, row.timerMapEncoding)
 	}
 	state.TimerInfos = timerInfos
 
-	childExecutionInfos := make(map[int64]*commonpb.DataBlob)
-	cMap := result["child_executions_map"].(map[int64][]byte)
-	cMapEncoding := result["child_executions_map_encoding"].(string)
-	for key, value := range cMap {
-		childExecutionInfos[key] = p.NewDataBlob(value, cMapEncoding)
+	childExecutionInfos := make(map[int64]*commonpb.DataBlob, len(row.childExecutionsMap))
+	for key, value := range row.childExecutionsMap {
+		childExecutionInfos[key] = p.NewDataBlob(value, row.childExecutionsMapEncoding)
 	}
 	state.ChildExecutionInfos = childExecutionInfos
 
-	requestCancelInfos := make(map[int64]*commonpb.DataBlob)
-	rMapEncoding := result["request_cancel_map_encoding"].(string)
-	rMap := result["request_cancel_map"].(map[int64][]byte)
-	for key, value := range rMap {
-		requestCancelInfos[key] = p.NewDataBlob(value, rMapEncoding)
+	requestCancelInfos := make(map[int64]*commonpb.DataBlob, len(row.requestCancelMap))
+	for key, value := range row.requestCancelMap {
+		requestCancelInfos[key] = p.NewDataBlob(value, row.requestCancelMapEncoding)
 	}
 	state.RequestCancelInfos = requestCancelInfos
 
-	signalInfos := make(map[int64]*commonpb.DataBlob)
-	sMapEncoding := result["signal_map_encoding"].(string)
-	sMap := result["signal_map"].(map[int64][]byte)
-	for key, value := range sMap {
-		signalInfos[key] = p.NewDataBlob(value, sMapEncoding)
+	signalInfos := make(map[int64]*commonpb.DataBlob, len(row.signalMap))
+	for key, value := range row.signalMap {
+		signalInfos[key] = p.NewDataBlob(value, row.signalMapEncoding)
 	}
 	state.SignalInfos = signalInfos
-	state.SignalRequestedIDs = gocql.UUIDsToStringSlice(result["signal_requested"])
+	state.SignalRequestedIDs = gocql.UUIDsToStringSlice(row.signalRequested)
 
-	chasmNodeBlobs := make(map[string]p.InternalChasmNode)
-	chasmNodeEncoding, ok := result["chasm_node_map_encoding"].(string)
-	if !ok {
-		return nil, serviceerror.NewInternal("GetWorkflowExecution failed: unknown chasm_node_map_encoding type")
-	}
-	chasmNodeBytes, ok := result["chasm_node_map"].(map[string][]byte)
-	if !ok {
-		return nil, serviceerror.NewInternal("GetWorkflowExecution failed: unknown chasm_node_map type")
-	}
-	for key, value := range chasmNodeBytes {
+	chasmNodeBlobs := make(map[string]p.InternalChasmNode, len(row.chasmNodeMap))
+	for key, value := range row.chasmNodeMap {
 		chasmNodeBlobs[key] = p.InternalChasmNode{
-			CassandraBlob: p.NewDataBlob(value, chasmNodeEncoding),
+			CassandraBlob: p.NewDataBlob(value, row.chasmNodeMapEncoding),
 		}
 	}
 	state.ChasmNodes = chasmNodeBlobs
 
-	eList := result["buffered_events_list"].([]map[string]any) //nolint:revive // unchecked-type-assertion: consistent with surrounding Cassandra result parsing
-	bufferedEventsBlobs := make([]*commonpb.DataBlob, 0, len(eList))
-	for _, v := range eList {
+	bufferedEventsBlobs := make([]*commonpb.DataBlob, 0, len(row.bufferedEventsList))
+	for _, v := range row.bufferedEventsList {
 		blob := createHistoryEventBatchBlob(v)
 		bufferedEventsBlobs = append(bufferedEventsBlobs, blob)
 	}
 	state.BufferedEvents = bufferedEventsBlobs
 
-	state.Checksum = p.NewDataBlob(result["checksum"].([]byte), result["checksum_encoding"].(string))
-
-	dbVersion := int64(0)
-	if dbRecordVersion, ok := result["db_record_version"]; ok {
-		dbVersion = dbRecordVersion.(int64)
-	} else {
-		dbVersion = 0
-	}
+	state.Checksum = p.NewDataBlob(row.checksum, row.checksumEncoding)
 
 	return &p.InternalGetWorkflowExecutionResponse{
 		State:           state,
-		DBRecordVersion: dbVersion,
+		DBRecordVersion: row.dbRecordVersion.value,
 	}, nil
 }
 
@@ -969,25 +999,25 @@ func (d *MutableStateStore) GetCurrentExecution(
 		rowTypeExecutionTaskID,
 	).WithContext(ctx)
 
-	result := make(map[string]any)
-	if err := query.MapScan(result); err != nil {
+	var row currentExecutionRow
+	if err := query.Scan(
+		&row.currentRunID,
+		&row.executionState,
+		&row.executionStateEncoding,
+	); err != nil {
 		return nil, gocql.ConvertError("GetCurrentExecution", err)
 	}
 
-	currentRunID := gocql.UUIDToString(result["current_run_id"])
-	executionStateBlob, err := executionStateBlobFromRow(result)
-	if err != nil {
-		return nil, serviceerror.NewUnavailablef("GetCurrentExecution operation failed. Error: %v", err)
-	}
-
 	// TODO: fix blob ExecutionState in storage should not be a blob.
-	executionState, err := d.serializer.WorkflowExecutionStateFromBlob(executionStateBlob)
+	executionState, err := d.serializer.WorkflowExecutionStateFromBlob(
+		p.NewDataBlob(row.executionState, row.executionStateEncoding),
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	return &p.InternalGetCurrentExecutionResponse{
-		RunID:          currentRunID,
+		RunID:          gocql.UUIDToString(row.currentRunID),
 		ExecutionState: executionState,
 	}, nil
 }
@@ -1113,51 +1143,4 @@ func (d *MutableStateStore) getCurrentRecordRunID(
 	}
 
 	return gocql.ArchetypeIDToUUID(archetypeID)
-}
-
-func mutableStateFromRow(
-	result map[string]any,
-) (*p.InternalWorkflowMutableState, error) {
-	eiBytes, ok := result["execution"].([]byte)
-	if !ok {
-		return nil, newPersistedTypeMismatchError("execution", "", eiBytes, result)
-	}
-
-	eiEncoding, ok := result["execution_encoding"].(string)
-	if !ok {
-		return nil, newPersistedTypeMismatchError("execution_encoding", "", eiEncoding, result)
-	}
-
-	nextEventID, ok := result["next_event_id"].(int64)
-	if !ok {
-		return nil, newPersistedTypeMismatchError("next_event_id", "", nextEventID, result)
-	}
-
-	protoState, err := executionStateBlobFromRow(result)
-	if err != nil {
-		return nil, err
-	}
-
-	mutableState := &p.InternalWorkflowMutableState{
-		ExecutionInfo:  p.NewDataBlob(eiBytes, eiEncoding),
-		ExecutionState: protoState,
-		NextEventID:    nextEventID,
-	}
-	return mutableState, nil
-}
-
-func executionStateBlobFromRow(
-	result map[string]any,
-) (*commonpb.DataBlob, error) {
-	state, ok := result["execution_state"].([]byte)
-	if !ok {
-		return nil, newPersistedTypeMismatchError("execution_state", "", state, result)
-	}
-
-	stateEncoding, ok := result["execution_state_encoding"].(string)
-	if !ok {
-		return nil, newPersistedTypeMismatchError("execution_state_encoding", "", stateEncoding, result)
-	}
-
-	return p.NewDataBlob(state, stateEncoding), nil
 }
