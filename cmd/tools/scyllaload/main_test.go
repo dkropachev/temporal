@@ -3,18 +3,68 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
+	"google.golang.org/grpc"
 )
+
+type fakeWorkflowRun struct {
+	id     string
+	getErr func() error
+}
+
+func (r *fakeWorkflowRun) GetID() string {
+	return r.id
+}
+
+func (*fakeWorkflowRun) GetRunID() string {
+	return "run-id"
+}
+
+func (r *fakeWorkflowRun) Get(context.Context, any) error {
+	return r.getErr()
+}
+
+func (r *fakeWorkflowRun) GetWithOptions(context.Context, any, client.WorkflowRunGetOptions) error {
+	return r.getErr()
+}
+
+type fakeWorkflowServiceClient struct {
+	workflowservice.WorkflowServiceClient
+	describeTaskQueue func(*workflowservice.DescribeTaskQueueRequest) (*workflowservice.DescribeTaskQueueResponse, error)
+}
+
+func (c *fakeWorkflowServiceClient) DescribeTaskQueue(
+	_ context.Context,
+	request *workflowservice.DescribeTaskQueueRequest,
+	_ ...grpc.CallOption,
+) (*workflowservice.DescribeTaskQueueResponse, error) {
+	return c.describeTaskQueue(request)
+}
+
+type clientWithWorkflowService struct {
+	client.Client
+	workflowService workflowservice.WorkflowServiceClient
+}
+
+func (c *clientWithWorkflowService) WorkflowService() workflowservice.WorkflowServiceClient {
+	return c.workflowService
+}
 
 func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -37,6 +87,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 		"-timeout=30s",
 		"-register-namespace=false",
 		"-worker=false",
+		"-backlog-before-workers=true",
+		"-backlog-wait-timeout=12s",
 		"-cpu-profile=/tmp/cpu.pprof",
 		"-heap-profile=/tmp/heap.pprof",
 		"-server-pprof=http://frontend:7936",
@@ -68,6 +120,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	require.Equal(t, 30*time.Second, cfg.timeout)
 	require.False(t, cfg.registerNS)
 	require.False(t, cfg.runWorker)
+	require.True(t, cfg.backlogBeforeWorkers)
+	require.Equal(t, 12*time.Second, cfg.backlogWaitTimeout)
 	require.Equal(t, "/tmp/cpu.pprof", cfg.cpuProfile)
 	require.Equal(t, "/tmp/heap.pprof", cfg.heapProfile)
 	require.Equal(t, "http://frontend:7936", cfg.serverPProf)
@@ -105,6 +159,36 @@ func TestValidateConfigRequiresPositiveTaskQueuesAndWorkers(t *testing.T) {
 	invalidWorkers := cfg
 	invalidWorkers.workersPerTaskQueue = 0
 	require.ErrorContains(t, validateConfig(invalidWorkers), "-workers-per-task-queue")
+}
+
+func TestValidateConfigBacklogMode(t *testing.T) {
+	cfg := runConfig{
+		workflows:            1,
+		concurrency:          1,
+		taskQueues:           1,
+		workersPerTaskQueue:  1,
+		runWorker:            true,
+		backlogBeforeWorkers: true,
+		backlogWaitTimeout:   time.Second,
+		serverCPUTime:        time.Second,
+	}
+	require.NoError(t, validateConfig(cfg))
+
+	workerDisabled := cfg
+	workerDisabled.runWorker = false
+	require.ErrorContains(t, validateConfig(workerDisabled), "-worker")
+
+	withSignals := cfg
+	withSignals.signalsEach = 1
+	require.ErrorContains(t, validateConfig(withSignals), "-signals-each")
+
+	withEagerStart := cfg
+	withEagerStart.eagerStart = true
+	require.ErrorContains(t, validateConfig(withEagerStart), "-eager-start")
+
+	invalidWait := cfg
+	invalidWait.backlogWaitTimeout = 0
+	require.ErrorContains(t, validateConfig(invalidWait), "-backlog-wait-timeout")
 }
 
 func TestLoadWorkflowRunsActivities(t *testing.T) {
@@ -258,6 +342,127 @@ func TestRunLoadDistributesWorkflowsAcrossTaskQueues(t *testing.T) {
 		"load-task-queue-2": 2,
 		"load-task-queue-3": 2,
 	}, taskQueueCounts)
+}
+
+func TestRunBacklogLoadStartsWorkersAfterTasksArePersisted(t *testing.T) {
+	var starts atomic.Int64
+	var workersStarted atomic.Bool
+	starter := func(context.Context, client.Client, runConfig, []byte, int64, int) (client.WorkflowRun, error) {
+		if workersStarted.Load() {
+			return nil, errors.New("workers started before enqueue completed")
+		}
+		starts.Add(1)
+		return &fakeWorkflowRun{
+			id: "workflow",
+			getErr: func() error {
+				if !workersStarted.Load() {
+					return errors.New("workflow drained before workers started")
+				}
+				return nil
+			},
+		}, nil
+	}
+	waiter := func(_ context.Context, _ client.Client, _ runConfig, expected int64) (int64, error) {
+		if workersStarted.Load() || expected != 4 || starts.Load() != 4 {
+			return 0, errors.New("backlog wait ran before enqueue completed")
+		}
+		return expected, nil
+	}
+	startWorkers := func(client.Client, runConfig) ([]worker.Worker, error) {
+		workersStarted.Store(true)
+		return nil, nil
+	}
+
+	result, workers, err := runBacklogLoadWithDependencies(t.Context(), nil, runConfig{
+		taskQueue:            "load-task-queue",
+		taskQueues:           2,
+		workersPerTaskQueue:  8,
+		workflows:            4,
+		concurrency:          2,
+		backlogBeforeWorkers: true,
+	}, starter, waiter, startWorkers)
+
+	require.NoError(t, err)
+	require.Nil(t, workers)
+	require.Equal(t, int64(4), result.Enqueued)
+	require.Equal(t, int64(4), result.BacklogTasks)
+	require.Equal(t, int64(4), result.Completed)
+	require.Zero(t, result.EnqueueFailed)
+	require.Zero(t, result.DrainFailed)
+	require.Zero(t, result.Failed)
+	require.Positive(t, result.EnqueueRequestsPerSec)
+	require.Positive(t, result.DrainWorkflowsPerSec)
+}
+
+func TestRunBacklogLoadReportsEnqueueAndDrainFailures(t *testing.T) {
+	starter := func(_ context.Context, _ client.Client, _ runConfig, _ []byte, _ int64, index int) (client.WorkflowRun, error) {
+		if index == 0 {
+			return nil, errors.New("enqueue failed")
+		}
+		return &fakeWorkflowRun{
+			id: "workflow",
+			getErr: func() error {
+				if index == 2 {
+					return errors.New("drain failed")
+				}
+				return nil
+			},
+		}, nil
+	}
+	waiter := func(_ context.Context, _ client.Client, _ runConfig, expected int64) (int64, error) {
+		return expected, nil
+	}
+	startWorkers := func(client.Client, runConfig) ([]worker.Worker, error) {
+		return nil, nil
+	}
+
+	result, _, err := runBacklogLoadWithDependencies(t.Context(), nil, runConfig{
+		workflows:            3,
+		concurrency:          2,
+		backlogBeforeWorkers: true,
+	}, starter, waiter, startWorkers)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(2), result.Enqueued)
+	require.Equal(t, int64(1), result.EnqueueFailed)
+	require.Equal(t, int64(1), result.Completed)
+	require.Equal(t, int64(1), result.DrainFailed)
+	require.Equal(t, int64(2), result.Failed)
+}
+
+func TestWorkflowTaskBacklogCountUsesReportedStats(t *testing.T) {
+	taskQueueNames := []string{"load-task-queue-0", "load-task-queue-1"}
+	backlogCounts := []int64{3, 4}
+	call := 0
+	service := &fakeWorkflowServiceClient{
+		describeTaskQueue: func(request *workflowservice.DescribeTaskQueueRequest) (*workflowservice.DescribeTaskQueueResponse, error) {
+			require.Less(t, call, len(taskQueueNames))
+			require.Equal(t, "load-test", request.GetNamespace())
+			require.Equal(t, taskQueueNames[call], request.GetTaskQueue().GetName())
+			require.Equal(t, enumspb.TASK_QUEUE_KIND_NORMAL, request.GetTaskQueue().GetKind())
+			require.Equal(t, enumspb.TASK_QUEUE_TYPE_WORKFLOW, request.GetTaskQueueType())
+			require.True(t, request.GetReportStats())
+
+			response := &workflowservice.DescribeTaskQueueResponse{
+				Stats: &taskqueuepb.TaskQueueStats{
+					ApproximateBacklogCount: backlogCounts[call],
+				},
+			}
+			call++
+			return response, nil
+		},
+	}
+	c := &clientWithWorkflowService{workflowService: service}
+
+	backlog, err := workflowTaskBacklogCount(t.Context(), c, runConfig{
+		namespace:  "load-test",
+		taskQueue:  "load-task-queue",
+		taskQueues: 2,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, len(taskQueueNames), call)
+	require.Equal(t, int64(7), backlog)
 }
 
 func TestServerProfilesFetchPPROFEndpoints(t *testing.T) {

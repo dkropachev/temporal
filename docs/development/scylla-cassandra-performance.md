@@ -189,7 +189,7 @@ Many-worker task queue read/write scaling matrix:
 
 ```bash
 for queues in 1 4 16; do
-  for workers in 1 2 4 8; do
+  for workers in 1 2 4 8 16 32; do
     go run ./cmd/tools/scyllaload \
       -address 127.0.0.1:7233 \
       -namespace scylla-load \
@@ -214,6 +214,57 @@ traffic plus activity task enqueue, poll, and completion traffic. Run the same q
 improves completed workflows/sec without increasing p99 persistence latency, matching schedule-to-start latency, or
 Scylla shard imbalance at the same cluster size. Reject changes that improve a single hot queue while regressing the
 many-queue worker matrix.
+
+To separate persisted task writes from worker-driven reads, first enqueue workflow tasks without workers, wait until
+`DescribeTaskQueue` reports at least the expected approximate backlog, and then start the requested workers:
+
+```bash
+go run ./cmd/tools/scyllaload \
+  -address 127.0.0.1:7233 \
+  -namespace scylla-load \
+  -task-queue scylla-load-backlog \
+  -task-queues 16 \
+  -workers-per-task-queue 32 \
+  -workflows 3200 \
+  -concurrency 320 \
+  -activities-each 0 \
+  -signals-each 0 \
+  -eager-start=false \
+  -backlog-before-workers \
+  -backlog-wait-timeout 30s \
+  -result-file /tmp/scyllaload.backlog.16q.32w.json
+```
+
+In backlog mode, `enqueueRequestsPerSec` measures workflow-start admission and persisted workflow-task writes while no
+worker is polling. `drainWorkflowsPerSec` measures persisted task polling/reads and workflow completion after workers
+start. Compare the same queue shape at 1, 2, 4, 8, 16, and 32 workers per task queue. Every cell must report the full
+expected `backlogTasks`, zero `enqueueFailed`, zero `drainFailed`, and zero `ResourceExhausted` metric growth.
+
+Default development RPS limits can hide storage scaling behind matching poll throttling. The benchmark-only dynamic
+configuration used for the unthrottled matrix was:
+
+```yaml
+frontend.rps: 100000
+frontend.namespaceRPS: 100000
+frontend.namespaceCount: 10000
+matching.rps: 100000
+matching.persistenceMaxQPS: 30000
+history.rps: 100000
+history.persistenceMaxQPS: 30000
+```
+
+These values are measurement ceilings, not production recommendations. Check service metrics before accepting a
+result: one default-limit 16-queue, 32-worker backlog run recorded 2,423 workflow-task poll and 790 activity-task poll
+`ResourceExhausted` responses with the `RpsLimit` cause. Its apparent worker-scaling decline was therefore invalid.
+Also monitor the Scylla data and commitlog filesystem during long matrices; an `EDQUOT` event invalidates the run even
+when the load generator has not yet reported a failure.
+
+After resetting the disposable CCM stores and raising only the benchmark limits, two 3,200-workflow controls at
+16 queues and 1 worker per queue produced a `2,540.48 workflows/sec` geometric-mean drain rate. Two controls at
+16 queues and 32 workers per queue (512 workers total) produced `2,796.46 workflows/sec`, a 10.08% increase. Workflow
+start admission remained between `4,865.58` and `5,372.68 requests/sec`; all 12,800 workflows entered the measured
+backlog and completed with zero failures. Persisted task reads therefore scale through 512 workers on this cluster,
+then approach server/database capacity rather than regressing as the quota-limited matrix suggested.
 
 The matrix must use the same server build settings and should randomize cell order across repeated passes. A mismatched
 `CGO_ENABLED=1` candidate initially appeared to regress the 16-queue, 8-worker activity control to

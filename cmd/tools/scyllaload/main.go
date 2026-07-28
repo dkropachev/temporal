@@ -20,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -47,6 +49,8 @@ type (
 		timeout               time.Duration
 		registerNS            bool
 		runWorker             bool
+		backlogBeforeWorkers  bool
+		backlogWaitTimeout    time.Duration
 		cpuProfile            string
 		heapProfile           string
 		serverPProf           string
@@ -86,6 +90,16 @@ type (
 		WorkflowsPerSec       float64       `json:"workflowsPerSec"`
 		Requests              int64         `json:"requests"`
 		RequestsPerSec        float64       `json:"requestsPerSec"`
+		BacklogBeforeWorkers  bool          `json:"backlogBeforeWorkers,omitempty"`
+		EnqueueElapsed        time.Duration `json:"enqueueElapsed,omitempty"`
+		Enqueued              int64         `json:"enqueued,omitempty"`
+		EnqueueFailed         int64         `json:"enqueueFailed,omitempty"`
+		EnqueueRequestsPerSec float64       `json:"enqueueRequestsPerSec,omitempty"`
+		BacklogWaitElapsed    time.Duration `json:"backlogWaitElapsed,omitempty"`
+		BacklogTasks          int64         `json:"backlogTasks,omitempty"`
+		DrainElapsed          time.Duration `json:"drainElapsed,omitempty"`
+		DrainFailed           int64         `json:"drainFailed,omitempty"`
+		DrainWorkflowsPerSec  float64       `json:"drainWorkflowsPerSec,omitempty"`
 		CPUProfile            string        `json:"cpuProfile,omitempty"`
 		HeapProfile           string        `json:"heapProfile,omitempty"`
 		ServerCPUProfile      string        `json:"serverCpuProfile,omitempty"`
@@ -111,6 +125,8 @@ type (
 		EagerStart              bool              `json:"eagerStart"`
 		EagerActivities         bool              `json:"eagerActivities"`
 		PayloadBytes            int               `json:"payloadBytes"`
+		BacklogBeforeWorkers    bool              `json:"backlogBeforeWorkers,omitempty"`
+		BacklogWaitTimeout      time.Duration     `json:"backlogWaitTimeout,omitempty"`
 		GoVersion               string            `json:"goVersion"`
 		GOOS                    string            `json:"goos"`
 		GOARCH                  string            `json:"goarch"`
@@ -172,11 +188,16 @@ func main() {
 		}
 	}
 
-	workers, err := startWorker(c, cfg)
-	if err != nil {
-		log.Fatalf("start worker: %v", err)
+	var workers []worker.Worker
+	if !cfg.backlogBeforeWorkers {
+		workers, err = startWorker(c, cfg)
+		if err != nil {
+			log.Fatalf("start worker: %v", err)
+		}
 	}
-	defer stopWorkers(workers)
+	defer func() {
+		stopWorkers(workers)
+	}()
 
 	stopCPUProfile, err := startCPUProfile(cfg.cpuProfile)
 	if err != nil {
@@ -192,7 +213,15 @@ func main() {
 	if err := writeRunMetadata(ctx, cfg); err != nil {
 		log.Fatalf("write run metadata: %v", err)
 	}
-	result := runLoad(ctx, c, cfg)
+	var result runResult
+	if cfg.backlogBeforeWorkers {
+		result, workers, err = runBacklogLoad(ctx, c, cfg)
+		if err != nil {
+			log.Fatalf("run persisted task backlog load: %v", err)
+		}
+	} else {
+		result = runLoad(ctx, c, cfg)
+	}
 	stopCPUProfile()
 	if err := serverCPUProfileDone(); err != nil {
 		log.Fatalf("write server CPU profile: %v", err)
@@ -236,6 +265,8 @@ func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
 	flags.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "overall load run timeout")
 	flags.BoolVar(&cfg.registerNS, "register-namespace", true, "register namespace if it does not exist")
 	flags.BoolVar(&cfg.runWorker, "worker", true, "run a worker in this process")
+	flags.BoolVar(&cfg.backlogBeforeWorkers, "backlog-before-workers", false, "persist workflow tasks before starting workers")
+	flags.DurationVar(&cfg.backlogWaitTimeout, "backlog-wait-timeout", 30*time.Second, "maximum time to wait for workflow tasks to enter the persisted backlog")
 	flags.StringVar(&cfg.cpuProfile, "cpu-profile", "", "write Go CPU profile for the load generator")
 	flags.StringVar(&cfg.heapProfile, "heap-profile", "", "write Go heap profile for the load generator after the run")
 	flags.StringVar(&cfg.serverPProf, "server-pprof", "", "Temporal server pprof base URL, for example http://127.0.0.1:7936")
@@ -271,6 +302,20 @@ func validateConfig(cfg runConfig) error {
 	}
 	if cfg.payloadBytes < 0 {
 		return errors.New("-payload-bytes must be non-negative")
+	}
+	if cfg.backlogBeforeWorkers {
+		if !cfg.runWorker {
+			return errors.New("-worker must be enabled when -backlog-before-workers is set")
+		}
+		if cfg.signalsEach != 0 {
+			return errors.New("-signals-each must be zero when -backlog-before-workers is set")
+		}
+		if cfg.eagerStart {
+			return errors.New("-eager-start must be disabled when -backlog-before-workers is set")
+		}
+		if cfg.backlogWaitTimeout <= 0 {
+			return errors.New("-backlog-wait-timeout must be positive when -backlog-before-workers is set")
+		}
 	}
 	if cfg.serverCPU != "" && cfg.serverPProf == "" {
 		return errors.New("-server-pprof must be set when -server-cpu-profile is set")
@@ -322,11 +367,23 @@ func runLoad(ctx context.Context, c client.Client, cfg runConfig) runResult {
 	return runLoadWithRunner(ctx, c, cfg, runOneWorkflow)
 }
 
-type workflowRunner func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult
+type (
+	workflowRunner  func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult
+	workflowStarter func(context.Context, client.Client, runConfig, []byte, int64, int) (client.WorkflowRun, error)
+	backlogWaiter   func(context.Context, client.Client, runConfig, int64) (int64, error)
+	workerStarter   func(client.Client, runConfig) ([]worker.Worker, error)
+)
 
 type workflowRunResult struct {
 	completed bool
 	requests  int64
+}
+
+type backlogEnqueueResult struct {
+	runs     []client.WorkflowRun
+	elapsed  time.Duration
+	enqueued int64
+	requests int64
 }
 
 func runLoadWithRunner(ctx context.Context, c client.Client, cfg runConfig, runner workflowRunner) runResult {
@@ -365,7 +422,20 @@ launch:
 
 	wg.Wait()
 	elapsed := time.Since(start)
-	result := runResult{
+	result := newRunResult(cfg)
+	result.Elapsed = elapsed
+	result.Completed = completed.Load()
+	result.Failed = failed.Load()
+	result.Requests = requests.Load()
+	if elapsed > 0 {
+		result.WorkflowsPerSec = float64(result.Completed) / elapsed.Seconds()
+		result.RequestsPerSec = float64(result.Requests) / elapsed.Seconds()
+	}
+	return result
+}
+
+func newRunResult(cfg runConfig) runResult {
+	return runResult{
 		Address:               cfg.address,
 		Namespace:             cfg.namespace,
 		TaskQueue:             cfg.taskQueue,
@@ -378,10 +448,7 @@ launch:
 		EagerStart:            cfg.eagerStart,
 		EagerActivities:       cfg.eagerActivities,
 		PayloadBytes:          cfg.payloadBytes,
-		Elapsed:               elapsed,
-		Completed:             completed.Load(),
-		Failed:                failed.Load(),
-		Requests:              requests.Load(),
+		BacklogBeforeWorkers:  cfg.backlogBeforeWorkers,
 		CPUProfile:            cfg.cpuProfile,
 		HeapProfile:           cfg.heapProfile,
 		ServerCPUProfile:      cfg.serverCPU,
@@ -392,11 +459,6 @@ launch:
 		ResultFile:            cfg.resultFile,
 		RunMetadataFile:       cfg.runMetadataFile,
 	}
-	if elapsed > 0 {
-		result.WorkflowsPerSec = float64(result.Completed) / elapsed.Seconds()
-		result.RequestsPerSec = float64(result.Requests) / elapsed.Seconds()
-	}
-	return result
 }
 
 func runOneWorkflow(
@@ -407,19 +469,9 @@ func runOneWorkflow(
 	startNanos int64,
 	workflowIndex int,
 ) workflowRunResult {
-	workflowID := fmt.Sprintf("scylla-load-%d-%d", startNanos, workflowIndex)
+	workflowID := workflowID(startNanos, workflowIndex)
 	result := workflowRunResult{requests: 1}
-	taskQueue := taskQueueName(cfg, workflowIndex%cfg.taskQueues)
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:               workflowID,
-		TaskQueue:        taskQueue,
-		EnableEagerStart: cfg.eagerStart,
-	}, loadWorkflow, workflowInput{
-		Activities: cfg.activitiesEach,
-		Signals:    cfg.signalsEach,
-		Eager:      cfg.eagerActivities,
-		Payload:    payload,
-	})
+	run, err := startOneWorkflow(ctx, c, cfg, payload, startNanos, workflowIndex)
 	if err != nil {
 		log.Printf("start workflow %s: %v", workflowID, err)
 		return result
@@ -439,6 +491,222 @@ func runOneWorkflow(
 	}
 	result.completed = true
 	return result
+}
+
+func startOneWorkflow(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+	payload []byte,
+	startNanos int64,
+	workflowIndex int,
+) (client.WorkflowRun, error) {
+	return c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:               workflowID(startNanos, workflowIndex),
+		TaskQueue:        taskQueueName(cfg, workflowIndex%cfg.taskQueues),
+		EnableEagerStart: cfg.eagerStart,
+	}, loadWorkflow, workflowInput{
+		Activities: cfg.activitiesEach,
+		Signals:    cfg.signalsEach,
+		Eager:      cfg.eagerActivities,
+		Payload:    payload,
+	})
+}
+
+func workflowID(startNanos int64, workflowIndex int) string {
+	return fmt.Sprintf("scylla-load-%d-%d", startNanos, workflowIndex)
+}
+
+func runBacklogLoad(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+) (runResult, []worker.Worker, error) {
+	return runBacklogLoadWithDependencies(ctx, c, cfg, startOneWorkflow, waitForWorkflowTaskBacklog, startWorker)
+}
+
+func runBacklogLoadWithDependencies(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+	starter workflowStarter,
+	waiter backlogWaiter,
+	startWorkers workerStarter,
+) (runResult, []worker.Worker, error) {
+	result := newRunResult(cfg)
+	start := time.Now()
+	enqueueResult := enqueueWorkflowBacklog(ctx, c, cfg, starter, start)
+	result.EnqueueElapsed = enqueueResult.elapsed
+	result.Enqueued = enqueueResult.enqueued
+	result.EnqueueFailed = int64(cfg.workflows) - result.Enqueued
+	result.Requests = enqueueResult.requests
+	if result.EnqueueElapsed > 0 {
+		result.EnqueueRequestsPerSec = float64(result.Requests) / result.EnqueueElapsed.Seconds()
+	}
+
+	backlogWaitStart := time.Now()
+	backlogTasks, err := waiter(ctx, c, cfg, result.Enqueued)
+	result.BacklogWaitElapsed = time.Since(backlogWaitStart)
+	result.BacklogTasks = backlogTasks
+	if err != nil {
+		return result, nil, err
+	}
+
+	drainStart := time.Now()
+	workers, err := startWorkers(c, cfg)
+	if err != nil {
+		return result, nil, err
+	}
+
+	completed := drainWorkflowBacklog(ctx, enqueueResult.runs, cfg.concurrency)
+	result.DrainElapsed = time.Since(drainStart)
+	result.Completed = completed
+	result.DrainFailed = result.Enqueued - result.Completed
+	result.Failed = int64(cfg.workflows) - result.Completed
+	result.Elapsed = time.Since(start)
+	if result.Elapsed > 0 {
+		result.WorkflowsPerSec = float64(result.Completed) / result.Elapsed.Seconds()
+		result.RequestsPerSec = float64(result.Requests) / result.Elapsed.Seconds()
+	}
+	if result.DrainElapsed > 0 {
+		result.DrainWorkflowsPerSec = float64(result.Completed) / result.DrainElapsed.Seconds()
+	}
+	return result, workers, nil
+}
+
+func enqueueWorkflowBacklog(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+	starter workflowStarter,
+	start time.Time,
+) backlogEnqueueResult {
+	payload := makePayload(cfg.payloadBytes)
+	runs := make([]client.WorkflowRun, cfg.workflows)
+	sem := make(chan struct{}, cfg.concurrency)
+	var wg sync.WaitGroup
+	var enqueued atomic.Int64
+	var requests atomic.Int64
+
+enqueue:
+	for workflowIndex := 0; workflowIndex < cfg.workflows; workflowIndex++ {
+		select {
+		case <-ctx.Done():
+			break enqueue
+		case sem <- struct{}{}:
+		}
+		index := workflowIndex
+		wg.Go(func() {
+			defer func() { <-sem }()
+			requests.Add(1)
+			run, err := starter(ctx, c, cfg, payload, start.UnixNano(), index)
+			if err != nil {
+				log.Printf("start workflow %s: %v", workflowID(start.UnixNano(), index), err)
+				return
+			}
+			runs[index] = run
+			enqueued.Add(1)
+		})
+	}
+	wg.Wait()
+	return backlogEnqueueResult{
+		runs:     runs,
+		elapsed:  time.Since(start),
+		enqueued: enqueued.Load(),
+		requests: requests.Load(),
+	}
+}
+
+func drainWorkflowBacklog(
+	ctx context.Context,
+	runs []client.WorkflowRun,
+	concurrency int,
+) int64 {
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var completed atomic.Int64
+
+drain:
+	for _, run := range runs {
+		if run == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			break drain
+		case sem <- struct{}{}:
+		}
+		workflowRun := run
+		wg.Go(func() {
+			defer func() { <-sem }()
+			if err := workflowRun.Get(ctx, nil); err != nil {
+				log.Printf("workflow %s failed: %v", workflowRun.GetID(), err)
+				return
+			}
+			completed.Add(1)
+		})
+	}
+	wg.Wait()
+	return completed.Load()
+}
+
+func waitForWorkflowTaskBacklog(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+	expected int64,
+) (int64, error) {
+	if expected == 0 {
+		return 0, nil
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, cfg.backlogWaitTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	var backlog int64
+	for {
+		var err error
+		backlog, err = workflowTaskBacklogCount(waitCtx, c, cfg)
+		if err != nil {
+			return backlog, err
+		}
+		if backlog >= expected {
+			return backlog, nil
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return backlog, fmt.Errorf("wait for workflow task backlog: got %d of %d tasks: %w", backlog, expected, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func workflowTaskBacklogCount(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+) (int64, error) {
+	var backlog int64
+	for taskQueueIndex := 0; taskQueueIndex < cfg.taskQueues; taskQueueIndex++ {
+		response, err := c.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
+			Namespace: cfg.namespace,
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: taskQueueName(cfg, taskQueueIndex),
+				Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
+			},
+			TaskQueueType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			ReportStats:   true,
+		})
+		if err != nil {
+			return backlog, err
+		}
+		backlog += response.GetStats().GetApproximateBacklogCount()
+	}
+	return backlog, nil
 }
 
 func taskQueueName(cfg runConfig, index int) string {
@@ -484,25 +752,27 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 		return nil
 	}
 	metadata := runMetadata{
-		StartedAt:           time.Now().UTC(),
-		Address:             cfg.address,
-		Namespace:           cfg.namespace,
-		TaskQueue:           cfg.taskQueue,
-		TaskQueues:          cfg.taskQueues,
-		WorkersPerTaskQueue: cfg.workersPerTaskQueue,
-		Workflows:           cfg.workflows,
-		Concurrency:         cfg.concurrency,
-		ActivitiesEach:      cfg.activitiesEach,
-		SignalsEach:         cfg.signalsEach,
-		EagerStart:          cfg.eagerStart,
-		EagerActivities:     cfg.eagerActivities,
-		PayloadBytes:        cfg.payloadBytes,
-		GoVersion:           runtime.Version(),
-		GOOS:                runtime.GOOS,
-		GOARCH:              runtime.GOARCH,
-		NumCPU:              runtime.NumCPU(),
-		GOMAXPROCS:          runtime.GOMAXPROCS(0),
-		Environment:         selectedEnvironment(),
+		StartedAt:            time.Now().UTC(),
+		Address:              cfg.address,
+		Namespace:            cfg.namespace,
+		TaskQueue:            cfg.taskQueue,
+		TaskQueues:           cfg.taskQueues,
+		WorkersPerTaskQueue:  cfg.workersPerTaskQueue,
+		Workflows:            cfg.workflows,
+		Concurrency:          cfg.concurrency,
+		ActivitiesEach:       cfg.activitiesEach,
+		SignalsEach:          cfg.signalsEach,
+		EagerStart:           cfg.eagerStart,
+		EagerActivities:      cfg.eagerActivities,
+		PayloadBytes:         cfg.payloadBytes,
+		BacklogBeforeWorkers: cfg.backlogBeforeWorkers,
+		BacklogWaitTimeout:   cfg.backlogWaitTimeout,
+		GoVersion:            runtime.Version(),
+		GOOS:                 runtime.GOOS,
+		GOARCH:               runtime.GOARCH,
+		NumCPU:               runtime.NumCPU(),
+		GOMAXPROCS:           runtime.GOMAXPROCS(0),
+		Environment:          selectedEnvironment(),
 	}
 	if cfg.serverPProf != "" {
 		pprofURL, err := serverPProfURL(cfg.serverPProf, "/debug/pprof/", nil)
