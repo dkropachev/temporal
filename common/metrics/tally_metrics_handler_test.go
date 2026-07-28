@@ -133,8 +133,12 @@ func TestTallyMetricsHandlerBoundsCaches(t *testing.T) {
 
 	cachedParent := handler.WithTags(StringTag("operation", "GetWorkflowExecution")).(*tallyMetricsHandler)
 
+	var cachedChild Handler
 	for i := 1; i < maxCachedTallyTagSets; i++ {
-		cachedParent.WithTags(UnsafeTaskQueueTag("task-queue-" + strconv.Itoa(i)))
+		taggedHandler := cachedParent.WithTags(UnsafeTaskQueueTag("task-queue-" + strconv.Itoa(i)))
+		if i == 1 {
+			cachedChild = taggedHandler
+		}
 	}
 	overflowTag := UnsafeTaskQueueTag("overflow-task-queue")
 	overflowTagKey, cacheable := newTallyTagCacheKey([]Tag{overflowTag})
@@ -143,10 +147,9 @@ func TestTallyMetricsHandlerBoundsCaches(t *testing.T) {
 
 	require.Same(t, handler.cache.state, cachedParent.cache.state)
 	require.Equal(t, int64(maxCachedTallyTagSets), handler.cache.state.taggedHandlersCount.Load())
-	require.True(t, handler.cache.state.taggedHandlersFull.Load())
 	require.True(t, isUncached)
-	_, bypassesCachedEntry := handler.WithTags(StringTag("operation", "GetWorkflowExecution")).(*uncachedTallyMetricsHandler)
-	require.True(t, bypassesCachedEntry)
+	require.Same(t, cachedParent, handler.WithTags(StringTag("operation", "GetWorkflowExecution")))
+	require.Same(t, cachedChild, cachedParent.WithTags(UnsafeTaskQueueTag("task-queue-1")))
 	_, ok := handler.cache.taggedHandlers.Load(overflowTagKey)
 	require.False(t, ok)
 }

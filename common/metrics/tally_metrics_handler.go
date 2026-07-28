@@ -31,7 +31,6 @@ type (
 
 	tallyMetricsCacheState struct {
 		taggedHandlersCount atomic.Int64
-		taggedHandlersFull  atomic.Bool
 	}
 
 	tallyMetricsHandlerBase struct {
@@ -91,7 +90,7 @@ func (tmh *tallyMetricsHandler) WithTags(tags ...Tag) Handler {
 	if len(tags) == 0 {
 		return tmh
 	}
-	if tmh.cache == nil || tmh.cache.state.taggedHandlersFull.Load() {
+	if tmh.cache == nil {
 		return tmh.newUncachedTaggedHandler(tags)
 	}
 	return tmh.withTagsCached(tags)
@@ -101,7 +100,7 @@ func (tmh *tallyMetricsHandler) withTags(tags []Tag) tallyHandler {
 	if len(tags) == 0 {
 		return tmh
 	}
-	if tmh.cache == nil || tmh.cache.state.taggedHandlersFull.Load() {
+	if tmh.cache == nil {
 		return tmh.newUncachedTaggedHandler(tags)
 	}
 	return tmh.withTagsCached(tags)
@@ -132,9 +131,6 @@ func (tmh *tallyMetricsHandler) withTagsCached(tags []Tag) tallyHandler {
 			return typedHandler
 		}
 		return tmh.newUncachedTaggedHandler(tags)
-	}
-	if tmh.cache.state.taggedHandlersCount.Load() >= maxCachedTallyTagSets {
-		tmh.cache.state.taggedHandlersFull.Store(true)
 	}
 	return taggedHandler
 }
