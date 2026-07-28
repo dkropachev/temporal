@@ -403,6 +403,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   Previously the loop checked the page token without creating a new iterator, which could spin on large build-ID
   mappings instead of advancing to the next page. It also stops if Cassandra returns the same empty page token twice,
   matching the QueueV2 list guard against repeated empty paging tokens.
+- Task-queue user data scans now close Cassandra iterators before returning malformed-row errors, and successful CAS
+  user-data updates return iterator close errors instead of ignoring them. This is an error-path resource cleanup rather
+  than a steady-state throughput optimization, but it avoids leaking driver-side scan resources under bad persisted data
+  or close failures.
 - History branch reads and history-tree branch scans now read the Cassandra page token after consuming each iterator,
   avoiding dropped next-page tokens on large histories or many branches.
 - History branch row conversion now returns typed field errors instead of panicking on malformed rows, and closes the

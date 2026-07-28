@@ -106,9 +106,11 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 	if err != nil {
 		return gocql.ConvertError("UpdateTaskQueueUserData", err)
 	}
-	defer iter.Close()
 
 	if !applied {
+		defer func() {
+			_ = iter.Close()
+		}()
 		// No error, but not applied. That means we had a conflict.
 		// Iterate through results to identify first conflicting row.
 		for {
@@ -132,6 +134,9 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 		return &p.ConditionFailedError{Msg: "Failed to update task queues: unknown conflict"}
 	}
 
+	if err := iter.Close(); err != nil {
+		return gocql.ConvertError("UpdateTaskQueueUserData", err)
+	}
 	return nil
 }
 
@@ -141,21 +146,28 @@ func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, reques
 
 	response := &p.InternalListTaskQueueUserDataEntriesResponse{}
 	row := make(map[string]any)
+	closeIter := func() {
+		_ = iter.Close()
+	}
 	for iter.MapScan(row) {
 		taskQueue, err := getTypedFieldFromRow[string]("task_queue_name", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		data, err := getTypedFieldFromRow[[]byte]("data", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		dataEncoding, err := getTypedFieldFromRow[string]("data_encoding", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		version, err := getTypedFieldFromRow[int64]("version", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 

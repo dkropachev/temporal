@@ -597,6 +597,72 @@ func TestGetTaskQueuesByBuildIDDropsRepeatedEmptyPageToken(t *testing.T) {
 	require.Equal(t, pageToken, session.queries[1].query.pageState)
 }
 
+func TestListTaskQueueUserDataEntriesClosesIteratorOnRowError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  map[string]any
+	}{
+		{
+			name: "missing task queue",
+			row: map[string]any{
+				"data":          []byte("data"),
+				"data_encoding": enumspb.ENCODING_TYPE_PROTO3.String(),
+				"version":       int64(1),
+			},
+		},
+		{
+			name: "missing data",
+			row: map[string]any{
+				"task_queue_name": "task-queue",
+				"data_encoding":   enumspb.ENCODING_TYPE_PROTO3.String(),
+				"version":         int64(1),
+			},
+		},
+		{
+			name: "missing encoding",
+			row: map[string]any{
+				"task_queue_name": "task-queue",
+				"data":            []byte("data"),
+				"version":         int64(1),
+			},
+		},
+		{
+			name: "missing version",
+			row: map[string]any{
+				"task_queue_name": "task-queue",
+				"data":            []byte("data"),
+				"data_encoding":   enumspb.ENCODING_TYPE_PROTO3.String(),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			iter := &recordingIter{
+				mapRows: []map[string]any{tc.row},
+			}
+			session := &recordingSession{
+				t: t,
+				queryFn: func(stmt string, args ...any) cgocql.Query {
+					require.Equal(t, templateListTaskQueueUserDataQuery, stmt)
+					require.Equal(t, []any{"namespace-id"}, args)
+					return &recordingQuery{
+						iter: iter,
+					}
+				},
+			}
+			store := userDataStore{Session: session}
+
+			response, err := store.ListTaskQueueUserDataEntries(t.Context(), &p.ListTaskQueueUserDataEntriesRequest{
+				NamespaceID: "namespace-id",
+				PageSize:    100,
+			})
+
+			require.Error(t, err)
+			require.Nil(t, response)
+			require.Equal(t, 1, iter.closeCalls)
+		})
+	}
+}
+
 func TestListConcreteExecutionsClosesIterator(t *testing.T) {
 	iter := &recordingIter{
 		closeErr: errors.New("close failed"),
