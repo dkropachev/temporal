@@ -365,6 +365,15 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   throughput dropped to `173.08 workflows/sec`, and signal throughput dropped to `239.11 workflows/sec`, compared with
   `187.54` and `291.81 workflows/sec` at `maxConns: 12`. Matching connections to the 12 Scylla shards remains the
   better default for this target.
+- Increasing normal matching task queue read/write partitions from `12` to `24` was tested and rejected on the same
+  3 node x 4 shard cluster. Activity throughput dropped to `97.82 workflows/sec`, and signal throughput dropped to
+  `240.02 workflows/sec` / `480.03 requests/sec`, compared with same-server 12-partition controls of
+  `189.46 workflows/sec` for activity and `290.73 workflows/sec` / `581.46 requests/sec` for signal. More partitions
+  add matching management and polling overhead without adding useful Scylla parallelism on a 12-shard target.
+- Reducing normal matching task queue read/write partitions from `12` to `6` was also tested and rejected. Activity
+  throughput dropped to `160.39 workflows/sec`, while signal throughput was effectively flat at
+  `292.64 workflows/sec` / `585.29 requests/sec`. The lower partition count reduces matching fanout overhead but
+  under-spreads the activity workload's task writes; `12` remains the better default for the 12-shard target.
 - Eager workflow start and activity dispatch were tested and accepted as load-generator controls for measuring
   colocated worker fast paths. On the same optimized server with `maxConns: 12`, the no-eager controls were
   `189.46 workflows/sec` for the one-activity workload and `290.73 workflows/sec` / `581.46 requests/sec` for the
