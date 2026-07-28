@@ -445,6 +445,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   CQL. This is a correctness cleanup in the same hot table path, not a benchmarked latency change.
 - Cassandra matching and history task reads now preallocate response task slices from the request page or batch size,
   matching the SQL store pattern and reducing allocation growth in hot paged task scans.
+- Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
+  page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
+  and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without
+  changing CQL, consistency, or paging behavior.
 - `ListConcreteExecutions` now closes the Cassandra iterator on normal completion and malformed-row early exits, and
   returns close errors on the normal path. This avoids leaking driver-side scan resources during shard-level
   `executions` table walks.

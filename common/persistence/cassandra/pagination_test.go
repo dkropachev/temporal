@@ -23,8 +23,9 @@ import (
 )
 
 var (
-	benchmarkQueueSink *Queue
-	benchmarkBoolSink  bool
+	benchmarkQueueSink          *Queue
+	benchmarkExecutionStateSink []*p.InternalWorkflowMutableState
+	benchmarkBoolSink           bool
 )
 
 func TestListNexusEndpointsUsesSameQueryForPageToken(t *testing.T) {
@@ -689,6 +690,59 @@ func TestListConcreteExecutionsClosesIterator(t *testing.T) {
 	require.Contains(t, err.Error(), "ListConcreteExecutions")
 	require.Len(t, session.queries, 1)
 	require.Equal(t, 1, iter.closeCalls)
+}
+
+func TestListConcreteExecutionsPreallocatesPage(t *testing.T) {
+	iter := &recordingIter{}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateListWorkflowExecutionQuery, stmt)
+			require.Equal(t, []any{int32(7), rowTypeExecution}, args)
+			return &recordingQuery{
+				iter: iter,
+			}
+		},
+	}
+	store := &MutableStateStore{Session: session}
+
+	response, err := store.ListConcreteExecutions(t.Context(), &p.ListConcreteExecutionsRequest{
+		ShardID:  7,
+		PageSize: 100,
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, response.States)
+	require.Equal(t, 100, cap(response.States))
+	require.Equal(t, 1, iter.closeCalls)
+}
+
+func BenchmarkListConcreteExecutionsResultAllocation(b *testing.B) {
+	states := make([]*p.InternalWorkflowMutableState, 100)
+	for i := range states {
+		states[i] = &p.InternalWorkflowMutableState{}
+	}
+
+	b.Run("grow", func(b *testing.B) {
+		for b.Loop() {
+			result := make([]*p.InternalWorkflowMutableState, 0)
+			//nolint:staticcheck // Model the row-at-a-time iterator used by ListConcreteExecutions.
+			for _, state := range states {
+				result = append(result, state)
+			}
+			benchmarkExecutionStateSink = result
+		}
+	})
+	b.Run("preallocate", func(b *testing.B) {
+		for b.Loop() {
+			result := make([]*p.InternalWorkflowMutableState, 0, len(states))
+			//nolint:staticcheck // Model the row-at-a-time iterator used by ListConcreteExecutions.
+			for _, state := range states {
+				result = append(result, state)
+			}
+			benchmarkExecutionStateSink = result
+		}
+	})
 }
 
 func TestListConcreteExecutionsClosesIteratorOnRowError(t *testing.T) {

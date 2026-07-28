@@ -1059,7 +1059,9 @@ func (d *MutableStateStore) ListConcreteExecutions(
 	).WithContext(ctx)
 	iter := query.PageSize(request.PageSize).PageState(request.PageToken).Iter()
 
-	response := &p.InternalListConcreteExecutionsResponse{}
+	response := &p.InternalListConcreteExecutionsResponse{
+		States: make([]*p.InternalWorkflowMutableState, 0, nonNegativeCapacity(request.PageSize)),
+	}
 	closeIterator := func() error {
 		if err := iter.Close(); err != nil {
 			return gocql.ConvertError("ListConcreteExecutions", err)
