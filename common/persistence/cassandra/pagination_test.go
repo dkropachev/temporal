@@ -23,10 +23,11 @@ import (
 )
 
 var (
-	benchmarkQueueSink          *Queue
-	benchmarkExecutionStateSink []*p.InternalWorkflowMutableState
-	benchmarkTaskResponseSink   *p.InternalGetTasksResponse
-	benchmarkBoolSink           bool
+	benchmarkQueueSink                     *Queue
+	benchmarkExecutionStateSink            []*p.InternalWorkflowMutableState
+	benchmarkConcreteExecutionResponseSink *p.InternalListConcreteExecutionsResponse
+	benchmarkTaskResponseSink              *p.InternalGetTasksResponse
+	benchmarkBoolSink                      bool
 )
 
 func TestListNexusEndpointsUsesSameQueryForPageToken(t *testing.T) {
@@ -761,11 +762,47 @@ func BenchmarkListConcreteExecutionsResultAllocation(b *testing.B) {
 	})
 }
 
-func TestListConcreteExecutionsClosesIteratorOnRowError(t *testing.T) {
-	iter := &recordingIter{
-		mapRows: []map[string]any{
-			{"execution": "not-bytes"},
+func BenchmarkListConcreteExecutionsReadPage(b *testing.B) {
+	rows := make([][]any, 100)
+	for i := range rows {
+		rows[i] = []any{
+			"run-id",
+			[]byte("execution"),
+			enumspb.ENCODING_TYPE_PROTO3.String(),
+			[]byte("execution-state"),
+			enumspb.ENCODING_TYPE_PROTO3.String(),
+			int64(i + 1),
+		}
+	}
+	session := &recordingSession{
+		t: b,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				iter: &recordingIter{
+					scanRows: rows,
+				},
+			}
 		},
+	}
+	store := &MutableStateStore{Session: session}
+	request := &p.ListConcreteExecutionsRequest{
+		ShardID:  7,
+		PageSize: 100,
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		response, err := store.ListConcreteExecutions(b.Context(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkConcreteExecutionResponseSink = response
+	}
+}
+
+func TestListConcreteExecutionsClosesIteratorOnScanError(t *testing.T) {
+	iter := &recordingIter{
+		closeErr: errors.New("scan failed"),
 	}
 	session := &recordingSession{
 		t: t,
@@ -786,7 +823,52 @@ func TestListConcreteExecutionsClosesIteratorOnRowError(t *testing.T) {
 
 	require.Error(t, err)
 	require.Nil(t, response)
-	require.Contains(t, err.Error(), "execution")
+	require.ErrorContains(t, err, "scan failed")
+	require.Equal(t, 1, iter.closeCalls)
+}
+
+func TestListConcreteExecutionsTypedScanSkipsCurrentRow(t *testing.T) {
+	pageToken := []byte("next-page")
+	iter := &recordingIter{
+		scanRows: [][]any{
+			{"current-run", nil, nil, nil, nil, int64(0)},
+			{
+				"run-id",
+				[]byte("execution"),
+				enumspb.ENCODING_TYPE_PROTO3.String(),
+				[]byte("execution-state"),
+				enumspb.ENCODING_TYPE_PROTO3.String(),
+				int64(42),
+			},
+		},
+		pageState:               pageToken,
+		pageStateAfterExhausted: true,
+	}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateListWorkflowExecutionQuery, stmt)
+			require.Equal(t, []any{int32(7), rowTypeExecution}, args)
+			return &recordingQuery{
+				iter: iter,
+			}
+		},
+	}
+	store := &MutableStateStore{Session: session}
+
+	response, err := store.ListConcreteExecutions(t.Context(), &p.ListConcreteExecutionsRequest{
+		ShardID:  7,
+		PageSize: 100,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, response.States, 1)
+	require.Equal(t, []byte("execution"), response.States[0].ExecutionInfo.Data)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3, response.States[0].ExecutionInfo.EncodingType)
+	require.Equal(t, []byte("execution-state"), response.States[0].ExecutionState.Data)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3, response.States[0].ExecutionState.EncodingType)
+	require.Equal(t, int64(42), response.States[0].NextEventID)
+	require.Equal(t, pageToken, response.NextPageToken)
 	require.Equal(t, 1, iter.closeCalls)
 }
 
@@ -2702,6 +2784,9 @@ func (i *recordingIter) Scan(dest ...any) bool {
 	row := i.scanRows[i.scanIdx]
 	i.scanIdx++
 	for idx := range dest {
+		if dest[idx] == nil {
+			continue
+		}
 		switch d := dest[idx].(type) {
 		case *string:
 			if row[idx] == nil {

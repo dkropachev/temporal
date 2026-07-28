@@ -1068,30 +1068,25 @@ func (d *MutableStateStore) ListConcreteExecutions(
 		}
 		return nil
 	}
-	result := make(map[string]any)
-	for iter.MapScan(result) {
-		if execution, ok := result["execution"]; ok {
-			executionBytes, ok := execution.([]byte)
-			if !ok {
-				_ = closeIterator()
-				return nil, newPersistedTypeMismatchError("execution", "", executionBytes, result)
-			}
-
-			if len(executionBytes) == 0 {
-				// current record has no value in execution column.
-				result = make(map[string]any)
-				continue
-			}
-
-			state, err := mutableStateFromRow(result)
-			if err != nil {
-				_ = closeIterator()
-				return nil, err
-			}
-			response.States = append(response.States, state)
+	var execution []byte
+	var executionEncoding string
+	var executionState []byte
+	var executionStateEncoding string
+	var nextEventID int64
+	for iter.Scan(nil, &execution, &executionEncoding, &executionState, &executionStateEncoding, &nextEventID) {
+		if len(execution) > 0 {
+			response.States = append(response.States, &p.InternalWorkflowMutableState{
+				ExecutionInfo:  p.NewDataBlob(execution, executionEncoding),
+				ExecutionState: p.NewDataBlob(executionState, executionStateEncoding),
+				NextEventID:    nextEventID,
+			})
 		}
 
-		result = make(map[string]any)
+		execution = nil
+		executionEncoding = ""
+		executionState = nil
+		executionStateEncoding = ""
+		nextEventID = 0
 	}
 	if len(iter.PageState()) > 0 {
 		response.NextPageToken = iter.PageState()

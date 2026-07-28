@@ -123,6 +123,7 @@ Include the matching task benchmark when validating server task-queue persistenc
 ```bash
 go test -tags test_dep ./common/persistence/tests -run '^$' -bench 'BenchmarkCassandraMatchingTaskQueue$' -benchtime=50x -count=3
 go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkGetTasksV1ReadPage$' -benchmem -benchtime=10000x -count=3
+go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkListConcreteExecutionsReadPage$' -benchmem -benchtime=10000x -count=3
 ```
 
 Include the task-queue user data build-ID count benchmark when validating worker-versioning metadata paths:
@@ -456,6 +457,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without
   changing CQL, consistency, or paging behavior.
+- `ListConcreteExecutions` also uses a typed iterator scan for its six fixed columns and skips the unused run ID
+  destination. Its focused 100-row read-page benchmark improved from `26.790-27.397 us/op`, `65480-65481 B/op`, and
+  506 allocations to `11.382-13.610 us/op`, `41616-41619 B/op`, and 411 allocations. Current-record rows with an empty
+  execution blob remain excluded.
 - `ListConcreteExecutions` now closes the Cassandra iterator on normal completion and malformed-row early exits, and
   returns close errors on the normal path. This avoids leaking driver-side scan resources during shard-level
   `executions` table walks.
