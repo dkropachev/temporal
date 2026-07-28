@@ -200,7 +200,7 @@ func TestLoadEmbeddedCassandraScyllaDefaults(t *testing.T) {
 	cfg, err := Load(WithEmbedded())
 
 	require.NoError(t, err)
-	require.Equal(t, int32(12), cfg.Persistence.NumHistoryShards)
+	require.Equal(t, int32(512), cfg.Persistence.NumHistoryShards)
 	cassandraConfig := cfg.Persistence.DataStores[cfg.Persistence.DefaultStore].Cassandra
 	require.Equal(t, 12, cassandraConfig.MaxConns)
 	require.InDelta(t, float32(2), *cassandraConfig.MaxExcessShardConnectionsRate, 0)

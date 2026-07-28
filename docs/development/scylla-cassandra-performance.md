@@ -5,7 +5,10 @@ optimization complete.
 
 ## Current 3 Node x 4 Shard Target
 
-- Use 12 history shards by default for Cassandra/Scylla deployments, matching total Scylla shards in the target cluster.
+- Use 512 logical history shards by default for new Cassandra/Scylla deployments. History shards map one-to-one to
+  `executions` partitions and are independent of the 12 physical Scylla shards in the target cluster.
+- The history shard count is fixed when a Temporal cluster is created. Existing clusters must retain their original
+  value; changing this default only affects new clusters that do not set `NUM_HISTORY_SHARDS`.
 - Use 1 matching task queue read/write partition by default, and opt known hot task queues into higher partition counts
   through dynamic config after measuring the workload.
 - Keep Scylla gocql shard-aware port enabled. It is enabled by default in the Scylla gocql fork; use
@@ -554,6 +557,31 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   nearly eliminated allocations for no/all-move cases, but reduced the live activity median from
   `189.13` to `180.33 workflows/sec`; a one-pass lazy-allocation variant reached `187.98`. Both production changes were
   rejected, while the correctness cases and benchmark remain as a regression target.
+- Cassandra/Scylla defaults now use 512 logical history shards instead of tying the count to the target cluster's
+  12 physical Scylla shards. Each history shard is one `executions` partition, and the conditional mutable-state batch
+  intentionally keeps its shard, workflow, and generated task rows in that partition. More logical shards distribute
+  those atomic batches without weakening their fencing or splitting them across partitions.
+
+  Fresh-store screening used the same 3-node x 4-shard Scylla cluster, 16 task queues, 32 workers per queue,
+  6,400 persisted workflow tasks, and concurrency 640:
+
+  | History shards | Start admission | Backlog drain | Max `executions` partition | Server RSS after run |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 12 | `5,536.51 starts/sec` | `2,539.45 workflows/sec` | `1,358,102 bytes` | `903,484 KiB` |
+  | 128 | `9,736.00 starts/sec` | `6,714.81 workflows/sec` | `219,342 bytes` | `1,052,408 KiB` |
+  | 512 | `11,853.46 starts/sec` | `7,064.67 workflows/sec` | `88,148 bytes` | `1,154,016 KiB` |
+
+  A fresh 512-shard confirmation reached `12,252.66 starts/sec` and `7,083.41 workflows/sec`, then a final
+  12-shard control reached `5,386.68` and `3,245.43`. The two-control geometric means improved from `5,461.08` to
+  `12,051.41 starts/sec` (`+120.68%`) and from `2,870.82` to `7,074.04 drain workflows/sec` (`+146.41%`).
+  Maximum sampled compacted partition size fell from a `1,629,722-byte` geometric mean to `88,148 bytes` (`-94.59%`).
+
+  A mixed one-activity workload with the same 512-worker shape completed `2,275.83 workflows/sec` at 512 history
+  shards versus `984.04` at 12 (`+131.27%`). All 44,800 measured workflows across the shard-count screening,
+  confirmations, and mixed controls completed with zero failures, no `ResourceExhausted`/`RpsLimit` metric series,
+  no dropped mutations, and no current Scylla storage errors. The measured server RSS geometric mean increased from
+  `894,136 KiB` to `1,154,652 KiB` (`+29.14%`); operators choosing a lower count for memory-constrained new clusters
+  trade away partition distribution and future history-service scale-out headroom.
 - Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without
