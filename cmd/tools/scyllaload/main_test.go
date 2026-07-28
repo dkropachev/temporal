@@ -230,6 +230,36 @@ func TestRunLoadReportsFrontendRequestThroughput(t *testing.T) {
 	require.GreaterOrEqual(t, result.RequestsPerSec, result.WorkflowsPerSec)
 }
 
+func TestRunLoadDistributesWorkflowsAcrossTaskQueues(t *testing.T) {
+	taskQueueCounts := make(map[string]int)
+	runner := func(_ context.Context, _ client.Client, cfg runConfig, _ []byte, _ int64, workflowIndex int) workflowRunResult {
+		taskQueueCounts[taskQueueName(cfg, workflowIndex%cfg.taskQueues)]++
+		return workflowRunResult{
+			completed: true,
+			requests:  1,
+		}
+	}
+
+	result := runLoadWithRunner(t.Context(), nil, runConfig{
+		taskQueue:           "load-task-queue",
+		taskQueues:          4,
+		workersPerTaskQueue: 8,
+		workflows:           8,
+		concurrency:         1,
+		activitiesEach:      1,
+	}, runner)
+
+	require.Equal(t, int64(8), result.Completed)
+	require.Equal(t, 4, result.TaskQueues)
+	require.Equal(t, 8, result.WorkersPerTaskQueue)
+	require.Equal(t, map[string]int{
+		"load-task-queue-0": 2,
+		"load-task-queue-1": 2,
+		"load-task-queue-2": 2,
+		"load-task-queue-3": 2,
+	}, taskQueueCounts)
+}
+
 func TestServerProfilesFetchPPROFEndpoints(t *testing.T) {
 	var profileCalled bool
 	var heapCalled bool

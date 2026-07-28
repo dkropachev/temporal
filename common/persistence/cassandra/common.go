@@ -59,3 +59,10 @@ func getTypedFieldFromRow[T any](fieldName string, row map[string]any) (T, error
 
 	return typed, nil
 }
+
+func nonNegativeCapacity(size int) int {
+	if size < 0 {
+		return 0
+	}
+	return size
+}

@@ -182,6 +182,36 @@ path. The metadata file records runtime/process settings, selected Cassandra/Scy
 pprof/metrics endpoint reachability so before/after samples can be tied back to their CPU, heap, Prometheus, and
 cluster-configuration evidence.
 
+Many-worker task queue read/write scaling matrix:
+
+```bash
+for queues in 1 4 16; do
+  for workers in 1 2 4 8; do
+    go run ./cmd/tools/scyllaload \
+      -address 127.0.0.1:7233 \
+      -namespace scylla-load \
+      -task-queue "scylla-load-${queues}q-${workers}w" \
+      -task-queues "${queues}" \
+      -workers-per-task-queue "${workers}" \
+      -workflows 3200 \
+      -concurrency 320 \
+      -activities-each 1 \
+      -signals-each 0 \
+      -payload-bytes 256 \
+      -result-file "/tmp/scyllaload.activity.${queues}q.${workers}w.json" \
+      -run-metadata-file "/tmp/scyllaload.activity.${queues}q.${workers}w.metadata.json"
+  done
+done
+```
+
+Use the activity matrix above to measure matching task writes and reads together: each workflow produces workflow-task
+traffic plus activity task enqueue, poll, and completion traffic. Run the same queue/worker matrix with
+`-activities-each 0 -signals-each 0` to isolate workflow-task-only task queue polling/read pressure, and with
+`-signals-each 1` to include frontend request throughput. Accept a task queue partition/configuration change only if it
+improves completed workflows/sec without increasing p99 persistence latency, matching schedule-to-start latency, or
+Scylla shard imbalance at the same cluster size. Reject changes that improve a single hot queue while regressing the
+many-queue worker matrix.
+
 Load-generator profiles can be inspected with:
 
 ```bash
@@ -413,6 +443,8 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   iterator before returning those errors.
 - History scheduled-task and timer-task scan templates now keep all `executions` predicates separated in the generated
   CQL. This is a correctness cleanup in the same hot table path, not a benchmarked latency change.
+- Cassandra matching and history task reads now preallocate response task slices from the request page or batch size,
+  matching the SQL store pattern and reducing allocation growth in hot paged task scans.
 - `ListConcreteExecutions` now closes the Cassandra iterator on normal completion and malformed-row early exits, and
   returns close errors on the normal path. This avoids leaking driver-side scan resources during shard-level
   `executions` table walks.

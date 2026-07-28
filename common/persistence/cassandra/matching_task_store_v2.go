@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -157,7 +158,9 @@ func (d *matchingTaskStoreV2) GetTasks(
 	}
 	iter := query.WithContext(ctx).PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetTasksResponse{}
+	response := &p.InternalGetTasksResponse{
+		Tasks: make([]*commonpb.DataBlob, 0, nonNegativeCapacity(request.PageSize)),
+	}
 	closeIterator := func() error {
 		if err := iter.Close(); err != nil {
 			return gocql.ConvertError("GetTasks", err)
