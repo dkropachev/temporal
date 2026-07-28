@@ -29,6 +29,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 		"-concurrency=3",
 		"-activities-each=2",
 		"-signals-each=1",
+		"-eager-start=true",
+		"-eager-activities=true",
 		"-payload-bytes=512",
 		"-timeout=30s",
 		"-register-namespace=false",
@@ -56,6 +58,8 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	require.Equal(t, 3, cfg.concurrency)
 	require.Equal(t, 2, cfg.activitiesEach)
 	require.Equal(t, 1, cfg.signalsEach)
+	require.True(t, cfg.eagerStart)
+	require.True(t, cfg.eagerActivities)
 	require.Equal(t, 512, cfg.payloadBytes)
 	require.Equal(t, 30*time.Second, cfg.timeout)
 	require.False(t, cfg.registerNS)
@@ -118,10 +122,13 @@ func TestRunLoadCountsUnlaunchedWorkflowsAsFailed(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	started := make(chan struct{})
 	release := make(chan struct{})
-	runner := func(context.Context, client.Client, runConfig, []byte, int64, int) bool {
+	runner := func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult {
 		close(started)
 		<-release
-		return true
+		return workflowRunResult{
+			completed: true,
+			requests:  3,
+		}
 	}
 
 	resultCh := make(chan runResult, 1)
@@ -156,6 +163,7 @@ func TestRunLoadCountsUnlaunchedWorkflowsAsFailed(t *testing.T) {
 	result := <-resultCh
 	require.Equal(t, int64(1), result.Completed)
 	require.Equal(t, int64(2), result.Failed)
+	require.Equal(t, int64(3), result.Requests)
 	require.Equal(t, 3, result.Workflows)
 	require.Equal(t, "/tmp/cpu.pprof", result.CPUProfile)
 	require.Equal(t, "/tmp/heap.pprof", result.HeapProfile)
@@ -166,6 +174,27 @@ func TestRunLoadCountsUnlaunchedWorkflowsAsFailed(t *testing.T) {
 	require.Equal(t, []string{"/tmp/cpu.top.txt", "/tmp/server-cpu.top.txt"}, result.ProfileSummaries)
 	require.Equal(t, "/tmp/scyllaload.result.json", result.ResultFile)
 	require.Equal(t, "/tmp/scyllaload.metadata.json", result.RunMetadataFile)
+}
+
+func TestRunLoadReportsFrontendRequestThroughput(t *testing.T) {
+	runner := func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult {
+		return workflowRunResult{
+			completed: true,
+			requests:  2,
+		}
+	}
+
+	result := runLoadWithRunner(t.Context(), nil, runConfig{
+		workflows:   3,
+		concurrency: 2,
+	}, runner)
+
+	require.Equal(t, int64(3), result.Completed)
+	require.Equal(t, int64(0), result.Failed)
+	require.Equal(t, int64(6), result.Requests)
+	require.Positive(t, result.WorkflowsPerSec)
+	require.Positive(t, result.RequestsPerSec)
+	require.GreaterOrEqual(t, result.RequestsPerSec, result.WorkflowsPerSec)
 }
 
 func TestServerProfilesFetchPPROFEndpoints(t *testing.T) {
@@ -302,6 +331,8 @@ func TestWriteRunMetadata(t *testing.T) {
 		concurrency:     3,
 		activitiesEach:  2,
 		signalsEach:     1,
+		eagerStart:      true,
+		eagerActivities: true,
 		payloadBytes:    512,
 		serverPProf:     server.URL,
 		runMetadataFile: outputPath,
@@ -321,19 +352,21 @@ func TestWriteRunMetadata(t *testing.T) {
 	require.Equal(t, "node1,node2,node3", metadata.Environment["CASSANDRA_SEEDS"])
 	metadata.Environment = nil
 	require.Equal(t, runMetadata{
-		Address:        "127.0.0.1:7233",
-		Namespace:      "scylla-load",
-		TaskQueue:      "scylla-load",
-		Workflows:      7,
-		Concurrency:    3,
-		ActivitiesEach: 2,
-		SignalsEach:    1,
-		PayloadBytes:   512,
-		GoVersion:      runtime.Version(),
-		GOOS:           runtime.GOOS,
-		GOARCH:         runtime.GOARCH,
-		NumCPU:         runtime.NumCPU(),
-		GOMAXPROCS:     runtime.GOMAXPROCS(0),
+		Address:         "127.0.0.1:7233",
+		Namespace:       "scylla-load",
+		TaskQueue:       "scylla-load",
+		Workflows:       7,
+		Concurrency:     3,
+		ActivitiesEach:  2,
+		SignalsEach:     1,
+		EagerStart:      true,
+		EagerActivities: true,
+		PayloadBytes:    512,
+		GoVersion:       runtime.Version(),
+		GOOS:            runtime.GOOS,
+		GOARCH:          runtime.GOARCH,
+		NumCPU:          runtime.NumCPU(),
+		GOMAXPROCS:      runtime.GOMAXPROCS(0),
 		PProfEndpoint: &endpointCheck{
 			Name:   "pprof",
 			URL:    server.URL + "/debug/pprof/",
@@ -395,11 +428,15 @@ func TestWriteResultFile(t *testing.T) {
 		"concurrency": 0,
 		"activitiesEach": 0,
 		"signalsEach": 0,
+		"eagerStart": false,
+		"eagerActivities": false,
 		"payloadBytes": 0,
 		"elapsed": 0,
 		"completed": 0,
 		"failed": 0,
 		"workflowsPerSec": 0,
+		"requests": 0,
+		"requestsPerSec": 0,
 		"resultFile": "`+resultPath+`"
 	}`, string(data))
 }

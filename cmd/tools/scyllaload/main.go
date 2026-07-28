@@ -39,6 +39,8 @@ type (
 		concurrency           int
 		activitiesEach        int
 		signalsEach           int
+		eagerStart            bool
+		eagerActivities       bool
 		payloadBytes          int
 		timeout               time.Duration
 		registerNS            bool
@@ -59,6 +61,7 @@ type (
 	workflowInput struct {
 		Activities int
 		Signals    int
+		Eager      bool
 		Payload    []byte
 	}
 
@@ -70,11 +73,15 @@ type (
 		Concurrency           int           `json:"concurrency"`
 		ActivitiesEach        int           `json:"activitiesEach"`
 		SignalsEach           int           `json:"signalsEach"`
+		EagerStart            bool          `json:"eagerStart"`
+		EagerActivities       bool          `json:"eagerActivities"`
 		PayloadBytes          int           `json:"payloadBytes"`
 		Elapsed               time.Duration `json:"elapsed"`
 		Completed             int64         `json:"completed"`
 		Failed                int64         `json:"failed"`
 		WorkflowsPerSec       float64       `json:"workflowsPerSec"`
+		Requests              int64         `json:"requests"`
+		RequestsPerSec        float64       `json:"requestsPerSec"`
 		CPUProfile            string        `json:"cpuProfile,omitempty"`
 		HeapProfile           string        `json:"heapProfile,omitempty"`
 		ServerCPUProfile      string        `json:"serverCpuProfile,omitempty"`
@@ -95,6 +102,8 @@ type (
 		Concurrency             int               `json:"concurrency"`
 		ActivitiesEach          int               `json:"activitiesEach"`
 		SignalsEach             int               `json:"signalsEach"`
+		EagerStart              bool              `json:"eagerStart"`
+		EagerActivities         bool              `json:"eagerActivities"`
 		PayloadBytes            int               `json:"payloadBytes"`
 		GoVersion               string            `json:"goVersion"`
 		GOOS                    string            `json:"goos"`
@@ -215,6 +224,8 @@ func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
 	flags.IntVar(&cfg.concurrency, "concurrency", 100, "maximum concurrent workflow executions")
 	flags.IntVar(&cfg.activitiesEach, "activities-each", 1, "activities executed by each workflow")
 	flags.IntVar(&cfg.signalsEach, "signals-each", 0, "signals sent to each workflow before completion")
+	flags.BoolVar(&cfg.eagerStart, "eager-start", false, "request eager workflow start from a colocated worker")
+	flags.BoolVar(&cfg.eagerActivities, "eager-activities", false, "request eager activity dispatch from workflow tasks")
 	flags.IntVar(&cfg.payloadBytes, "payload-bytes", 128, "payload size for workflow inputs, activities, and signals")
 	flags.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "overall load run timeout")
 	flags.BoolVar(&cfg.registerNS, "register-namespace", true, "register namespace if it does not exist")
@@ -283,13 +294,19 @@ func runLoad(ctx context.Context, c client.Client, cfg runConfig) runResult {
 	return runLoadWithRunner(ctx, c, cfg, runOneWorkflow)
 }
 
-type workflowRunner func(context.Context, client.Client, runConfig, []byte, int64, int) bool
+type workflowRunner func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult
+
+type workflowRunResult struct {
+	completed bool
+	requests  int64
+}
 
 func runLoadWithRunner(ctx context.Context, c client.Client, cfg runConfig, runner workflowRunner) runResult {
 	payload := makePayload(cfg.payloadBytes)
 	start := time.Now()
 	var completed atomic.Int64
 	var failed atomic.Int64
+	var requests atomic.Int64
 	sem := make(chan struct{}, cfg.concurrency)
 	var wg sync.WaitGroup
 
@@ -305,7 +322,9 @@ launch:
 		workflowIndex := i
 		wg.Go(func() {
 			defer func() { <-sem }()
-			if runner(ctx, c, cfg, payload, start.UnixNano(), workflowIndex) {
+			runResult := runner(ctx, c, cfg, payload, start.UnixNano(), workflowIndex)
+			requests.Add(runResult.requests)
+			if runResult.completed {
 				completed.Add(1)
 			} else {
 				failed.Add(1)
@@ -326,10 +345,13 @@ launch:
 		Concurrency:           cfg.concurrency,
 		ActivitiesEach:        cfg.activitiesEach,
 		SignalsEach:           cfg.signalsEach,
+		EagerStart:            cfg.eagerStart,
+		EagerActivities:       cfg.eagerActivities,
 		PayloadBytes:          cfg.payloadBytes,
 		Elapsed:               elapsed,
 		Completed:             completed.Load(),
 		Failed:                failed.Load(),
+		Requests:              requests.Load(),
 		CPUProfile:            cfg.cpuProfile,
 		HeapProfile:           cfg.heapProfile,
 		ServerCPUProfile:      cfg.serverCPU,
@@ -342,6 +364,7 @@ launch:
 	}
 	if elapsed > 0 {
 		result.WorkflowsPerSec = float64(result.Completed) / elapsed.Seconds()
+		result.RequestsPerSec = float64(result.Requests) / elapsed.Seconds()
 	}
 	return result
 }
@@ -353,33 +376,38 @@ func runOneWorkflow(
 	payload []byte,
 	startNanos int64,
 	workflowIndex int,
-) bool {
+) workflowRunResult {
 	workflowID := fmt.Sprintf("scylla-load-%d-%d", startNanos, workflowIndex)
+	result := workflowRunResult{requests: 1}
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:        workflowID,
-		TaskQueue: cfg.taskQueue,
+		ID:               workflowID,
+		TaskQueue:        cfg.taskQueue,
+		EnableEagerStart: cfg.eagerStart,
 	}, loadWorkflow, workflowInput{
 		Activities: cfg.activitiesEach,
 		Signals:    cfg.signalsEach,
+		Eager:      cfg.eagerActivities,
 		Payload:    payload,
 	})
 	if err != nil {
 		log.Printf("start workflow %s: %v", workflowID, err)
-		return false
+		return result
 	}
 
 	for signalIndex := 0; signalIndex < cfg.signalsEach; signalIndex++ {
+		result.requests++
 		if err := c.SignalWorkflow(ctx, workflowID, run.GetRunID(), signalName, payload); err != nil {
 			log.Printf("signal workflow %s: %v", workflowID, err)
-			return false
+			return result
 		}
 	}
 
 	if err := run.Get(ctx, nil); err != nil {
 		log.Printf("workflow %s failed: %v", workflowID, err)
-		return false
+		return result
 	}
-	return true
+	result.completed = true
+	return result
 }
 
 func makePayload(size int) []byte {
@@ -418,21 +446,23 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 		return nil
 	}
 	metadata := runMetadata{
-		StartedAt:      time.Now().UTC(),
-		Address:        cfg.address,
-		Namespace:      cfg.namespace,
-		TaskQueue:      cfg.taskQueue,
-		Workflows:      cfg.workflows,
-		Concurrency:    cfg.concurrency,
-		ActivitiesEach: cfg.activitiesEach,
-		SignalsEach:    cfg.signalsEach,
-		PayloadBytes:   cfg.payloadBytes,
-		GoVersion:      runtime.Version(),
-		GOOS:           runtime.GOOS,
-		GOARCH:         runtime.GOARCH,
-		NumCPU:         runtime.NumCPU(),
-		GOMAXPROCS:     runtime.GOMAXPROCS(0),
-		Environment:    selectedEnvironment(),
+		StartedAt:       time.Now().UTC(),
+		Address:         cfg.address,
+		Namespace:       cfg.namespace,
+		TaskQueue:       cfg.taskQueue,
+		Workflows:       cfg.workflows,
+		Concurrency:     cfg.concurrency,
+		ActivitiesEach:  cfg.activitiesEach,
+		SignalsEach:     cfg.signalsEach,
+		EagerStart:      cfg.eagerStart,
+		EagerActivities: cfg.eagerActivities,
+		PayloadBytes:    cfg.payloadBytes,
+		GoVersion:       runtime.Version(),
+		GOOS:            runtime.GOOS,
+		GOARCH:          runtime.GOARCH,
+		NumCPU:          runtime.NumCPU(),
+		GOMAXPROCS:      runtime.GOMAXPROCS(0),
+		Environment:     selectedEnvironment(),
 	}
 	if cfg.serverPProf != "" {
 		pprofURL, err := serverPProfURL(cfg.serverPProf, "/debug/pprof/", nil)
@@ -721,7 +751,8 @@ func ensureNamespace(ctx context.Context, c client.Client, namespace string) err
 
 func loadWorkflow(ctx workflow.Context, input workflowInput) error {
 	activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: time.Minute,
+		StartToCloseTimeout:   time.Minute,
+		DisableEagerExecution: !input.Eager,
 	})
 	for i := 0; i < input.Activities; i++ {
 		var size int

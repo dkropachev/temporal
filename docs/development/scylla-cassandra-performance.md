@@ -147,6 +147,8 @@ go run ./cmd/tools/scyllaload \
   -concurrency 200 \
   -activities-each 1 \
   -signals-each 0 \
+  -eager-start \
+  -eager-activities \
   -payload-bytes 256 \
   -cpu-profile /tmp/scyllaload.cpu.pprof \
   -heap-profile /tmp/scyllaload.heap.pprof \
@@ -170,12 +172,15 @@ go run ./cmd/tools/scyllaload \
 ```
 
 Use `-signals-each` to stress mutable-state update paths after workflow start, and increase `-activities-each` to
-stress matching task writes and reads. Run the same command before and after persistence changes while collecting
-Temporal persistence metrics and Scylla per-shard/LWT metrics. The emitted result JSON includes the load result and any
-load-generator/server profile paths, pprof top summary paths, pre-run and post-run metrics snapshot paths, the result
-JSON path, and the run-metadata JSON path. The metadata file records runtime/process settings, selected Cassandra/Scylla
-environment variables, and pprof/metrics endpoint reachability so before/after samples can be tied back to their CPU,
-heap, Prometheus, and cluster-configuration evidence.
+stress matching task writes and reads. Use `-eager-start` and `-eager-activities` to measure the colocated worker fast
+paths; activity eager execution also requires `system.enableActivityEagerExecution` in dynamic config. Run the same
+command before and after persistence changes while collecting Temporal persistence metrics and Scylla per-shard/LWT
+metrics. The emitted result JSON reports completed
+`workflowsPerSec` and frontend `requestsPerSec` for start/signal calls, plus the load-generator/server profile paths,
+pprof top summary paths, pre-run and post-run metrics snapshot paths, the result JSON path, and the run-metadata JSON
+path. The metadata file records runtime/process settings, selected Cassandra/Scylla environment variables, and
+pprof/metrics endpoint reachability so before/after samples can be tied back to their CPU, heap, Prometheus, and
+cluster-configuration evidence.
 
 Load-generator profiles can be inspected with:
 
@@ -350,6 +355,24 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   Scylla cluster, legacy create changed from `2,347,673` to `2,361,531 ns/op` (`+0.6%`) while fair create changed from
   `2,349,971` to `2,308,822 ns/op` (`-1.8%`). The mixed/noisy result is not enough to justify changing the conditional
   range-fenced write path.
+- Switching the new-branch history tree+first-node write from a logged batch to an unlogged batch was tested and
+  rejected. The isolated `BenchmarkCassandraHistoryNodeAppendRead/append` improved slightly from roughly `1.09 ms/op`
+  to `1.07 ms/op`, but full server throughput on the same 3 node x 4 shard cluster regressed: activity workflow
+  throughput changed from `187.54` to `180.38 workflows/sec`, and signal workflow throughput changed from `291.81` to
+  `284.80 workflows/sec`. The small microbenchmark gain does not offset the workflow-level regression or the weaker
+  cross-table branch creation failure behavior.
+- Increasing Cassandra `maxConns` from `12` to `24` was tested and rejected on the same server workload. Activity
+  throughput dropped to `173.08 workflows/sec`, and signal throughput dropped to `239.11 workflows/sec`, compared with
+  `187.54` and `291.81 workflows/sec` at `maxConns: 12`. Matching connections to the 12 Scylla shards remains the
+  better default for this target.
+- Eager workflow start and activity dispatch were tested and accepted as load-generator controls for measuring
+  colocated worker fast paths. On the same optimized server with `maxConns: 12`, the no-eager controls were
+  `189.46 workflows/sec` for the one-activity workload and `290.73 workflows/sec` / `581.46 requests/sec` for the
+  one-signal workload. `-eager-start` alone raised the one-activity workload to `285.29 workflows/sec`;
+  `-eager-activities` alone raised it to `219.81 workflows/sec`; both flags together reached
+  `304.25 workflows/sec`. The one-signal workload, which has no activities, reached `1255.46 workflows/sec` /
+  `2510.91 requests/sec` with eager start enabled. This does not change the schema patch, but it gives cluster
+  throughput tests an explicit way to separate persistence/data-model bottlenecks from matching round trips.
 - Cluster membership queries no longer append `ALLOW FILTERING` for partition-local scans or full primary-key equality
   reads. The store still keeps `ALLOW FILTERING` for host-ID-without-role, RPC address, session-start, and heartbeat
   filters that cannot be served by the table's primary key alone.
