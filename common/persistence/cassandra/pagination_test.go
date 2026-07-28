@@ -25,6 +25,7 @@ import (
 var (
 	benchmarkQueueSink          *Queue
 	benchmarkExecutionStateSink []*p.InternalWorkflowMutableState
+	benchmarkTaskResponseSink   *p.InternalGetTasksResponse
 	benchmarkBoolSink           bool
 )
 
@@ -75,6 +76,21 @@ func TestListNexusEndpointsUsesSameQueryForPageToken(t *testing.T) {
 	require.Len(t, session.queries, 2)
 	require.Equal(t, templateListEndpointsFirstPageQuery, session.queries[0].stmt)
 	require.Equal(t, token, session.queries[0].query.pageState)
+}
+
+func TestNullableInt64UnmarshalCQL(t *testing.T) {
+	info := gocql.NewNativeType(4, gocql.TypeBigInt)
+	var value nullableInt64
+
+	require.NoError(t, value.UnmarshalCQL(info, nil))
+	require.False(t, value.valid)
+	require.Zero(t, value.value)
+
+	require.NoError(t, value.UnmarshalCQL(info, []byte{0, 0, 0, 0, 0, 0, 0, 42}))
+	require.True(t, value.valid)
+	require.Equal(t, int64(42), value.value)
+
+	require.Error(t, value.UnmarshalCQL(info, []byte{1}))
 }
 
 func TestListNexusEndpointsFirstPageChecksTableVersion(t *testing.T) {
@@ -774,11 +790,9 @@ func TestListConcreteExecutionsClosesIteratorOnRowError(t *testing.T) {
 	require.Equal(t, 1, iter.closeCalls)
 }
 
-func TestGetTasksV1ClosesIteratorOnRowError(t *testing.T) {
+func TestGetTasksV1ClosesIteratorOnScanError(t *testing.T) {
 	iter := &recordingIter{
-		mapRows: []map[string]any{
-			{"task_id": int64(1)},
-		},
+		closeErr: errors.New("scan failed"),
 	}
 	session := &recordingSession{
 		t: t,
@@ -806,11 +820,48 @@ func TestGetTasksV1ClosesIteratorOnRowError(t *testing.T) {
 	require.Equal(t, 1, iter.closeCalls)
 }
 
-func TestGetTasksV2ClosesIteratorOnRowError(t *testing.T) {
+func TestGetTasksV1TypedScanSkipsStaticRow(t *testing.T) {
+	pageToken := []byte("next-page")
 	iter := &recordingIter{
-		mapRows: []map[string]any{
-			{"task_id": int64(1)},
+		scanRows: [][]any{
+			{nil, nil, nil},
+			{int64(1), []byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()},
 		},
+		pageState:               pageToken,
+		pageStateAfterExhausted: true,
+	}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateGetTasksQuery, stmt)
+			require.Equal(t, []any{"namespace-id", "task-queue", enumspb.TASK_QUEUE_TYPE_WORKFLOW, rowTypeTask, int64(1), int64(10)}, args)
+			return &recordingQuery{
+				iter: iter,
+			}
+		},
+	}
+	store := &matchingTaskStoreV1{Session: session}
+
+	response, err := store.GetTasks(t.Context(), &p.GetTasksRequest{
+		NamespaceID:        "namespace-id",
+		TaskQueue:          "task-queue",
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		InclusiveMinTaskID: 1,
+		ExclusiveMaxTaskID: 10,
+		PageSize:           10,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, response.Tasks, 1)
+	require.Equal(t, []byte("task"), response.Tasks[0].Data)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3, response.Tasks[0].EncodingType)
+	require.Equal(t, pageToken, response.NextPageToken)
+	require.Equal(t, 1, iter.closeCalls)
+}
+
+func TestGetTasksV2ClosesIteratorOnScanError(t *testing.T) {
+	iter := &recordingIter{
+		closeErr: errors.New("scan failed"),
 	}
 	session := &recordingSession{
 		t: t,
@@ -849,6 +900,97 @@ func TestGetTasksV2ClosesIteratorOnRowError(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, response)
 	require.Equal(t, 1, iter.closeCalls)
+}
+
+func TestGetTasksV2TypedScanSkipsStaticRow(t *testing.T) {
+	pageToken := []byte("next-page")
+	iter := &recordingIter{
+		scanRows: [][]any{
+			{nil, nil, nil},
+			{int64(1), []byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()},
+		},
+		pageState:               pageToken,
+		pageStateAfterExhausted: true,
+	}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateGetTasksQuery_v2_limit, stmt)
+			require.Equal(t, []any{
+				"namespace-id",
+				"task-queue",
+				enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+				rowTypeTask,
+				int64(1),
+				int64(1),
+				rowTypeTask,
+				int64(math.MaxInt64),
+				int64(math.MaxInt64),
+				10,
+			}, args)
+			return &recordingQuery{
+				iter: iter,
+			}
+		},
+	}
+	store := &matchingTaskStoreV2{Session: session}
+
+	response, err := store.GetTasks(t.Context(), &p.GetTasksRequest{
+		NamespaceID:        "namespace-id",
+		TaskQueue:          "task-queue",
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		InclusiveMinPass:   1,
+		InclusiveMinTaskID: 1,
+		ExclusiveMaxTaskID: math.MaxInt64,
+		PageSize:           10,
+		UseLimit:           true,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, response.Tasks, 1)
+	require.Equal(t, []byte("task"), response.Tasks[0].Data)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3, response.Tasks[0].EncodingType)
+	require.Equal(t, pageToken, response.NextPageToken)
+	require.Equal(t, 1, iter.closeCalls)
+}
+
+func BenchmarkGetTasksV1ReadPage(b *testing.B) {
+	rows := make([][]any, 100)
+	for i := range rows {
+		rows[i] = []any{
+			int64(i + 1),
+			[]byte("task"),
+			enumspb.ENCODING_TYPE_PROTO3.String(),
+		}
+	}
+	session := &recordingSession{
+		t: b,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{
+				iter: &recordingIter{
+					scanRows: rows,
+				},
+			}
+		},
+	}
+	store := &matchingTaskStoreV1{Session: session}
+	request := &p.GetTasksRequest{
+		NamespaceID:        "namespace-id",
+		TaskQueue:          "task-queue",
+		TaskType:           enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		InclusiveMinTaskID: 1,
+		ExclusiveMaxTaskID: 101,
+		PageSize:           100,
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		response, err := store.GetTasks(b.Context(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkTaskResponseSink = response
+	}
 }
 
 func TestReadHistoryBranchReverseUsesBranchPartition(t *testing.T) {
@@ -2399,7 +2541,7 @@ type recordedQuery struct {
 }
 
 type recordingSession struct {
-	t       *testing.T
+	t       testing.TB
 	queryFn func(stmt string, args ...any) cgocql.Query
 	queries []recordedQuery
 }
@@ -2562,11 +2704,28 @@ func (i *recordingIter) Scan(dest ...any) bool {
 	for idx := range dest {
 		switch d := dest[idx].(type) {
 		case *string:
-			*d = row[idx].(string)
+			if row[idx] == nil {
+				*d = ""
+			} else {
+				*d = row[idx].(string)
+			}
 		case *[]byte:
-			*d = row[idx].([]byte)
+			if row[idx] == nil {
+				*d = nil
+			} else {
+				*d = row[idx].([]byte)
+			}
 		case *int64:
 			*d = row[idx].(int64)
+		case *nullableInt64:
+			if row[idx] == nil {
+				*d = nullableInt64{}
+			} else {
+				*d = nullableInt64{
+					value: row[idx].(int64),
+					valid: true,
+				}
+			}
 		default:
 			panic("unsupported scan destination")
 		}

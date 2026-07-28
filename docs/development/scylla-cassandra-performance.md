@@ -122,6 +122,7 @@ Include the matching task benchmark when validating server task-queue persistenc
 
 ```bash
 go test -tags test_dep ./common/persistence/tests -run '^$' -bench 'BenchmarkCassandraMatchingTaskQueue$' -benchtime=50x -count=3
+go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkGetTasksV1ReadPage$' -benchmem -benchtime=10000x -count=3
 ```
 
 Include the task-queue user data build-ID count benchmark when validating worker-versioning metadata paths:
@@ -414,6 +415,8 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   `292.64 workflows/sec` / `585.29 requests/sec`. The lower partition count reduces matching fanout overhead but
   under-spreads that activity workload's task writes. The later many-task-queue runs above showed the broader default
   should still be conservative, with higher partition counts reserved for specifically measured hot queues.
+- Reusing one map across matching-task `MapScan` calls was rejected because gocql requires a new map for every row.
+  Typed `Scan` removes the per-row map instead while preserving null detection for Cassandra static-only rows.
 - Eager workflow start and activity dispatch were tested and accepted as load-generator controls for measuring
   colocated worker fast paths. On the same optimized server with `maxConns: 12`, the no-eager controls were
   `189.46 workflows/sec` for the one-activity workload and `290.73 workflows/sec` / `581.46 requests/sec` for the
@@ -445,6 +448,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   CQL. This is a correctness cleanup in the same hot table path, not a benchmarked latency change.
 - Cassandra matching and history task reads now preallocate response task slices from the request page or batch size,
   matching the SQL store pattern and reducing allocation growth in hot paged task scans.
+- Cassandra matching task reads now use typed iterator scans instead of allocating a new `MapScan` result map for
+  every task. A focused 100-task V1 read-page benchmark improved from `15.752-16.915 us/op`, `43176-43178 B/op`, and
+  308 allocations to `6.016-6.073 us/op`, `14432-14433 B/op`, and 211 allocations. V1 and V2 retain nullable task-ID
+  handling so static-only rows are skipped without treating task ID zero as a sentinel.
 - Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without

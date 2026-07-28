@@ -149,39 +149,17 @@ func (d *matchingTaskStoreV1) GetTasks(
 		}
 		return nil
 	}
-	task := make(map[string]any)
-	for iter.MapScan(task) {
-		_, ok := task["task_id"]
-		if !ok { // no tasks, but static column record returned
-			continue
+	var taskID nullableInt64
+	var taskVal []byte
+	var encodingVal string
+	for iter.Scan(&taskID, &taskVal, &encodingVal) {
+		if taskID.valid {
+			response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
 		}
 
-		rawTask, ok := task["task"]
-		if !ok {
-			_ = closeIterator()
-			return nil, newFieldNotFoundError("task", task)
-		}
-		taskVal, ok := rawTask.([]byte)
-		if !ok {
-			var byteSliceType []byte
-			_ = closeIterator()
-			return nil, newPersistedTypeMismatchError("task", byteSliceType, rawTask, task)
-		}
-
-		rawEncoding, ok := task["task_encoding"]
-		if !ok {
-			_ = closeIterator()
-			return nil, newFieldNotFoundError("task_encoding", task)
-		}
-		encodingVal, ok := rawEncoding.(string)
-		if !ok {
-			var byteSliceType []byte
-			_ = closeIterator()
-			return nil, newPersistedTypeMismatchError("task_encoding", byteSliceType, rawEncoding, task)
-		}
-		response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
-
-		task = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
+		taskID = nullableInt64{}
+		taskVal = nil
+		encodingVal = ""
 	}
 	if len(iter.PageState()) > 0 {
 		response.NextPageToken = iter.PageState()

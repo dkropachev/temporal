@@ -2,12 +2,19 @@ package cassandra
 
 import (
 	"fmt"
+
+	"github.com/gocql/gocql"
 )
 
 type (
 	// FieldNotFoundError is an error type returned when an untyped query return does not contain the expected fields.
 	FieldNotFoundError struct {
 		Msg string
+	}
+
+	nullableInt64 struct {
+		value int64
+		valid bool
 	}
 )
 
@@ -65,4 +72,13 @@ func nonNegativeCapacity(size int) int {
 		return 0
 	}
 	return size
+}
+
+func (n *nullableInt64) UnmarshalCQL(info gocql.TypeInfo, data []byte) error {
+	n.valid = data != nil
+	if !n.valid {
+		n.value = 0
+		return nil
+	}
+	return gocql.Unmarshal(info, data, &n.value)
 }
