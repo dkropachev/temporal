@@ -114,7 +114,7 @@ func (s *queueV2Store) EnqueueMessage(
 	unlock := s.lockQueue(queueType, queueName)
 	defer unlock()
 
-	if _, ok := s.getCachedQueue(queueType, queueName); !ok {
+	if !s.isKnownQueue(queueType, queueName) {
 		_, err := s.getQueue(ctx, queueType, queueName)
 		if err != nil {
 			return nil, err
@@ -178,6 +178,7 @@ func (s *queueV2Store) ReadMessages(
 		}
 		encoding, err := enumspb.EncodingTypeFromString(messageEncoding)
 		if err != nil {
+			_ = iter.Close()
 			return nil, serialization.NewUnknownEncodingTypeError(messageEncoding)
 		}
 
@@ -412,6 +413,14 @@ func (s *queueV2Store) getCachedQueue(queueType persistence.QueueV2Type, queueNa
 		return nil, false
 	}
 	return cloneQueue(q.(*Queue)), true
+}
+
+func (s *queueV2Store) isKnownQueue(queueType persistence.QueueV2Type, queueName string) bool {
+	_, ok := s.knownQueues.Load(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	})
+	return ok
 }
 
 func (s *queueV2Store) markKnownQueue(queueType persistence.QueueV2Type, queueName string, queue *Queue) {

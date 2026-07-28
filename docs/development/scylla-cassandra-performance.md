@@ -51,10 +51,9 @@ Install the Temporal Cassandra schema with NetworkTopologyStrategy RF=3:
 - `history_node` now uses `(tree_id, branch_id)` as the partition key.
 - This reduces the large-partition pattern where all branches for a tree share one Cassandra/Scylla partition.
 - Existing history reads and writes already qualify both `tree_id` and `branch_id`, so the query shape remains targeted.
-- `queues` now uses `(queue_type, queue_bucket)` as the partition key and `queue_name` as the clustering key, with 12
-  metadata buckets for the 3-node x 4-shard target.
-- This removes `ALLOW FILTERING` from QueueV2 list-by-type metadata scans without putting every queue of one type in one
-  metadata partition. Point reads and CAS updates qualify `queue_type`, deterministic `queue_bucket`, and `queue_name`.
+- `queues` keeps its upgrade-compatible `(queue_type, queue_name)` key shape in this PR. QueueV2 list-by-type scans
+  still use `ALLOW FILTERING`; changing that requires a separate migration and was left out to keep the queue range
+  allocation change rolling-upgrade safe.
 - Legacy `queue` message IDs are now allocated through `queue_message_id_range`, which fences cross-process writers at
   range granularity and lets individual message inserts use regular writes.
 - `queue_message_id_ranges` is keyed by `(queue_type, queue_name)`, not by `queue_type` alone, so QueueV2 range
@@ -277,9 +276,9 @@ Interpretation:
   `queue_type`-wide LWT partition.
 - QueueV2 metadata CAS conflicts invalidate the local queue metadata cache so a retry fetches the latest version instead
   of repeatedly using stale metadata.
-- QueueV2 list latency improved 1.8% in the 100-queue microbenchmark before the final metadata bucketing pass. The final
-  schema keeps the no-`ALLOW FILTERING` query shape and also spreads queue metadata across 12 fixed buckets, avoiding
-  both cluster-wide filtering and a single large metadata partition as queue counts grow.
+- QueueV2 list latency improved 1.8% in the 100-queue microbenchmark after the metadata cache and iterator cleanup.
+  The list path still uses the upgrade-compatible `queues` primary key and `ALLOW FILTERING`; replacing that with
+  bucketed queue metadata should be handled as a separate schema migration.
 - The legacy queue store now reserves message-ID ranges with CAS and uses regular inserts for the namespace replication
   queue and its DLQ path. This removes the steady-state `SELECT message_id ... ORDER BY message_id DESC LIMIT 1` read
   and per-message `IF NOT EXISTS` from same-process appends. It reduced legacy queue enqueue latency by 52.0% in the
@@ -379,10 +378,12 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   `240.02 workflows/sec` / `480.03 requests/sec`, compared with same-server 12-partition controls of
   `189.46 workflows/sec` for activity and `290.73 workflows/sec` / `581.46 requests/sec` for signal. More partitions
   add matching management and polling overhead without adding useful Scylla parallelism on a 12-shard target.
-- Reducing normal matching task queue read/write partitions from `12` to `6` was also tested and rejected. Activity
+- Reducing matching task queue read/write partitions from `12` to `6` was tested against the earlier single-hot-queue
+  target and rejected for that target. Activity
   throughput dropped to `160.39 workflows/sec`, while signal throughput was effectively flat at
   `292.64 workflows/sec` / `585.29 requests/sec`. The lower partition count reduces matching fanout overhead but
-  under-spreads the activity workload's task writes; `12` remains the better default for the 12-shard target.
+  under-spreads that activity workload's task writes. The later many-task-queue runs above showed the broader default
+  should still be conservative, with higher partition counts reserved for specifically measured hot queues.
 - Eager workflow start and activity dispatch were tested and accepted as load-generator controls for measuring
   colocated worker fast paths. On the same optimized server with `maxConns: 12`, the no-eager controls were
   `189.46 workflows/sec` for the one-activity workload and `290.73 workflows/sec` / `581.46 requests/sec` for the
@@ -424,18 +425,15 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   `-benchtime=100x -count=3` and `CASSANDRA_MAX_CONNS=12`. The optimized samples were `1,147,301`, `1,113,305`, and
   `1,108,269 ns/op`. Compared with the prior cached-LWT optimized average of `1,184,106 ns/op`, the allocator reduces
   enqueue latency by another 5.2%.
-- The final bucketed QueueV2 list schema was covered by unit tests for schema shape, no `ALLOW FILTERING`, invalid page
-  tokens, repeated empty Cassandra page tokens, and bucket-boundary page tokens. A follow-up 3-node Scylla list
-  benchmark attempt failed before measurement because local Scylla 2026.2.0 containers repeatedly banned joining nodes
-  during raft topology bootstrap, even with sequential node startup. The local live-profile attempt on 2026-07-27 used
-  three temporary `scylladb/scylla:latest` containers with `--smp 4`, `--memory 4G`, `--developer-mode 1`, and
-  per-node listen/broadcast names. The seed node accepted CQL after 3 seconds, but both joining nodes logged
-  `raft_topology - received notification of being banned from the cluster` before CQL was ready. The temporary
-  containers and network were removed after the failed bootstrap. A retry against the repo-pinned
-  `docker.io/scylladb/scylla:2026.1` image could not start because the local container runtime could not pull the image
-  from Docker Hub without registry credentials.
+- QueueV2 cached enqueue now checks queue existence without cloning cached queue metadata. The local lookup benchmark
+  showed the old clone path at `277.5-373.4 ns/op`, `308 B/op`, and `6 allocs/op`, while the existence-only path was
+  `14.41-15.40 ns/op` with zero allocations. This removes per-enqueue CPU/allocation overhead after the queue metadata
+  is known.
+- QueueV2 list pagination remains covered by unit tests for invalid page tokens and repeated empty Cassandra page
+  tokens. A bucketed QueueV2 metadata schema was investigated but not kept in this PR because it needs a separate
+  migration for existing `queues` rows.
 - QueueV2 `ListQueues` now closes the metadata-list iterator before returning row-level metadata/count errors, avoiding
-  driver-side scan resource leaks while walking bucketed queue metadata partitions.
+  driver-side scan resource leaks while walking queue metadata rows.
 - The legacy queue rows were measured separately with `-benchtime=100x -count=3`, `CASSANDRA_MAX_CONNS=12`, and
   `CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE=2`. Baseline was `HEAD` plus the benchmark harness and test-helper
   benchmark compatibility only. Baseline enqueue samples were `2,255,904`, `2,247,092`, and `2,265,705 ns/op`;

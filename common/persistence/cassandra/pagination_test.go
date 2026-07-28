@@ -22,6 +22,11 @@ import (
 	"go.temporal.io/server/common/util"
 )
 
+var (
+	benchmarkQueueSink *Queue
+	benchmarkBoolSink  bool
+)
+
 func TestListNexusEndpointsUsesSameQueryForPageToken(t *testing.T) {
 	endpointID := "11111111-1111-1111-1111-111111111111"
 	token := []byte("page-token")
@@ -1908,6 +1913,86 @@ func TestQueueV2ReadMessagesCachesKnownQueue(t *testing.T) {
 		TemplateCreateQueueQuery,
 		TemplateGetMessagesQuery,
 	}, recordedStatements(session.queries))
+}
+
+func TestQueueV2ReadMessagesClosesIteratorOnMessageEncodingError(t *testing.T) {
+	iter := &recordingIter{
+		scanRows: [][]any{
+			{int64(7), []byte("message"), "invalid-encoding"},
+		},
+	}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			switch stmt {
+			case TemplateGetQueueQuery:
+				queueBytes, err := (&persistencespb.Queue{
+					Partitions: map[int32]*persistencespb.QueuePartition{
+						0: {
+							MinMessageId: p.FirstQueueMessageID,
+						},
+					},
+				}).Marshal()
+				require.NoError(t, err)
+				return &recordingQuery{
+					scanFn: func(dest ...any) error {
+						*dest[0].(*[]byte) = queueBytes
+						*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+						*dest[2].(*int64) = 0
+						return nil
+					},
+				}
+			case TemplateGetMessagesQuery:
+				return &recordingQuery{
+					iter: iter,
+				}
+			default:
+				t.Fatalf("unexpected query: %s", stmt)
+			}
+			return nil
+		},
+	}
+	store := NewQueueV2Store(session, log.NewNoopLogger())
+
+	resp, err := store.ReadMessages(t.Context(), &p.InternalReadMessagesRequest{
+		QueueType: p.QueueTypeHistoryNormal,
+		QueueName: "test-queue",
+		PageSize:  100,
+	})
+
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.Equal(t, 1, iter.closeCalls)
+}
+
+func BenchmarkQueueV2CachedQueueLookup(b *testing.B) {
+	store := &queueV2Store{}
+	queueType := p.QueueTypeHistoryNormal
+	queueName := "test-queue"
+	store.markKnownQueue(queueType, queueName, &Queue{
+		Metadata: &persistencespb.Queue{
+			Partitions: map[int32]*persistencespb.QueuePartition{
+				0: {
+					MinMessageId: p.FirstQueueMessageID,
+				},
+			},
+		},
+		Version: 1,
+	})
+
+	b.Run("clone", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			q, _ := store.getCachedQueue(queueType, queueName)
+			benchmarkQueueSink = q
+		}
+	})
+	b.Run("exists", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchmarkBoolSink = store.isKnownQueue(queueType, queueName)
+		}
+	})
 }
 
 func TestQueueV2RangeDeleteUpdatesCachedQueue(t *testing.T) {
