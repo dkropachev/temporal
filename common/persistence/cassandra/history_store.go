@@ -170,7 +170,7 @@ func (h *HistoryStore) ReadHistoryBranch(
 
 	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
-	nodes := make([]p.InternalHistoryNode, 0, request.PageSize)
+	nodes := make([]p.InternalHistoryNode, 0, iter.NumRows())
 	var nodeID int64
 	var prevTxnID int64
 	var txnID int64

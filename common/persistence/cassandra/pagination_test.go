@@ -1401,7 +1401,7 @@ func TestReadHistoryBranchMetadataOnlyUsesTypedScan(t *testing.T) {
 	require.Equal(t, enumspb.ENCODING_TYPE_UNSPECIFIED, response.Nodes[0].Events.EncodingType)
 }
 
-func TestReadHistoryBranchReturnsPageTokenAfterScan(t *testing.T) {
+func TestReadHistoryBranchUsesReturnedRowCountAndPageTokenAfterScan(t *testing.T) {
 	const (
 		treeID   = "11111111-1111-1111-1111-111111111111"
 		branchID = "22222222-2222-2222-2222-222222222222"
@@ -1438,12 +1438,13 @@ func TestReadHistoryBranchReturnsPageTokenAfterScan(t *testing.T) {
 		BranchID:    branchID,
 		MinNodeID:   1,
 		MaxNodeID:   10,
-		PageSize:    1,
+		PageSize:    256,
 	})
 
 	require.NoError(t, err)
 	require.Equal(t, pageToken, response.NextPageToken)
 	require.Len(t, response.Nodes, 1)
+	require.Equal(t, 1, cap(response.Nodes))
 }
 
 func TestReadHistoryBranchClosesIteratorOnScanError(t *testing.T) {
@@ -1483,11 +1484,19 @@ func TestReadHistoryBranchClosesIteratorOnScanError(t *testing.T) {
 }
 
 func BenchmarkReadHistoryBranchPage(b *testing.B) {
+	benchmarkReadHistoryBranchPage(b, 100, 100)
+}
+
+func BenchmarkReadHistoryBranchSparsePage(b *testing.B) {
+	benchmarkReadHistoryBranchPage(b, 256, 1)
+}
+
+func benchmarkReadHistoryBranchPage(b *testing.B, pageSize int, rowCount int) {
 	const (
 		treeID   = "11111111-1111-1111-1111-111111111111"
 		branchID = "22222222-2222-2222-2222-222222222222"
 	)
-	rows := make([][]any, 100)
+	rows := make([][]any, rowCount)
 	for i := range rows {
 		rows[i] = []any{
 			int64(i + 1),
@@ -1515,7 +1524,7 @@ func BenchmarkReadHistoryBranchPage(b *testing.B) {
 		BranchID:    branchID,
 		MinNodeID:   1,
 		MaxNodeID:   101,
-		PageSize:    100,
+		PageSize:    pageSize,
 	}
 
 	b.ResetTimer()
@@ -3163,6 +3172,10 @@ func (i *recordingIter) MapScan(dest map[string]any) bool {
 	}
 	i.mapIdx++
 	return true
+}
+
+func (i *recordingIter) NumRows() int {
+	return len(i.scanRows)
 }
 
 func (i *recordingIter) PageState() []byte {

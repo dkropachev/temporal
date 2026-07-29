@@ -113,7 +113,7 @@ CASSANDRA_PORT=9042 \
 CASSANDRA_MAX_CONNS=12 \
 CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE=2 \
 go test -tags test_dep ./common/persistence/tests -run '^$' -bench 'BenchmarkCassandra(HistoryNodeAppendRead|QueueV2EnqueueRead)$' -benchtime=30s -count=3
-go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkReadHistoryBranchPage$' -benchmem -benchtime=10000x -count=3
+go test -tags test_dep ./common/persistence/cassandra -run '^$' -bench 'BenchmarkReadHistoryBranch(Page|SparsePage)$' -benchmem -benchtime=10000x -count=3
 ```
 
 Include the legacy namespace-replication queue benchmark when validating queue append changes:
@@ -539,6 +539,18 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   100-node page benchmark improved from `20.460-22.430 us/op`, `45896-45897 B/op`, and 311 allocations to
   `4.624-4.852 us/op`, `12456-12457 B/op`, and 116 allocations. Reverse-order reads retain the same fixed column shape,
   and metadata-only reads scan only the three selected ID columns.
+- Cassandra history branch reads now size their node slice from the number of rows in the returned gocql page instead
+  of the requested event page size. A one-row page with `PageSize=256` improved from `1,146-1,269 ns/op`,
+  `10,552-10,553 B/op`, and 17 allocations to `714.8-965.6 ns/op`, `1,112 B/op`, and 17 allocations. The full
+  100-row benchmark retains its `12,456-12,458 B/op` footprint and 116 allocations.
+
+  Equal 6,400-workflow live profiles reduced flat `HistoryStore.ReadHistoryBranch` allocation from `176.01 MiB` to
+  `8.00 MiB` (`-95.45%`) and total sampled server allocation from `7.66 GiB` to `6.61 GiB` (`-13.75%`). Longer
+  reverse-order controls used 16 task queues, 8 workers per queue, 25,600 workflows per cell, concurrency 320, one
+  activity per workflow, and a 256-byte payload. Baseline cells reached `941.05` and `926.86 workflows/sec`;
+  candidate cells reached `981.38` and `913.48`. Geometric throughput improved from `933.93` to
+  `946.82 workflows/sec` (`+1.38%`). All 102,400 workflows completed with zero load failures, all three Scylla nodes
+  remained up, and Scylla logged no run-time errors during the controls.
 - Cassandra workflow mutable-state reads now scan their 22 fixed columns into a typed row and pre-size decoded
   activity, timer, child, cancel, signal, and CHASM maps. The focused benchmark improved from
   `3.599-4.350 us/op`, `5120-5121 B/op`, and 42 allocations to `1.751-1.868 us/op`, `3688-3690 B/op`, and

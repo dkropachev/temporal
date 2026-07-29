@@ -78,6 +78,10 @@ func (f failingIter) MapScan(map[string]any) bool {
 	return false
 }
 
+func (f failingIter) NumRows() int {
+	return 0
+}
+
 func (f failingIter) PageState() []byte {
 	return nil
 }
