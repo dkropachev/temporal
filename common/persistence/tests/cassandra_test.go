@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/persistence"
@@ -25,6 +27,7 @@ import (
 	"go.temporal.io/server/common/persistence/persistencetest"
 	"go.temporal.io/server/common/persistence/serialization"
 	_ "go.temporal.io/server/common/persistence/sql/sqlplugin/mysql"
+	"go.temporal.io/server/common/util"
 )
 
 type (
@@ -48,20 +51,13 @@ type (
 	}
 	// failingIter is a [gocql.Iter] which fails when iterated.
 	failingIter struct{}
-	// blockingSession is a [gocql.Session] designed for testing concurrent inserts.
-	// See cassandra.ErrQueueMessageIDConflict for more.
+	// blockingSession is a [gocql.Session] designed for testing concurrent updates.
 	blockingSession struct {
 		gocql.Session
 		queryToBlockOn   string
+		queryShouldBlock func(string) bool
 		queryStarted     chan struct{}
 		queryCanContinue chan struct{}
-	}
-	// enqueueMessageResult contains the result of a call to persistence.QueueV2.EnqueueMessage.
-	enqueueMessageResult struct {
-		// id of the inserted message
-		id int
-		// err if the call failed
-		err error
 	}
 	testQueueParams struct {
 		logger log.Logger
@@ -84,6 +80,10 @@ func (f failingIter) Scan(...any) bool {
 
 func (f failingIter) MapScan(map[string]any) bool {
 	return false
+}
+
+func (f failingIter) NumRows() int {
+	return 0
 }
 
 func (f failingIter) PageState() []byte {
@@ -202,6 +202,512 @@ func TestCassandraHistoryStoreSuite(t *testing.T) {
 	suite.Run(t, s)
 }
 
+func TestCassandraHistoryStoreV2Suite(t *testing.T) {
+	t.Parallel()
+	testData, tearDown := setUpCassandraTestWithHistoryNodeV2Reads(t)
+	defer tearDown()
+
+	store, err := testData.Factory.NewExecutionStore()
+	if err != nil {
+		t.Fatalf("unable to create Cassandra DB: %v", err)
+	}
+
+	s := NewHistoryEventsSuite(t, store, testData.Logger)
+	suite.Run(t, s)
+}
+
+func TestCassandraHistoryNodeV2MigrationPreservesLegacyReads(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewCassandraConfig()
+	logger := log.NewNoopLogger()
+	SetUpCassandraDatabase(t, cfg, logger)
+	t.Cleanup(func() {
+		TearDownCassandraKeyspace(t, cfg)
+	})
+	ApplySchemaUpdate(t, cfg, "../../../schema/cassandra/temporal/versioned/v1.0/schema.cql", logger)
+	for _, schemaFile := range GetSchemaFiles(t, "../../../schema/cassandra/temporal", logger) {
+		if strings.Contains(schemaFile, "/v1.0/") {
+			continue
+		}
+		if strings.Contains(schemaFile, "/v1.15/") {
+			break
+		}
+		ApplySchemaUpdate(t, cfg, schemaFile, logger)
+	}
+
+	treeID := uuid.NewString()
+	branchID := uuid.NewString()
+	session := newCassandraTestSession(t, cfg, logger)
+	for nodeID := int64(1); nodeID <= 2; nodeID++ {
+		err := session.Query(
+			`INSERT INTO history_node (tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) `+
+				`VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?`,
+			treeID,
+			branchID,
+			nodeID,
+			nodeID-1,
+			nodeID,
+			[]byte("events"),
+			enumspb.ENCODING_TYPE_PROTO3.String(),
+			int64(1000),
+		).Exec()
+		require.NoError(t, err)
+	}
+	session.Close()
+
+	ApplySchemaUpdate(t, cfg, "../../../schema/cassandra/temporal/versioned/v1.15/history_node_v2.cql", logger)
+	session = newCassandraTestSession(t, cfg, logger)
+	defer session.Close()
+	err := session.Query(
+		`DELETE FROM history_node_v2 USING TIMESTAMP ? `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		int64(2000),
+		treeID,
+		branchID,
+		int64(2),
+		int64(2),
+	).Exec()
+	require.NoError(t, err)
+
+	var (
+		nodeID       int64
+		prevTxnID    int64
+		txnID        int64
+		data         []byte
+		dataEncoding string
+	)
+	err = session.Query(
+		`SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? `+
+			`ORDER BY branch_id DESC, node_id DESC`,
+		treeID,
+		branchID,
+		int64(1),
+		int64(2),
+	).Scan(&nodeID, &prevTxnID, &txnID, &data, &dataEncoding)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), nodeID)
+	require.Equal(t, []byte("events"), data)
+
+	copied, err := cassandra.BackfillHistoryNodeV2(
+		t.Context(),
+		session,
+		cassandra.HistoryNodeV2BackfillOptions{
+			PageSize:    10,
+			Concurrency: 2,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), copied)
+
+	err = session.Query(
+		`SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node_v2 `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? ORDER BY node_id DESC`,
+		treeID,
+		branchID,
+		int64(1),
+		int64(2),
+	).Scan(&nodeID, &prevTxnID, &txnID, &data, &dataEncoding)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), nodeID)
+	require.Equal(t, []byte("events"), data)
+
+	err = session.Query(
+		`SELECT node_id FROM history_node_v2 `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		treeID,
+		branchID,
+		int64(2),
+		int64(2),
+	).Scan(&nodeID)
+	require.True(t, gocql.IsNotFoundError(err), "backfill must not resurrect a row with a newer tombstone")
+}
+
+func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewCassandraConfig()
+	logger := log.NewNoopLogger()
+	SetUpCassandraDatabase(t, cfg, logger)
+	t.Cleanup(func() {
+		TearDownCassandraKeyspace(t, cfg)
+	})
+	SetUpCassandraSchema(t, cfg, logger)
+
+	session := newCassandraTestSession(t, cfg, logger)
+	require.NoError(t, session.Query(`DROP TABLE history_node_v2`).Exec())
+	require.NoError(t, session.Query(`DROP TABLE history_node`).Exec())
+	require.NoError(t, session.AwaitSchemaAgreement(t.Context()))
+	require.NoError(t, session.Query(
+		`CREATE TABLE history_node (`+
+			`tree_id uuid, branch_id uuid, node_id bigint, txn_id bigint, prev_txn_id bigint, `+
+			`data blob, data_encoding text, PRIMARY KEY ((tree_id, branch_id), node_id, txn_id)) `+
+			`WITH CLUSTERING ORDER BY (node_id ASC, txn_id DESC)`,
+	).Exec())
+	require.NoError(t, session.AwaitSchemaAgreement(t.Context()))
+
+	treeID := uuid.NewString()
+	branchID := uuid.NewString()
+	deletedBranchID := uuid.NewString()
+	for nodeID := int64(1); nodeID <= 2; nodeID++ {
+		insertHistoryNodeForMigrationTest(t, session, treeID, branchID, nodeID)
+	}
+	session.Close()
+
+	ApplySchemaUpdate(t, cfg, "../../../schema/cassandra/temporal/versioned/v1.15/history_node_v2.cql", logger)
+	session = newCassandraTestSession(t, cfg, logger)
+	defer session.Close()
+
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
+	))
+	rebuildV2Store := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
+	)
+	branchInfo := &persistencespb.HistoryBranch{TreeId: treeID, BranchId: branchID}
+	deletedBranchInfo := &persistencespb.HistoryBranch{TreeId: treeID, BranchId: deletedBranchID}
+	appendHistoryNodeForMigrationTest(t, rebuildV2Store, branchInfo, 3)
+	require.NoError(t, session.Query(
+		`DELETE FROM history_node `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		treeID,
+		branchID,
+		int64(3),
+		int64(3),
+	).Exec())
+	appendHistoryNodeForMigrationTest(t, rebuildV2Store, deletedBranchInfo, 10)
+
+	recreateV2Session := &blockingSession{
+		Session: session,
+		queryShouldBlock: func(query string) bool {
+			return strings.HasPrefix(query, "CREATE TABLE")
+		},
+		queryStarted:     make(chan struct{}, 1),
+		queryCanContinue: make(chan struct{}),
+	}
+	recreateV2Result := make(chan error, 1)
+	go func() {
+		recreateV2Result <- cassandra.RecreateHistoryNodeV2(
+			t.Context(),
+			recreateV2Session,
+			cfg.Keyspace,
+			true,
+		)
+	}()
+	select {
+	case <-recreateV2Session.queryStarted:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	appendHistoryNodeForMigrationTest(t, rebuildV2Store, branchInfo, 4)
+	require.NoError(t, rebuildV2Store.DeleteHistoryBranch(
+		t.Context(),
+		&persistence.InternalDeleteHistoryBranchRequest{
+			BranchInfo:   &persistencespb.HistoryBranch{TreeId: treeID, BranchId: uuid.NewString()},
+			BranchRanges: nil,
+		},
+	))
+	close(recreateV2Session.queryCanContinue)
+	require.NoError(t, <-recreateV2Result)
+	appendHistoryNodeForMigrationTest(t, rebuildV2Store, branchInfo, 5)
+
+	copied, err := cassandra.BackfillHistoryNodeV2(
+		t.Context(),
+		session,
+		cassandra.HistoryNodeBackfillOptions{PageSize: 2, Concurrency: 2},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(5), copied)
+	var staleNodeID int64
+	err = session.Query(
+		`SELECT node_id FROM history_node_v2 `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		treeID,
+		branchID,
+		int64(3),
+		int64(3),
+	).Scan(&staleNodeID)
+	require.True(t, gocql.IsNotFoundError(err), "rebuild must remove rows deleted by old source-only writers")
+
+	oldV2Store := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+	)
+	require.NoError(t, oldV2Store.DeleteHistoryNodes(t.Context(), &persistence.InternalDeleteHistoryNodesRequest{
+		BranchInfo:    branchInfo,
+		NodeID:        2,
+		TransactionID: 2,
+	}))
+	appendHistoryNodeForMigrationTest(t, oldV2Store, branchInfo, 6)
+
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+	))
+	cutoverStore := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+	)
+	appendHistoryNodeForMigrationTest(t, cutoverStore, branchInfo, 7)
+	require.Equal(t, []int64{7, 6, 5, 4, 1}, readHistoryNodeIDsForMigrationTest(
+		t,
+		oldV2Store,
+		treeID,
+		branchID,
+	))
+	appendHistoryNodeForMigrationTest(t, oldV2Store, branchInfo, 8)
+	require.Equal(t, []int64{8, 7, 6, 5, 4, 1}, readHistoryNodeIDsForMigrationTest(
+		t,
+		cutoverStore,
+		treeID,
+		branchID,
+	))
+
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+	))
+	rebuildV1Store := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+	)
+	recreateV1Session := &blockingSession{
+		Session: session,
+		queryShouldBlock: func(query string) bool {
+			return strings.HasPrefix(query, "CREATE TABLE")
+		},
+		queryStarted:     make(chan struct{}, 1),
+		queryCanContinue: make(chan struct{}),
+	}
+	recreateV1Result := make(chan error, 1)
+	go func() {
+		recreateV1Result <- cassandra.RecreateHistoryNodeV1(
+			t.Context(),
+			recreateV1Session,
+			cfg.Keyspace,
+			true,
+		)
+	}()
+	select {
+	case <-recreateV1Session.queryStarted:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	for nodeID := int64(20); nodeID < 30; nodeID++ {
+		appendHistoryNodeForMigrationTest(t, rebuildV1Store, branchInfo, nodeID)
+	}
+	require.NoError(t, rebuildV1Store.DeleteHistoryNodes(
+		t.Context(),
+		&persistence.InternalDeleteHistoryNodesRequest{
+			BranchInfo:    branchInfo,
+			NodeID:        8,
+			TransactionID: 8,
+		},
+	))
+	require.NoError(t, rebuildV1Store.DeleteHistoryBranch(
+		t.Context(),
+		&persistence.InternalDeleteHistoryBranchRequest{
+			BranchInfo: deletedBranchInfo,
+			BranchRanges: []persistence.InternalDeleteHistoryBranchRange{{
+				BranchId:    deletedBranchID,
+				BeginNodeId: 10,
+			}},
+		},
+	))
+	close(recreateV1Session.queryCanContinue)
+	require.NoError(t, <-recreateV1Result)
+	appendHistoryNodeForMigrationTest(t, rebuildV1Store, branchInfo, 9)
+	require.NoError(t, session.Query(
+		`INSERT INTO history_node_v2 (`+
+			`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) `+
+			`VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?`,
+		treeID,
+		branchID,
+		int64(99),
+		int64(98),
+		int64(99),
+		[]byte("events"),
+		enumspb.ENCODING_TYPE_PROTO3.String(),
+		int64(1000),
+	).Exec())
+	require.NoError(t, session.Query(
+		`DELETE FROM history_node USING TIMESTAMP ? `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		int64(2000),
+		treeID,
+		branchID,
+		int64(99),
+		int64(99),
+	).Exec())
+
+	copied, err = cassandra.BackfillHistoryNodeV1(
+		t.Context(),
+		session,
+		cassandra.HistoryNodeBackfillOptions{PageSize: 2, Concurrency: 2},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(17), copied)
+	var tombstonedNodeID int64
+	err = session.Query(
+		`SELECT node_id FROM history_node `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		treeID,
+		branchID,
+		int64(99),
+		int64(99),
+	).Scan(&tombstonedNodeID)
+	require.True(t, gocql.IsNotFoundError(err), "reverse backfill must not resurrect a row with a newer V1 tombstone")
+	err = session.Query(
+		`SELECT node_id FROM history_node `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ?`,
+		treeID,
+		branchID,
+		int64(8),
+		int64(8),
+	).Scan(&staleNodeID)
+	require.True(t, gocql.IsNotFoundError(err), "V1 rebuild must not restore a row deleted while V1 was absent")
+
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	))
+	canonicalStore := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+	appendHistoryNodeForMigrationTest(t, canonicalStore, branchInfo, 10)
+
+	require.NoError(t, canonicalStore.DeleteHistoryBranch(
+		t.Context(),
+		&persistence.InternalDeleteHistoryBranchRequest{
+			BranchInfo: branchInfo,
+			BranchRanges: []persistence.InternalDeleteHistoryBranchRange{{
+				BranchId:    branchID,
+				BeginNodeId: 5,
+			}},
+		},
+	))
+	require.Equal(t, []int64{4, 1}, readHistoryNodeIDsForMigrationTest(
+		t,
+		canonicalStore,
+		treeID,
+		branchID,
+	))
+
+	rollbackStore := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+	)
+	require.Equal(t, []int64{4, 1}, readHistoryNodeIDsForMigrationTest(
+		t,
+		rollbackStore,
+		treeID,
+		branchID,
+	))
+	require.Empty(t, readHistoryNodeIDsForMigrationTest(
+		t,
+		rollbackStore,
+		treeID,
+		deletedBranchID,
+	))
+}
+
+func insertHistoryNodeForMigrationTest(
+	t *testing.T,
+	session gocql.Session,
+	treeID string,
+	branchID string,
+	nodeID int64,
+) {
+	t.Helper()
+	err := session.Query(
+		`INSERT INTO history_node (`+
+			`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) `+
+			`VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		treeID,
+		branchID,
+		nodeID,
+		nodeID-1,
+		nodeID,
+		[]byte("events"),
+		enumspb.ENCODING_TYPE_PROTO3.String(),
+	).Exec()
+	require.NoError(t, err)
+}
+
+func appendHistoryNodeForMigrationTest(
+	t *testing.T,
+	store *cassandra.HistoryStore,
+	branchInfo *persistencespb.HistoryBranch,
+	nodeID int64,
+) {
+	t.Helper()
+	require.NoError(t, store.AppendHistoryNodes(t.Context(), &persistence.InternalAppendHistoryNodesRequest{
+		BranchInfo: branchInfo,
+		Node: persistence.InternalHistoryNode{
+			NodeID:            nodeID,
+			PrevTransactionID: nodeID - 1,
+			TransactionID:     nodeID,
+			Events: &commonpb.DataBlob{
+				EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+				Data:         []byte("events"),
+			},
+		},
+	}))
+}
+
+func readHistoryNodeIDsForMigrationTest(
+	t *testing.T,
+	store *cassandra.HistoryStore,
+	treeID string,
+	branchID string,
+) []int64 {
+	t.Helper()
+	branchToken, err := store.NewHistoryBranch(
+		"",
+		"",
+		"",
+		treeID,
+		util.Ptr(branchID),
+		nil,
+		0,
+		0,
+		0,
+	)
+	require.NoError(t, err)
+	response, err := store.ReadHistoryBranch(t.Context(), &persistence.InternalReadHistoryBranchRequest{
+		BranchToken:  branchToken,
+		BranchID:     branchID,
+		MinNodeID:    1,
+		MaxNodeID:    100,
+		PageSize:     100,
+		ReverseOrder: true,
+	})
+	require.NoError(t, err)
+	nodeIDs := make([]int64, len(response.Nodes))
+	for i, node := range response.Nodes {
+		nodeIDs[i] = node.NodeID
+	}
+	return nodeIDs
+}
+
 func TestCassandraTaskQueueSuite(t *testing.T) {
 	t.Parallel()
 	testData, tearDown := setUpCassandraTest(t)
@@ -304,6 +810,67 @@ func TestCassandraQueuePersistence(t *testing.T) {
 	suite.Run(t, s)
 }
 
+func TestCassandraQueueConcurrentEnqueueKeepsReadableOrder(t *testing.T) {
+	t.Parallel()
+
+	cluster := persistencetests.NewTestClusterForCassandra(&persistencetests.TestBaseOptions{}, log.NewNoopLogger())
+	cluster.SetupTestDatabase()
+	t.Cleanup(cluster.TearDownTestDatabase)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sessions := make([]*blockingSession, 2)
+	queues := make([]persistence.Queue, 2)
+	queueType := persistence.QueueType(1000)
+	for i := range sessions {
+		sessions[i] = &blockingSession{
+			Session: cluster.GetSession(),
+			queryShouldBlock: func(query string) bool {
+				return strings.HasPrefix(query, "INSERT INTO queue ")
+			},
+			queryStarted:     make(chan struct{}, 1),
+			queryCanContinue: make(chan struct{}),
+		}
+		var err error
+		queues[i], err = cassandra.NewQueueStore(queueType, sessions[i], log.NewNoopLogger())
+		require.NoError(t, err)
+	}
+
+	results := []chan error{make(chan error, 1), make(chan error, 1)}
+	for i := range queues {
+		go func() {
+			results[i] <- queues[i].EnqueueMessage(ctx, &commonpb.DataBlob{
+				EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+				Data:         []byte{byte(i)},
+			})
+		}()
+	}
+	for i := range sessions {
+		select {
+		case <-sessions[i].queryStarted:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+
+	close(sessions[0].queryCanContinue)
+	require.NoError(t, <-results[0])
+	close(sessions[1].queryCanContinue)
+	require.ErrorIs(t, <-results[1], cassandra.ErrEnqueueMessageConflict)
+
+	require.NoError(t, queues[1].EnqueueMessage(ctx, &commonpb.DataBlob{
+		EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+		Data:         []byte("retry"),
+	}))
+
+	messages, err := queues[0].ReadMessages(ctx, persistence.EmptyQueueMessageID, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Equal(t, int64(0), messages[0].ID)
+	require.Equal(t, int64(1), messages[1].ID)
+}
+
 func TestCassandraQueueV2Persistence(t *testing.T) {
 	// This test function is split up into two parts:
 	// 1. Test the generic queue functionality, which is independent of the database choice (Cassandra here).
@@ -383,16 +950,116 @@ func testCassandraQueueV2(t *testing.T, cluster *cassandra.TestCluster) {
 	t.Run("ConcurrentConflicts", func(t *testing.T) {
 		testCassandraQueueV2ConcurrentConflicts(t, cluster)
 	})
+	t.Run("ConcurrentEnqueueKeepsContiguousIDs", func(t *testing.T) {
+		testCassandraQueueV2ConcurrentEnqueueKeepsContiguousIDs(t, cluster)
+	})
 	t.Run("MultiplePartitions", func(t *testing.T) {
 		testCassandraQueueV2MultiplePartitions(t, cluster)
 	})
 }
 
-func testCassandraQueueV2ConcurrentConflicts(t *testing.T, cluster *cassandra.TestCluster) {
-	t.Run("EnqueueMessage", func(t *testing.T) {
-		t.Parallel()
-		testCassandraQueueV2EnqueueErrEnqueueMessageConflict(t, cluster)
+func testCassandraQueueV2ConcurrentEnqueueKeepsContiguousIDs(t *testing.T, cluster *cassandra.TestCluster) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sessions := make([]*blockingSession, 2)
+	queues := make([]persistence.QueueV2, 2)
+	for i := range sessions {
+		sessions[i] = &blockingSession{
+			Session:          cluster.GetSession(),
+			queryToBlockOn:   cassandra.TemplateEnqueueMessageQuery,
+			queryStarted:     make(chan struct{}, 1),
+			queryCanContinue: make(chan struct{}),
+		}
+		queues[i] = newQueueV2Store(sessions[i])
+	}
+
+	queueType := persistence.QueueTypeHistoryNormal
+	queueName := "test-queue-" + t.Name()
+	_, err := queues[0].CreateQueue(ctx, &persistence.InternalCreateQueueRequest{
+		QueueType: queueType,
+		QueueName: queueName,
 	})
+	require.NoError(t, err)
+
+	type enqueueResult struct {
+		response *persistence.InternalEnqueueMessageResponse
+		err      error
+	}
+	results := []chan enqueueResult{
+		make(chan enqueueResult, 1),
+		make(chan enqueueResult, 1),
+	}
+	for i := range queues {
+		go func() {
+			response, err := persistencetest.EnqueueMessage(ctx, queues[i], queueType, queueName)
+			results[i] <- enqueueResult{response: response, err: err}
+		}()
+	}
+	for i := range sessions {
+		select {
+		case <-sessions[i].queryStarted:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+
+	close(sessions[0].queryCanContinue)
+	first := <-results[0]
+	require.NoError(t, first.err)
+	require.Equal(t, int64(persistence.FirstQueueMessageID), first.response.Metadata.ID)
+
+	close(sessions[1].queryCanContinue)
+	second := <-results[1]
+	require.ErrorIs(t, second.err, cassandra.ErrEnqueueMessageConflict)
+
+	retry, err := persistencetest.EnqueueMessage(ctx, queues[1], queueType, queueName)
+	require.NoError(t, err)
+	require.Equal(t, int64(persistence.FirstQueueMessageID+1), retry.Metadata.ID)
+
+	readResponse, err := queues[0].ReadMessages(ctx, &persistence.InternalReadMessagesRequest{
+		QueueType: queueType,
+		QueueName: queueName,
+		PageSize:  10,
+	})
+	require.NoError(t, err)
+	require.Len(t, readResponse.Messages, 2)
+	require.Equal(t, int64(persistence.FirstQueueMessageID), readResponse.Messages[0].MetaData.ID)
+	require.Equal(t, int64(persistence.FirstQueueMessageID+1), readResponse.Messages[1].MetaData.ID)
+
+	listResponse, err := queues[0].ListQueues(ctx, &persistence.InternalListQueuesRequest{
+		QueueType: queueType,
+		PageSize:  1000,
+	})
+	require.NoError(t, err)
+	queueInfo := findQueueInfo(t, listResponse.Queues, queueName)
+	require.Equal(t, int64(2), queueInfo.MessageCount)
+	require.Equal(t, int64(persistence.FirstQueueMessageID+1), queueInfo.LastMessageID)
+
+	deleteResponse, err := queues[0].RangeDeleteMessages(ctx, &persistence.InternalRangeDeleteMessagesRequest{
+		QueueType: queueType,
+		QueueName: queueName,
+		InclusiveMaxMessageMetadata: persistence.MessageMetadata{
+			ID: persistence.FirstQueueMessageID,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), deleteResponse.MessagesDeleted)
+	require.Equal(t, 1, getNumMessages(t, cluster, queueType, queueName, 10))
+}
+
+func findQueueInfo(t *testing.T, queues []persistence.QueueInfo, queueName string) persistence.QueueInfo {
+	t.Helper()
+	for _, queue := range queues {
+		if queue.QueueName == queueName {
+			return queue
+		}
+	}
+	t.Fatalf("queue %q not found", queueName)
+	return persistence.QueueInfo{}
+}
+
+func testCassandraQueueV2ConcurrentConflicts(t *testing.T, cluster *cassandra.TestCluster) {
 	t.Run("RangeDeleteMessages", func(t *testing.T) {
 		t.Parallel()
 		testCassandraQueueV2ConcurrentRangeDeleteMessages(t, cluster)
@@ -499,7 +1166,7 @@ func testCassandraQueueV2ErrEnqueueMessageGetMaxMessageIDQuery(t *testing.T, clu
 	require.Error(t, err)
 	assert.ErrorAs(t, err, new(*serviceerror.Unavailable))
 	assert.ErrorContains(t, err, assert.AnError.Error())
-	assert.ErrorContains(t, err, "QueueV2GetMaxMessageID")
+	require.ErrorContains(t, err, "QueueV2GetMaxMessageID")
 }
 
 func testCassandraQueueV2ErrListQueuesGetMaxMessageIDQuery(t *testing.T, cluster *cassandra.TestCluster) {
@@ -543,119 +1210,12 @@ func testCassandraQueueV2MultiplePartitions(t *testing.T, cluster *cassandra.Tes
 // Query checks if the query matches queryToBlockOn, and, if so, it notifies the test and then blocks until the test
 // unblocks it.
 func (f *blockingSession) Query(query string, args ...any) gocql.Query {
-	if query == f.queryToBlockOn {
+	if query == f.queryToBlockOn || (f.queryShouldBlock != nil && f.queryShouldBlock(query)) {
 		f.queryStarted <- struct{}{}
 		<-f.queryCanContinue
 	}
 
 	return f.Session.Query(query, args...)
-}
-
-// testCassandraQueueV2EnqueueErrEnqueueMessageConflict tests that when there are concurrent inserts to the queue, only one of
-// them is accepted if they try to enqueue a message with the same ID, and the other clients are given the correct
-// error.
-func testCassandraQueueV2EnqueueErrEnqueueMessageConflict(t *testing.T, cluster *cassandra.TestCluster) {
-	const numConcurrentWrites = 3
-
-	session := &blockingSession{
-		Session:          cluster.GetSession(),
-		queryToBlockOn:   cassandra.TemplateEnqueueMessageQuery,
-		queryStarted:     make(chan struct{}, numConcurrentWrites),
-		queryCanContinue: make(chan struct{}),
-	}
-
-	q := newQueueV2Store(session)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	t.Cleanup(cancel)
-
-	queueType := persistence.QueueTypeHistoryNormal
-	queueName := "test-queue-" + t.Name()
-
-	results := make(chan enqueueMessageResult, numConcurrentWrites)
-
-	_, err := q.CreateQueue(ctx, &persistence.InternalCreateQueueRequest{
-		QueueType: queueType,
-		QueueName: queueName,
-	})
-	require.NoError(t, err)
-	for range numConcurrentWrites {
-		go func() {
-			res, err := persistencetest.EnqueueMessage(ctx, q, queueType, queueName)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				case results <- enqueueMessageResult{err: err}:
-				}
-			} else {
-				select {
-				case <-ctx.Done():
-					return
-				case results <- enqueueMessageResult{id: int(res.Metadata.ID)}:
-				}
-			}
-		}()
-	}
-
-	for range numConcurrentWrites {
-		select {
-		case <-ctx.Done():
-			printResults(t, results)
-			t.Fatal("timed out waiting for enqueue to be called")
-		case <-session.queryStarted:
-		}
-	}
-	close(session.queryCanContinue)
-
-	numConflicts := 0
-	writtenMessageIDs := make([]int, 0, 1)
-
-	for range numConcurrentWrites {
-		var res enqueueMessageResult
-		select {
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for enqueue to return")
-		case res = <-results:
-		}
-		if res.err != nil {
-			assert.ErrorIs(t, res.err, cassandra.ErrEnqueueMessageConflict)
-
-			numConflicts++
-		} else {
-			writtenMessageIDs = append(writtenMessageIDs, res.id)
-		}
-	}
-
-	assert.Equal(t, numConcurrentWrites-1, numConflicts,
-		"every query other than the accepted one should have failed")
-	assert.Len(t, writtenMessageIDs, 1,
-		"only one message should have been written")
-
-	messages, err := q.ReadMessages(ctx, &persistence.InternalReadMessagesRequest{
-		QueueType:     queueType,
-		QueueName:     queueName,
-		PageSize:      numConcurrentWrites,
-		NextPageToken: nil,
-	})
-
-	require.NoError(t, err)
-	require.Len(t, messages.Messages, 1,
-		"there should only be one message in the queue")
-	assert.Equal(t, writtenMessageIDs[0], int(messages.Messages[0].MetaData.ID),
-		"the message in the queue should be the one that Cassandra told us was accepted")
-}
-
-func printResults(t *testing.T, results chan enqueueMessageResult) {
-	for {
-		select {
-		case res := <-results:
-			if res.err != nil {
-				t.Error("got unexpected error:", res.err)
-			}
-		default:
-			return
-		}
-	}
 }
 
 func testCassandraQueueV2ErrInvalidQueueMessageEncodingType(t *testing.T, cluster *cassandra.TestCluster) {
@@ -818,18 +1378,20 @@ func testCassandraQueueV2ErrInvalidPayload(t *testing.T, cluster *cassandra.Test
 }
 
 func testCassandraQueueV2ErrGetQueueQuery(t *testing.T, cluster *cassandra.TestCluster) {
-	q := newQueueV2Store(failingSession{
-		Session:        cluster.GetSession(),
-		failingQueries: []string{cassandra.TemplateGetQueueQuery},
-	})
 	ctx := context.Background()
 	queueType := persistence.QueueTypeHistoryNormal
 	queueName := "test-queue-" + t.Name()
-	_, err := q.CreateQueue(ctx, &persistence.InternalCreateQueueRequest{
+	setupQueue := newQueueV2Store(cluster.GetSession())
+	_, err := setupQueue.CreateQueue(ctx, &persistence.InternalCreateQueueRequest{
 		QueueType: queueType,
 		QueueName: queueName,
 	})
 	require.NoError(t, err)
+
+	q := newQueueV2Store(failingSession{
+		Session:        cluster.GetSession(),
+		failingQueries: []string{cassandra.TemplateGetQueueQuery},
+	})
 	_, err = q.ReadMessages(ctx, &persistence.InternalReadMessagesRequest{
 		QueueType: queueType,
 		QueueName: queueName,
@@ -921,7 +1483,7 @@ func testCassandraQueueV2MinMessageIDOptimization(t *testing.T, cluster *cassand
 	assert.Equal(t, queueType, args[0])
 	assert.Equal(t, queueName, args[1])
 	assert.Equal(t, 0, args[2])
-	assert.Equal(t, persistence.FirstQueueMessageID+1, args[3], "We should skip the first "+
+	require.Equal(t, int64(persistence.FirstQueueMessageID+1), args[3], "We should skip the first "+
 		"message ID because we deleted it")
 	assert.Equal(t, pageSize, args[4])
 }
