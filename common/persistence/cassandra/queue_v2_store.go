@@ -1,9 +1,9 @@
 package cassandra
 
 import (
-	stdbytes "bytes"
 	"context"
 	"fmt"
+	"sync"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -12,6 +12,7 @@ import (
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
+	"google.golang.org/protobuf/proto"
 )
 
 type (
@@ -19,13 +20,20 @@ type (
 	// queue_messages tables that implement the QueueV2 interface. The schema is located at:
 	//	schema/cassandra/temporal/versioned/v1.9/queues.cql
 	queueV2Store struct {
-		session gocql.Session
-		logger  log.Logger
+		session     gocql.Session
+		logger      log.Logger
+		knownQueues sync.Map
+		queueLocks  sync.Map
 	}
 
 	Queue struct {
 		Metadata *persistencespb.Queue
 		Version  int64
+	}
+
+	queueV2Key struct {
+		queueType persistence.QueueV2Type
+		queueName string
 	}
 )
 
@@ -37,37 +45,12 @@ const (
 	TemplateGetQueueQuery            = `SELECT metadata_payload, metadata_encoding, version FROM queues WHERE queue_type = ? AND queue_name = ?`
 	TemplateRangeDeleteMessagesQuery = `DELETE FROM queue_messages WHERE queue_type = ? AND queue_name = ? AND queue_partition = ? AND message_id >= ? AND message_id <= ?`
 	TemplateUpdateQueueMetadataQuery = `UPDATE queues SET metadata_payload = ?, metadata_encoding = ?, version = ? WHERE queue_type = ? AND queue_name = ? IF version = ?`
-	// We will have to ALLOW FILTERING for this query since partition key consists of both queue_type and queue_name.
-	templateGetQueueNamesQuery = `SELECT queue_name, metadata_payload, metadata_encoding, version FROM queues WHERE queue_type = ? ALLOW FILTERING`
+	templateGetQueueNamesQuery       = `SELECT queue_name, metadata_payload, metadata_encoding, version FROM queues WHERE queue_type = ? ALLOW FILTERING`
 )
 
 var (
-	// ErrEnqueueMessageConflict is returned when a message with the same ID already exists in the queue. This is
-	// possible when there are concurrent writes to the queue because we enqueue a message using two queries:
-	//
-	// 	1. SELECT MAX(ID) to get the next message ID (for a given queue partition)
-	// 	2. INSERT (ID, message) with IF NOT EXISTS
-	//
-	// See the following example:
-	//
-	//  Client A           Client B                          Cassandra DB
-	//  |                  |                                            |
-	//  |--1. SELECT MAX(ID) FROM queue_messages----------------------->|
-	//  |                  |                                            |
-	//  |<-2. Return X--------------------------------------------------|
-	//  |                  |                                            |
-	//  |                  |--3. SELECT MAX(ID) FROM queue_messages---->|
-	//  |                  |                                            |
-	//  |                  |<-4. Return X-------------------------------|
-	//  |                  |                                            |
-	//  |--5. INSERT INTO queue_messages (ID = X)---------------------->|
-	//  |                  |                                            |
-	//  |<-6. Acknowledge-----------------------------------------------|
-	//  |                  |                                            |
-	//  |                  |--7. INSERT INTO queue_messages (ID = X)--->|
-	//  |                  |                                            |
-	//  |                  |<-8. Conflict/Error-------------------------|
-	//  |                  |                                            |
+	// ErrEnqueueMessageConflict is returned by queue implementations that use conditional inserts to allocate message
+	// IDs and lose a race with another writer.
 	ErrEnqueueMessageConflict = &persistence.ConditionFailedError{
 		Msg: "conflict inserting queue message, likely due to concurrent writes",
 	}
@@ -113,20 +96,23 @@ func (s *queueV2Store) EnqueueMessage(
 	ctx context.Context,
 	request *persistence.InternalEnqueueMessageRequest,
 ) (*persistence.InternalEnqueueMessageResponse, error) {
-	// TODO: add concurrency control around this method to avoid things like QueueMessageIDConflict.
-	// TODO: cache the queue in memory to avoid querying the database every time.
-	_, err := s.getQueue(ctx, request.QueueType, request.QueueName)
+	queueType := request.QueueType
+	queueName := request.QueueName
+	unlock := s.lockQueue(queueType, queueName)
+	defer unlock()
+
+	if !s.isKnownQueue(queueType, queueName) {
+		_, err := s.getQueue(ctx, queueType, queueName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	lastMessageID, ok, err := s.getMaxMessageID(ctx, queueType, queueName)
 	if err != nil {
 		return nil, err
 	}
-	lastMessageID, ok, err := s.getMaxMessageID(ctx, request.QueueType, request.QueueName)
-	if err != nil {
-		return nil, err
-	}
-	var nextMessageID int64
-	if !ok {
-		nextMessageID = persistence.FirstQueueMessageID
-	} else {
+	nextMessageID := int64(persistence.FirstQueueMessageID)
+	if ok {
 		nextMessageID = lastMessageID + 1
 	}
 	err = s.tryInsert(ctx, request.QueueType, request.QueueName, request.Blob, nextMessageID)
@@ -142,9 +128,13 @@ func (s *queueV2Store) ReadMessages(
 	ctx context.Context,
 	request *persistence.InternalReadMessagesRequest,
 ) (*persistence.InternalReadMessagesResponse, error) {
-	q, err := s.getQueue(ctx, request.QueueType, request.QueueName)
-	if err != nil {
-		return nil, err
+	q, ok := s.getCachedQueue(request.QueueType, request.QueueName)
+	if !ok {
+		var err error
+		q, err = s.getQueue(ctx, request.QueueType, request.QueueName)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if request.PageSize <= 0 {
 		return nil, persistence.ErrNonPositiveReadQueueMessagesPageSize
@@ -159,7 +149,7 @@ func (s *queueV2Store) ReadMessages(
 		request.QueueType,
 		request.QueueName,
 		0,
-		int(minMessageID),
+		minMessageID,
 		request.PageSize,
 	).WithContext(ctx).Iter()
 
@@ -179,6 +169,7 @@ func (s *queueV2Store) ReadMessages(
 		}
 		encoding, err := enumspb.EncodingTypeFromString(messageEncoding)
 		if err != nil {
+			_ = iter.Close()
 			return nil, serialization.NewUnknownEncodingTypeError(messageEncoding)
 		}
 
@@ -239,6 +230,10 @@ func (s *queueV2Store) CreateQueue(
 			queueName,
 		)
 	}
+	s.markKnownQueue(queueType, queueName, &Queue{
+		Metadata: &q,
+		Version:  0,
+	})
 	return &persistence.InternalCreateQueueResponse{}, nil
 }
 
@@ -256,13 +251,20 @@ func (s *queueV2Store) RangeDeleteMessages(
 	}
 	queueType := request.QueueType
 	queueName := request.QueueName
-	q, err := s.getQueue(ctx, queueType, queueName)
-	if err != nil {
-		return nil, err
+	q, ok := s.getCachedQueue(queueType, queueName)
+	if !ok {
+		var err error
+		q, err = s.getQueue(ctx, queueType, queueName)
+		if err != nil {
+			return nil, err
+		}
 	}
 	partition, err := persistence.GetPartitionForQueueV2(queueType, queueName, q.Metadata)
 	if err != nil {
 		return nil, err
+	}
+	if request.InclusiveMaxMessageMetadata.ID < partition.MinMessageId {
+		return &persistence.InternalRangeDeleteMessagesResponse{}, nil
 	}
 	maxMessageID, ok, err := s.getMaxMessageID(ctx, queueType, queueName)
 	if err != nil {
@@ -326,6 +328,7 @@ func (s *queueV2Store) updateQueue(
 		return gocql.ConvertError("QueueV2UpdateQueueMetadata", err)
 	}
 	if !applied {
+		s.forgetKnownQueue(queueType, queueName)
 		return fmt.Errorf(
 			"%w: queue type %v and name %v",
 			ErrUpdateQueueConflict,
@@ -333,6 +336,7 @@ func (s *queueV2Store) updateQueue(
 			queueName,
 		)
 	}
+	s.markKnownQueue(queueType, queueName, q)
 	return nil
 }
 
@@ -356,13 +360,7 @@ func (s *queueV2Store) tryInsert(
 		return gocql.ConvertError("QueueV2EnqueueMessage", err)
 	}
 	if !applied {
-		return fmt.Errorf(
-			"%w: queue type %v and name %v already has a message with ID %v",
-			ErrEnqueueMessageConflict,
-			queueType,
-			queueName,
-			messageID,
-		)
+		return ErrEnqueueMessageConflict
 	}
 
 	return nil
@@ -373,7 +371,65 @@ func (s *queueV2Store) getQueue(
 	queueType persistence.QueueV2Type,
 	name string,
 ) (*Queue, error) {
-	return GetQueue(ctx, s.session, name, queueType)
+	q, err := GetQueue(ctx, s.session, name, queueType)
+	if err != nil {
+		return nil, err
+	}
+	s.markKnownQueue(queueType, name, q)
+	return q, nil
+}
+
+func (s *queueV2Store) getCachedQueue(queueType persistence.QueueV2Type, queueName string) (*Queue, bool) {
+	q, ok := s.knownQueues.Load(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	})
+	if !ok {
+		return nil, false
+	}
+	return cloneQueue(q.(*Queue)), true
+}
+
+func (s *queueV2Store) isKnownQueue(queueType persistence.QueueV2Type, queueName string) bool {
+	_, ok := s.knownQueues.Load(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	})
+	return ok
+}
+
+func (s *queueV2Store) markKnownQueue(queueType persistence.QueueV2Type, queueName string, queue *Queue) {
+	s.knownQueues.Store(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	}, cloneQueue(queue))
+}
+
+func (s *queueV2Store) forgetKnownQueue(queueType persistence.QueueV2Type, queueName string) {
+	s.knownQueues.Delete(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	})
+}
+
+func (s *queueV2Store) lockQueue(queueType persistence.QueueV2Type, queueName string) func() {
+	lock, _ := s.queueLocks.LoadOrStore(queueV2Key{
+		queueType: queueType,
+		queueName: queueName,
+	}, &sync.Mutex{})
+	mutex, ok := lock.(*sync.Mutex)
+	if !ok {
+		mutex = &sync.Mutex{}
+	}
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+func cloneQueue(queue *Queue) *Queue {
+	return &Queue{
+		Metadata: proto.Clone(queue.Metadata).(*persistencespb.Queue),
+		Version:  queue.Version,
+	}
 }
 
 func GetQueue(
@@ -474,14 +530,17 @@ func (s *queueV2Store) ListQueues(
 	}
 	var queues []persistence.QueueInfo
 	nextPageToken := request.NextPageToken
-	for len(queues) < request.PageSize {
-		initialQueueCount := len(queues)
+	for {
+		queueCount := len(queues)
 		iter := s.session.Query(
 			templateGetQueueNamesQuery,
 			request.QueueType,
 		).PageSize(request.PageSize - len(queues)).PageState(nextPageToken).WithContext(ctx).Iter()
 
-		for {
+		closeIter := func() {
+			_ = iter.Close()
+		}
+		for len(queues) < request.PageSize {
 			var (
 				queueName        string
 				metadataBytes    []byte
@@ -493,14 +552,17 @@ func (s *queueV2Store) ListQueues(
 			}
 			q, err := getQueueFromMetadata(request.QueueType, queueName, metadataBytes, metadataEncoding, version)
 			if err != nil {
+				closeIter()
 				return nil, err
 			}
 			partition, err := persistence.GetPartitionForQueueV2(request.QueueType, queueName, q.Metadata)
 			if err != nil {
+				closeIter()
 				return nil, err
 			}
 			messageCount, lastMessageID, err := s.getMessageCountAndLastID(ctx, request.QueueType, queueName, partition)
 			if err != nil {
+				closeIter()
 				return nil, err
 			}
 			queues = append(queues, persistence.QueueInfo{
@@ -512,16 +574,10 @@ func (s *queueV2Store) ListQueues(
 		if err := iter.Close(); err != nil {
 			return nil, gocql.ConvertError("QueueV2ListQueues", err)
 		}
-		iterPageToken := iter.PageState()
-		if len(iterPageToken) == 0 {
-			nextPageToken = nil
+		nextPageToken = iter.PageState()
+		if len(queues) == request.PageSize || len(nextPageToken) == 0 || len(queues) == queueCount {
 			break
 		}
-		if stdbytes.Equal(iterPageToken, nextPageToken) && len(queues) == initialQueueCount {
-			nextPageToken = nil
-			break
-		}
-		nextPageToken = iterPageToken
 	}
 	return &persistence.InternalListQueuesResponse{
 		Queues:        queues,

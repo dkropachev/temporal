@@ -47,10 +47,10 @@ const (
 	templateGetHistoryScheduledTasksQuery = `SELECT visibility_ts, task_id, task_data, task_encoding ` +
 		`FROM executions ` +
 		`WHERE shard_id = ? ` +
-		`and type = ?` +
+		`and type = ? ` +
 		`and namespace_id = ? ` +
-		`and workflow_id = ?` +
-		`and run_id = ?` +
+		`and workflow_id = ? ` +
+		`and run_id = ? ` +
 		`and visibility_ts >= ? ` +
 		`and visibility_ts < ?`
 
@@ -134,10 +134,10 @@ const (
 	templateGetTimerTasksQuery = `SELECT visibility_ts, task_id, timer, timer_encoding ` +
 		`FROM executions ` +
 		`WHERE shard_id = ? ` +
-		`and type = ?` +
+		`and type = ? ` +
 		`and namespace_id = ? ` +
-		`and workflow_id = ?` +
-		`and run_id = ?` +
+		`and workflow_id = ? ` +
+		`and run_id = ? ` +
 		`and visibility_ts >= ? ` +
 		`and visibility_ts < ?`
 
@@ -299,7 +299,9 @@ func (d *MutableStateTaskStore) getTransferTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -380,7 +382,9 @@ func (d *MutableStateTaskStore) getTimerTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+	}
 	var timestamp time.Time
 	var taskID int64
 	var data []byte
@@ -635,7 +639,9 @@ func (d *MutableStateTaskStore) getVisibilityTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -764,7 +770,9 @@ func (d *MutableStateTaskStore) getHistoryImmedidateTasks(
 
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -811,7 +819,9 @@ func (d *MutableStateTaskStore) getHistoryScheduledTasks(
 
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+	}
 	var timestamp time.Time
 	var taskID int64
 	var data []byte
