@@ -243,7 +243,8 @@ metrics. The emitted result JSON reports completed
 pprof top summary paths, pre-run and post-run metrics snapshot paths, the result JSON path, and the run-metadata JSON
 path. The metadata file records runtime/process settings, selected Cassandra/Scylla environment variables, and
 pprof/metrics endpoint reachability so before/after samples can be tied back to their CPU, heap, Prometheus, and
-cluster-configuration evidence.
+cluster-configuration evidence. Backlog results report worker startup separately as `workerStartElapsed`;
+`drainElapsed` and `drainWorkflowsPerSec` begin after every worker has started.
 
 When matching before/after Scylla metric endpoints are supplied, the result JSON also includes
 `scyllaPreparedStatements`. `prepareRequests` counts all CQL `PREPARE` requests in the measured window.
@@ -304,9 +305,14 @@ go run ./cmd/tools/scyllaload \
 ```
 
 In backlog mode, `enqueueRequestsPerSec` measures workflow-start admission and persisted workflow-task writes while no
-worker is polling. `drainWorkflowsPerSec` measures persisted task polling/reads and workflow completion after workers
-start. Compare the same queue shape at 1, 2, 4, 8, 16, and 32 workers per task queue. Every cell must report the full
-expected `backlogTasks`, zero `enqueueFailed`, zero `drainFailed`, and zero `ResourceExhausted` metric growth.
+worker is polling. `workerStartElapsed` measures local SDK worker startup. `drainWorkflowsPerSec` measures persisted
+task polling/reads and workflow completion after workers start. Compare the same queue shape at 1, 2, 4, 8, 16, and
+32 workers per task queue. Every cell must report the full expected `backlogTasks`, zero `enqueueFailed`, zero
+`drainFailed`, and zero `ResourceExhausted` metric growth.
+
+The historical backlog tables below were recorded before worker startup was split from `drainElapsed`, so their drain
+rates conservatively include the same local startup phase in both revisions. New results use the separated timer and
+must not be mixed into those sample sets without rerunning both revisions.
 
 Default development RPS limits can hide storage scaling behind matching poll throttling. The benchmark-only dynamic
 configuration used for the unthrottled matrix was:
@@ -395,11 +401,15 @@ go tool pprof -top /tmp/temporal.heap.pprof
 
 ## Post-Safety Persistence Result
 
-The final online-migration, queue, and history design was rerun against exact base on a local Scylla `2026.1.7` cluster
-with three nodes, four shards per node, and 4 GiB per node. Persistence test keyspaces use RF=1. Each operation ran for
-50 iterations in three fresh-keyspace samples; the table reports the median. Both revisions used
+The final online-migration, legacy queue, and history design was rerun against exact base on a local Scylla `2026.1.7`
+cluster with three nodes, four shards per node, and 4 GiB per node. Persistence test keyspaces use RF=1. Each operation
+ran for 50 iterations in three fresh-keyspace samples; the table reports the median. Both revisions used
 `CASSANDRA_MAX_CONNS=12`; the optimized revision also used
 `CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE=2`.
+
+After the final QueueV2 metadata-freshness correction, its four rows were rerun against exact base on the same
+three-node topology temporarily limited to two shards and 2 GiB per node, with `CASSANDRA_MAX_CONNS=4` on both
+revisions. Those rows compare only samples from that identical recovery-cluster configuration.
 
 | Benchmark | Base median ns/op | Final median ns/op | Delta |
 | --- | ---: | ---: | ---: |
@@ -407,17 +417,18 @@ with three nodes, four shards per node, and 4 GiB per node. Persistence test key
 | `HistoryNodeAppendRead/read` | 1,242,014 | 1,194,998 | -3.79% |
 | `HistoryNodeV2OnlyAppendRead/append` | 1,089,627 | 1,091,929 | +0.21% |
 | `HistoryNodeV2OnlyAppendRead/read` | 1,242,014 | 1,202,721 | -3.16% |
-| `QueueV2EnqueueRead/enqueue` | 3,457,183 | 2,336,363 | -32.42% |
-| `QueueV2EnqueueRead/read` | 2,270,834 | 1,172,969 | -48.35% |
-| `QueueV2EnqueueRead/range_delete` | 4,553,699 | 3,488,093 | -23.40% |
-| `QueueV2EnqueueRead/list` | 114,014,571 | 115,045,543 | +0.90% |
+| `QueueV2EnqueueRead/enqueue` | 3,417,950 | 2,330,037 | -31.83% |
+| `QueueV2EnqueueRead/read` | 2,246,261 | 2,226,298 | -0.89% |
+| `QueueV2EnqueueRead/range_delete` | 4,525,653 | 4,555,883 | +0.67% |
+| `QueueV2EnqueueRead/list` | 113,220,069 | 112,666,554 | -0.49% |
 | `QueueEnqueueRead/enqueue` | 2,293,566 | 2,300,431 | +0.30% |
 | `QueueEnqueueRead/read` | 1,206,100 | 1,210,576 | +0.37% |
 
-The safe QueueV2 metadata cache retains substantial enqueue, read, and range-delete gains. Conditional, contiguous
-message-ID allocation leaves the legacy queue at baseline behavior. Final `canonical-dual` history append pays a 6.73%
-latency cost to maintain the rollback table, while V2 branch reads improve by 3.79%. Temporary `v2-only` append is
-within 0.21% of base.
+The bounded QueueV2 existence cache retains a 31.83% enqueue gain. Metadata-dependent first-page reads and range
+deletes now reload versioned queue metadata, leaving read, range-delete, and list latency within 1% of base.
+Conditional, contiguous message-ID allocation leaves the legacy queue at baseline behavior. Final `canonical-dual`
+history append pays a 6.73% latency cost to maintain the rollback table, while V2 branch reads improve by 3.79%.
+Temporary `v2-only` append is within 0.21% of base.
 
 `HistoryNodeMultiBranchRead` medians were 19,793,834 ns/op for base and 15,898,516 ns/op for the final branch, but
 individual samples overlapped and ranged from 15.9 to 23.5 ms. That result is too noisy to rank the implementations.
@@ -429,6 +440,12 @@ fresh RF=1 latency test does not demonstrate.
 The exact base and final `canonical-dual` branch were also run with fresh RF=3 stores against the same three-node,
 four-shard Scylla cluster. Each sample followed schema and server stabilization waits plus a 1,000-workflow warmup.
 The workload used 6,400 workflows, 16 task queues, 32 workers per queue, concurrency 640, and a 256-byte payload.
+
+The E2E binaries predate the final review-only corrections to QueueV2, schema-layout validation, pagination
+termination, and benchmark timer reporting. Those corrections do not change the workflow history or matching data
+paths exercised here. QueueV2 was rerun separately after its metadata-freshness correction, as described in the
+post-safety persistence section. The E2E numbers therefore remain evidence for the database-placement change, but they
+are not a bit-for-bit benchmark of the final commit.
 
 | Workload | Base samples | Base median | Final samples | Final median | Delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -538,12 +555,16 @@ above.
 
 Interpretation:
 
-- The QueueV2 metadata cache removes the metadata read from hot enqueue paths after a queue is known. The final path
-  still performs a max-ID read and conditional insert for every message.
+- The bounded QueueV2 existence cache removes the metadata read from hot enqueue paths after a queue is known. The
+  final path still performs a max-ID read and conditional insert for every message.
+- QueueV2 first-page reads and range deletes reload versioned metadata. Continuation-page reads use their message-ID
+  token; a process with known queue existence does not need another metadata query, while a cold process validates the
+  queue first. This prevents a long-lived process from repeatedly scanning an obsolete tombstone range or overlooking
+  a newer partition layout without allowing a continuation token to bypass queue validation.
 - QueueV2 enqueues are locally serialized per queue to avoid same-process conflicts. Independent queue names use
-  independent locks; cross-process conflicts are resolved by the conditional insert and retry.
-- QueueV2 metadata CAS conflicts invalidate the local queue metadata cache so a retry fetches the latest version instead
-  of repeatedly using stale metadata.
+  one of 256 bounded lock stripes; cross-process conflicts are resolved by the conditional insert and retry.
+- QueueV2 metadata CAS conflicts invalidate the local existence entry. Metadata itself is not reused by reads or
+  deletes.
 - The list path still uses the upgrade-compatible `queues` primary key and `ALLOW FILTERING`; replacing that with
   bucketed queue metadata requires a separate schema migration.
 - The legacy queue store retains its max-ID read and conditional insert. The prior enqueue-latency result came from the
@@ -741,18 +762,16 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   task stores. Normal reads already closed the iterator; this covers the early-exit path on the matching task hot table.
 - Nexus endpoint listing now closes iterators before version-conflict and malformed-row errors on first-page and
   continuation scans, matching the same driver-resource cleanup pattern used in the hotter persistence scans.
-- The range-delete row was measured separately with `-benchtime=100x -count=3` and `CASSANDRA_MAX_CONNS=12` on both
-  baseline and optimized worktrees. The optimized samples were `3,439,679`, `3,391,419`, and `3,368,529 ns/op`.
-- The list row was measured separately with `-benchtime=100x -count=3`, `CASSANDRA_MAX_CONNS=12`, and 100 seeded queue
-  metadata rows. Baseline samples were `115,401,614`, `114,936,553`, and `113,495,269 ns/op`; optimized samples were
-  `111,834,750`, `111,807,282`, and `114,092,106 ns/op`.
+- The safety-corrected QueueV2 rerun used `-benchtime=50x -count=3`. Base range-delete samples were `4,525,653`,
+  `4,455,202`, and `4,534,400 ns/op`; final samples were `4,651,480`, `4,555,883`, and `4,498,415 ns/op`.
+  Base list samples were `114,479,360`, `111,389,592`, and `113,220,069 ns/op`; final samples were `114,246,413`,
+  `112,666,554`, and `111,313,916 ns/op`.
 - The rejected QueueV2 range-allocator experiment measured `1,147,301`, `1,113,305`, and `1,108,269 ns/op`. It was
   removed because it could skip late-committing messages and make counts inexact; these samples are not final-branch
   results.
-- QueueV2 cached enqueue now checks queue existence without cloning cached queue metadata. The local lookup benchmark
-  showed the old clone path at `277.5-373.4 ns/op`, `308 B/op`, and `6 allocs/op`, while the existence-only path was
-  `14.41-15.40 ns/op` with zero allocations. This removes per-enqueue CPU/allocation overhead after the queue metadata
-  is known.
+- QueueV2 cached enqueue checks queue existence without cloning mutable queue metadata. The final bounded lookup
+  measured `27.78-27.97 ns/op` with zero allocations. This removes per-enqueue clone overhead while bounding cache and
+  lock memory.
 - QueueV2 list pagination remains covered by unit tests for invalid page tokens and repeated empty Cassandra page
   tokens. A bucketed QueueV2 metadata schema was investigated but not kept in this PR because it needs a separate
   migration for existing `queues` rows.
