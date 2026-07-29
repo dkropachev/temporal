@@ -106,6 +106,7 @@ type (
 		ServerHeapProfile     string        `json:"serverHeapProfile,omitempty"`
 		MetricSnapshotsBefore []string      `json:"metricSnapshotsBefore,omitempty"`
 		MetricSnapshotsAfter  []string      `json:"metricSnapshotsAfter,omitempty"`
+		PreparedStats         *prepStats    `json:"scyllaPreparedStatements,omitempty"`
 		ProfileSummaries      []string      `json:"profileSummaries,omitempty"`
 		ResultFile            string        `json:"resultFile,omitempty"`
 		RunMetadataFile       string        `json:"runMetadataFile,omitempty"`
@@ -234,6 +235,13 @@ func main() {
 	}
 	if err := writeMetricSnapshots(ctx, cfg.metricSnapshotsAfter); err != nil {
 		log.Fatalf("write post-run metric snapshots: %v", err)
+	}
+	result.PreparedStats, err = readScyllaPreparedStatementMetrics(
+		cfg.metricSnapshotsBefore,
+		cfg.metricSnapshotsAfter,
+	)
+	if err != nil {
+		log.Fatalf("read Scylla prepared statement metrics: %v", err)
 	}
 	if err := writeProfileSummaries(ctx, cfg.profileSummaries); err != nil {
 		log.Fatalf("write profile summaries: %v", err)

@@ -686,9 +686,17 @@ func TestWriteProfileSummaries(t *testing.T) {
 func TestWriteResultFile(t *testing.T) {
 	resultPath := t.TempDir() + "/result.json"
 	result := runResult{
-		Address:    "127.0.0.1:7233",
-		Namespace:  "scylla-load",
-		Workflows:  7,
+		Address:   "127.0.0.1:7233",
+		Namespace: "scylla-load",
+		Workflows: 7,
+		PreparedStats: &prepStats{
+			MetricEndpoints:            3,
+			PrepareRequests:            4,
+			ReprepareAttempts:          1,
+			ClientReprepareAttempts:    1,
+			PreparedCacheEntriesBefore: 100,
+			PreparedCacheEntriesAfter:  101,
+		},
 		ResultFile: resultPath,
 	}
 
@@ -715,6 +723,19 @@ func TestWriteResultFile(t *testing.T) {
 		"workflowsPerSec": 0,
 		"requests": 0,
 		"requestsPerSec": 0,
+		"scyllaPreparedStatements": {
+			"metricEndpoints": 3,
+			"prepareRequests": 4,
+			"reprepareAttempts": 1,
+			"clientReprepareAttempts": 1,
+			"forwardedReprepareAttempts": 0,
+			"statementsParsed": 0,
+			"preparedCacheEvictions": 0,
+			"oneOffPreparedCacheEvictions": 0,
+			"authorizedPreparedCacheEvictions": 0,
+			"preparedCacheEntriesBefore": 100,
+			"preparedCacheEntriesAfter": 101
+		},
 		"resultFile": "`+resultPath+`"
 	}`, string(data))
 }

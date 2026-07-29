@@ -245,6 +245,14 @@ path. The metadata file records runtime/process settings, selected Cassandra/Scy
 pprof/metrics endpoint reachability so before/after samples can be tied back to their CPU, heap, Prometheus, and
 cluster-configuration evidence.
 
+When matching before/after Scylla metric endpoints are supplied, the result JSON also includes
+`scyllaPreparedStatements`. `prepareRequests` counts all CQL `PREPARE` requests in the measured window.
+`clientReprepareAttempts` counts `UNPREPARED` responses that make gocql evict a prepared ID, prepare it again, and
+retry; `forwardedReprepareAttempts` counts the equivalent internal Scylla repair for a forwarded request.
+`reprepareAttempts` is their sum. The remaining fields distinguish parsed plans and real prepared-plan cache churn
+from authorization-cache expiry. A Scylla counter reset during a run invalidates the sample and fails result
+generation instead of reporting a misleading negative delta.
+
 Many-worker task queue read/write scaling matrix:
 
 ```bash
@@ -431,6 +439,19 @@ The workload used 6,400 workflows, 16 task queues, 32 workers per queue, concurr
 All twelve measured runs completed 6,400 workflows with zero load failures; each backlog run observed all 6,400
 persisted tasks. Scylla read-failure, write-failure, and write-timeout counters remained unchanged in every measured
 window.
+
+| Workload | Revision | Post-warmup `PREPARE` requests | Reprepare attempts | Prepared-plan cache evictions |
+| --- | --- | ---: | ---: | ---: |
+| Activity | Base | 9; 9; 9 | 0; 0; 0 | 0; 0; 0 |
+| Activity | Final | 1; 0; 1 | 0; 0; 0 | 0; 0; 0 |
+| Backlog | Base | 9; 9; 11 | 0; 0; 0 | 0; 0; 0 |
+| Backlog | Final | 3; 3; 9 | 0; 0; 0 | 0; 0; 0 |
+
+The low `PREPARE` counts are lazy preparation on a host or operation path not exercised by the 1,000-workflow warmup;
+none followed an `UNPREPARED` response. There were also no internal forwarded reprepares, prepared-plan cache
+evictions, or one-off-plan evictions. No persistence query or cache-size fix is indicated by these runs. The
+authorization prepared cache did expire entries during longer samples, as expected from Scylla's permission-cache
+validity window; those evictions do not remove CQL plans or cause statement repreparation.
 
 | Workload | Metric | Base median | Final median | Delta |
 | --- | --- | ---: | ---: | ---: |
