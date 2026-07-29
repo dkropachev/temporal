@@ -46,12 +46,13 @@ func (rl *RateLimiterImpl) SetBurst(burst int) {
 	rl.refreshInternalRateLimiterImpl(nil, &burst)
 }
 
+// Reserve uses the native reservation because RateLimiterImpl always uses real time, preserving its clock semantics.
 func (rl *RateLimiterImpl) Reserve() Reservation {
-	return rl.ClockedRateLimiter.Reserve()
+	return rl.rateLimiter.ReserveN(rl.timeSource.Now(), 1)
 }
 
 func (rl *RateLimiterImpl) ReserveN(now time.Time, n int) Reservation {
-	return rl.ClockedRateLimiter.ReserveN(now, n)
+	return rl.rateLimiter.ReserveN(now, n)
 }
 
 // SetRateBurst sets the rps & burst of the rate limiter

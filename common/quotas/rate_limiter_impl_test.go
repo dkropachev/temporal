@@ -2,6 +2,7 @@ package quotas
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -17,6 +18,15 @@ type (
 func TestRateLimiterSuite(t *testing.T) {
 	s := new(rateLimiterSuite)
 	suite.Run(t, s)
+}
+
+func TestRateLimiterReserve(t *testing.T) {
+	rateLimiter := NewRateLimiter(0, 1)
+
+	reservation := rateLimiter.Reserve()
+	require.True(t, reservation.OK())
+	require.Zero(t, reservation.Delay())
+	require.False(t, rateLimiter.ReserveN(time.Now(), 2).OK())
 }
 
 func (s *rateLimiterSuite) SetupSuite() {

@@ -1,6 +1,7 @@
 package quotas
 
 import (
+	"runtime"
 	"testing"
 	"time"
 )
@@ -33,4 +34,17 @@ func BenchmarkDynamicRateLimiter(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		limiter.Allow()
 	}
+}
+
+func BenchmarkRateLimiterReserve(b *testing.B) {
+	limiter := NewRateLimiter(testRate, testBurst)
+	now := time.Unix(0, 0).UTC()
+
+	var reservation Reservation
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		reservation = limiter.ReserveN(now, 1)
+	}
+	runtime.KeepAlive(reservation)
 }
