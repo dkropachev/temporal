@@ -25,6 +25,9 @@ func CalculateExternalPayloadSize(events []*historypb.HistoryEvent, metricsHandl
 	}
 
 	for _, event := range events {
+		if !historyEventCanContainExternalPayload(event) {
+			continue
+		}
 		err := proxy.VisitPayloads(context.Background(), event, proxy.VisitPayloadsOptions{
 			Visitor:              visitor,
 			SkipSearchAttributes: true,
@@ -34,4 +37,24 @@ func CalculateExternalPayloadSize(events []*historypb.HistoryEvent, metricsHandl
 		}
 	}
 	return totalSize, totalCount, nil
+}
+
+func historyEventCanContainExternalPayload(event *historypb.HistoryEvent) bool {
+	if event == nil {
+		return false
+	}
+	if event.GetUserMetadata() != nil {
+		return true
+	}
+	switch attributes := event.Attributes.(type) {
+	case nil,
+		*historypb.HistoryEvent_WorkflowTaskScheduledEventAttributes,
+		*historypb.HistoryEvent_WorkflowTaskStartedEventAttributes,
+		*historypb.HistoryEvent_WorkflowTaskCompletedEventAttributes:
+		return false
+	case *historypb.HistoryEvent_ActivityTaskStartedEventAttributes:
+		return attributes.ActivityTaskStartedEventAttributes.GetLastFailure() != nil
+	default:
+		return true
+	}
 }
