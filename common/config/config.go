@@ -362,6 +362,9 @@ type (
 		Datacenter string `yaml:"datacenter"`
 		// MaxConns is the max number of connections to this datastore for a single keyspace
 		MaxConns int `yaml:"maxConns"`
+		// MaxPreparedStmts is the maximum number of prepared statements cached by the gocql client.
+		// Non-positive values use the default of 6000.
+		MaxPreparedStmts int `yaml:"maxPreparedStmts"`
 		// ConnectTimeout is a timeout for initial dial to cassandra server (default: 600 milliseconds)
 		ConnectTimeout time.Duration `yaml:"connectTimeout"`
 		// Timeout is a timeout for reads and, unless otherwise specified, writes. If not specified, ConnectTimeout is used.
