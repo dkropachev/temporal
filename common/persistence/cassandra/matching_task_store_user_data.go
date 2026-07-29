@@ -190,7 +190,6 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 	var pageToken []byte
 
 	for {
-		initialTaskQueueCount := len(taskQueues)
 		query := d.Session.Query(templateListTaskQueueNamesByBuildIdQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
 		iter := query.PageSize(listTaskQueueNamesByBuildIdPageSize).PageState(pageToken).Iter()
 		row := make(map[string]any)
@@ -215,8 +214,7 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 		if err := iter.Close(); err != nil {
 			return nil, gocql.ConvertError("GetTaskQueuesByBuildId", err)
 		}
-		if len(nextPageToken) == 0 ||
-			(slices.Equal(nextPageToken, pageToken) && len(taskQueues) == initialTaskQueueCount) {
+		if len(nextPageToken) == 0 || slices.Equal(nextPageToken, pageToken) {
 			break
 		}
 		pageToken = nextPageToken

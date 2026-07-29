@@ -97,6 +97,7 @@ type (
 		EnqueueRequestsPerSec float64       `json:"enqueueRequestsPerSec,omitempty"`
 		BacklogWaitElapsed    time.Duration `json:"backlogWaitElapsed,omitempty"`
 		BacklogTasks          int64         `json:"backlogTasks,omitempty"`
+		WorkerStartElapsed    time.Duration `json:"workerStartElapsed,omitempty"`
 		DrainElapsed          time.Duration `json:"drainElapsed,omitempty"`
 		DrainFailed           int64         `json:"drainFailed,omitempty"`
 		DrainWorkflowsPerSec  float64       `json:"drainWorkflowsPerSec,omitempty"`
@@ -560,12 +561,14 @@ func runBacklogLoadWithDependencies(
 		return result, nil, err
 	}
 
-	drainStart := time.Now()
+	workerStart := time.Now()
 	workers, err := startWorkers(c, cfg)
+	result.WorkerStartElapsed = time.Since(workerStart)
 	if err != nil {
 		return result, nil, err
 	}
 
+	drainStart := time.Now()
 	completed := drainWorkflowBacklog(ctx, enqueueResult.runs, cfg.concurrency)
 	result.DrainElapsed = time.Since(drainStart)
 	result.Completed = completed

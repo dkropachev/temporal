@@ -16,7 +16,7 @@ const (
 	historyNodeTableName   = "history_node"
 	historyNodeV2TableName = "history_node_v2"
 
-	templateGetHistoryNodeSchemaColumns = `SELECT column_name, kind, position FROM system_schema.columns ` +
+	templateGetHistoryNodeSchemaColumns = `SELECT column_name, kind, position, clustering_order FROM system_schema.columns ` +
 		`WHERE keyspace_name = ? AND table_name = ?`
 
 	templateDropHistoryNodeTable   = `DROP TABLE IF EXISTS %s.history_node`
@@ -44,8 +44,9 @@ const (
 )
 
 type historyNodeKeyColumn struct {
-	name     string
-	position int
+	name            string
+	position        int
+	clusteringOrder string
 }
 
 type historyNodeModeLayouts struct {
@@ -118,11 +119,16 @@ func GetHistoryNodeTableLayout(
 			columnName string
 			kind       string
 			position   int
+			order      string
 		)
-		if !iter.Scan(&columnName, &kind, &position) {
+		if !iter.Scan(&columnName, &kind, &position, &order) {
 			break
 		}
-		column := historyNodeKeyColumn{name: columnName, position: position}
+		column := historyNodeKeyColumn{
+			name:            columnName,
+			position:        position,
+			clusteringOrder: strings.ToLower(order),
+		}
 		switch kind {
 		case "partition_key":
 			partitionKeys = append(partitionKeys, column)
@@ -153,10 +159,12 @@ func GetHistoryNodeTableLayout(
 
 	switch {
 	case historyNodeKeyColumnsEqual(partitionKeys, "tree_id") &&
-		historyNodeKeyColumnsEqual(clusteringKeys, "branch_id", "node_id", "txn_id"):
+		historyNodeKeyColumnsEqual(clusteringKeys, "branch_id", "node_id", "txn_id") &&
+		historyNodeClusteringOrderEqual(clusteringKeys, "asc", "asc", "desc"):
 		return HistoryNodeTableLayoutLegacyV1, nil
 	case historyNodeKeyColumnsEqual(partitionKeys, "tree_id", "branch_id") &&
-		historyNodeKeyColumnsEqual(clusteringKeys, "node_id", "txn_id"):
+		historyNodeKeyColumnsEqual(clusteringKeys, "node_id", "txn_id") &&
+		historyNodeClusteringOrderEqual(clusteringKeys, "asc", "desc"):
 		return HistoryNodeTableLayoutBranchV2, nil
 	default:
 		return HistoryNodeTableLayoutUnknown, nil
@@ -169,6 +177,18 @@ func historyNodeKeyColumnsEqual(columns []historyNodeKeyColumn, names ...string)
 	}
 	for i, name := range names {
 		if columns[i].name != name || columns[i].position != i {
+			return false
+		}
+	}
+	return true
+}
+
+func historyNodeClusteringOrderEqual(columns []historyNodeKeyColumn, orders ...string) bool {
+	if len(columns) != len(orders) {
+		return false
+	}
+	for i, order := range orders {
+		if columns[i].clusteringOrder != order {
 			return false
 		}
 	}

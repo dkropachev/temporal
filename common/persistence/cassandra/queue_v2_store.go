@@ -1,6 +1,7 @@
 package cassandra
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -12,7 +13,6 @@ import (
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
-	"google.golang.org/protobuf/proto"
 )
 
 type (
@@ -20,10 +20,11 @@ type (
 	// queue_messages tables that implement the QueueV2 interface. The schema is located at:
 	//	schema/cassandra/temporal/versioned/v1.9/queues.cql
 	queueV2Store struct {
-		session     gocql.Session
-		logger      log.Logger
-		knownQueues sync.Map
-		queueLocks  sync.Map
+		session       gocql.Session
+		logger        log.Logger
+		knownQueuesMu sync.RWMutex
+		knownQueues   map[queueV2Key]struct{}
+		queueLocks    [queueV2LockStripes]sync.Mutex
 	}
 
 	Queue struct {
@@ -38,6 +39,9 @@ type (
 )
 
 const (
+	queueV2LockStripes     = 256
+	queueV2KnownQueuesSize = 4096
+
 	TemplateEnqueueMessageQuery      = `INSERT INTO queue_messages (queue_type, queue_name, queue_partition, message_id, message_payload, message_encoding) VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS`
 	TemplateGetMessagesQuery         = `SELECT message_id, message_payload, message_encoding FROM queue_messages WHERE queue_type = ? AND queue_name = ? AND queue_partition = ? AND message_id >= ? ORDER BY message_id ASC LIMIT ?`
 	TemplateGetMaxMessageIDQuery     = `SELECT message_id FROM queue_messages WHERE queue_type = ? AND queue_name = ? AND queue_partition = ? ORDER BY message_id DESC LIMIT 1`
@@ -128,18 +132,27 @@ func (s *queueV2Store) ReadMessages(
 	ctx context.Context,
 	request *persistence.InternalReadMessagesRequest,
 ) (*persistence.InternalReadMessagesResponse, error) {
-	q, ok := s.getCachedQueue(request.QueueType, request.QueueName)
-	if !ok {
-		var err error
-		q, err = s.getQueue(ctx, request.QueueType, request.QueueName)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if request.PageSize <= 0 {
 		return nil, persistence.ErrNonPositiveReadQueueMessagesPageSize
 	}
-	minMessageID, err := persistence.GetMinMessageIDToReadForQueueV2(request.QueueType, request.QueueName, request.NextPageToken, q.Metadata)
+	var queueMetadata *persistencespb.Queue
+	if len(request.NextPageToken) == 0 {
+		q, err := s.getQueue(ctx, request.QueueType, request.QueueName)
+		if err != nil {
+			return nil, err
+		}
+		queueMetadata = q.Metadata
+	} else if !s.isKnownQueue(request.QueueType, request.QueueName) {
+		if _, err := s.getQueue(ctx, request.QueueType, request.QueueName); err != nil {
+			return nil, err
+		}
+	}
+	minMessageID, err := persistence.GetMinMessageIDToReadForQueueV2(
+		request.QueueType,
+		request.QueueName,
+		request.NextPageToken,
+		queueMetadata,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -230,10 +243,7 @@ func (s *queueV2Store) CreateQueue(
 			queueName,
 		)
 	}
-	s.markKnownQueue(queueType, queueName, &Queue{
-		Metadata: &q,
-		Version:  0,
-	})
+	s.markKnownQueue(queueType, queueName)
 	return &persistence.InternalCreateQueueResponse{}, nil
 }
 
@@ -251,13 +261,9 @@ func (s *queueV2Store) RangeDeleteMessages(
 	}
 	queueType := request.QueueType
 	queueName := request.QueueName
-	q, ok := s.getCachedQueue(queueType, queueName)
-	if !ok {
-		var err error
-		q, err = s.getQueue(ctx, queueType, queueName)
-		if err != nil {
-			return nil, err
-		}
+	q, err := s.getQueue(ctx, queueType, queueName)
+	if err != nil {
+		return nil, err
 	}
 	partition, err := persistence.GetPartitionForQueueV2(queueType, queueName, q.Metadata)
 	if err != nil {
@@ -336,7 +342,7 @@ func (s *queueV2Store) updateQueue(
 			queueName,
 		)
 	}
-	s.markKnownQueue(queueType, queueName, q)
+	s.markKnownQueue(queueType, queueName)
 	return nil
 }
 
@@ -375,61 +381,67 @@ func (s *queueV2Store) getQueue(
 	if err != nil {
 		return nil, err
 	}
-	s.markKnownQueue(queueType, name, q)
+	s.markKnownQueue(queueType, name)
 	return q, nil
 }
 
-func (s *queueV2Store) getCachedQueue(queueType persistence.QueueV2Type, queueName string) (*Queue, bool) {
-	q, ok := s.knownQueues.Load(queueV2Key{
-		queueType: queueType,
-		queueName: queueName,
-	})
-	if !ok {
-		return nil, false
-	}
-	return cloneQueue(q.(*Queue)), true
-}
-
 func (s *queueV2Store) isKnownQueue(queueType persistence.QueueV2Type, queueName string) bool {
-	_, ok := s.knownQueues.Load(queueV2Key{
+	s.knownQueuesMu.RLock()
+	defer s.knownQueuesMu.RUnlock()
+	_, ok := s.knownQueues[queueV2Key{
 		queueType: queueType,
 		queueName: queueName,
-	})
+	}]
 	return ok
 }
 
-func (s *queueV2Store) markKnownQueue(queueType persistence.QueueV2Type, queueName string, queue *Queue) {
-	s.knownQueues.Store(queueV2Key{
+func (s *queueV2Store) markKnownQueue(queueType persistence.QueueV2Type, queueName string) {
+	key := queueV2Key{
 		queueType: queueType,
 		queueName: queueName,
-	}, cloneQueue(queue))
+	}
+	s.knownQueuesMu.Lock()
+	defer s.knownQueuesMu.Unlock()
+	if _, ok := s.knownQueues[key]; ok {
+		return
+	}
+	if len(s.knownQueues) >= queueV2KnownQueuesSize {
+		clear(s.knownQueues)
+	}
+	if s.knownQueues == nil {
+		s.knownQueues = make(map[queueV2Key]struct{})
+	}
+	s.knownQueues[key] = struct{}{}
 }
 
 func (s *queueV2Store) forgetKnownQueue(queueType persistence.QueueV2Type, queueName string) {
-	s.knownQueues.Delete(queueV2Key{
+	s.knownQueuesMu.Lock()
+	defer s.knownQueuesMu.Unlock()
+	delete(s.knownQueues, queueV2Key{
 		queueType: queueType,
 		queueName: queueName,
 	})
 }
 
 func (s *queueV2Store) lockQueue(queueType persistence.QueueV2Type, queueName string) func() {
-	lock, _ := s.queueLocks.LoadOrStore(queueV2Key{
-		queueType: queueType,
-		queueName: queueName,
-	}, &sync.Mutex{})
-	mutex, ok := lock.(*sync.Mutex)
-	if !ok {
-		mutex = &sync.Mutex{}
-	}
+	mutex := &s.queueLocks[queueV2LockIndex(queueType, queueName)]
 	mutex.Lock()
 	return mutex.Unlock
 }
 
-func cloneQueue(queue *Queue) *Queue {
-	return &Queue{
-		Metadata: proto.Clone(queue.Metadata).(*persistencespb.Queue),
-		Version:  queue.Version,
+func queueV2LockIndex(queueType persistence.QueueV2Type, queueName string) uint32 {
+	const (
+		fnvOffset32 = uint32(2166136261)
+		fnvPrime32  = uint32(16777619)
+	)
+	hash := fnvOffset32
+	hash ^= uint32(queueType)
+	hash *= fnvPrime32
+	for i := range len(queueName) {
+		hash ^= uint32(queueName[i])
+		hash *= fnvPrime32
 	}
+	return hash % queueV2LockStripes
 }
 
 func GetQueue(
@@ -531,11 +543,11 @@ func (s *queueV2Store) ListQueues(
 	var queues []persistence.QueueInfo
 	nextPageToken := request.NextPageToken
 	for {
-		queueCount := len(queues)
+		currentPageToken := nextPageToken
 		iter := s.session.Query(
 			templateGetQueueNamesQuery,
 			request.QueueType,
-		).PageSize(request.PageSize - len(queues)).PageState(nextPageToken).WithContext(ctx).Iter()
+		).PageSize(request.PageSize - len(queues)).PageState(currentPageToken).WithContext(ctx).Iter()
 
 		closeIter := func() {
 			_ = iter.Close()
@@ -575,7 +587,11 @@ func (s *queueV2Store) ListQueues(
 			return nil, gocql.ConvertError("QueueV2ListQueues", err)
 		}
 		nextPageToken = iter.PageState()
-		if len(queues) == request.PageSize || len(nextPageToken) == 0 || len(queues) == queueCount {
+		if len(queues) == request.PageSize || len(nextPageToken) == 0 {
+			break
+		}
+		if bytes.Equal(nextPageToken, currentPageToken) {
+			nextPageToken = nil
 			break
 		}
 	}

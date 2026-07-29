@@ -391,6 +391,7 @@ func TestRunBacklogLoadStartsWorkersAfterTasksArePersisted(t *testing.T) {
 	require.Zero(t, result.DrainFailed)
 	require.Zero(t, result.Failed)
 	require.Positive(t, result.EnqueueRequestsPerSec)
+	require.Positive(t, result.WorkerStartElapsed)
 	require.Positive(t, result.DrainWorkflowsPerSec)
 }
 

@@ -3,6 +3,7 @@ package cassandra
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"strings"
@@ -25,7 +26,6 @@ import (
 )
 
 var (
-	benchmarkQueueSink                     *Queue
 	benchmarkExecutionStateSink            []*p.InternalWorkflowMutableState
 	benchmarkConcreteExecutionResponseSink *p.InternalListConcreteExecutionsResponse
 	benchmarkCurrentExecutionResponseSink  *p.InternalGetCurrentExecutionResponse
@@ -207,8 +207,70 @@ func TestListQueuesUsesSameQueryForPageToken(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Empty(t, resp.Queues)
-	require.Equal(t, pageState, resp.NextPageToken)
+	require.Nil(t, resp.NextPageToken)
 	require.Len(t, session.queries, 1)
+}
+
+func TestListQueuesContinuesAcrossEmptyFilteredPage(t *testing.T) {
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: p.FirstQueueMessageID,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
+	firstPageState := []byte("first-page")
+	nextPageState := []byte("next-page")
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			switch stmt {
+			case templateGetQueueNamesQuery:
+				require.Equal(t, []any{p.QueueTypeHistoryDLQ}, args)
+				return &recordingQuery{
+					iterFn: func(q *recordingQuery) cgocql.Iter {
+						switch string(q.pageState) {
+						case "":
+							return &recordingIter{pageState: firstPageState}
+						case string(firstPageState):
+							return &recordingIter{
+								pageState: nextPageState,
+								scanRows: [][]any{
+									{"queue-0", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
+								},
+							}
+						default:
+							t.Fatalf("unexpected page state: %q", q.pageState)
+							return nil
+						}
+					},
+				}
+			case TemplateGetMaxMessageIDQuery:
+				return &recordingQuery{
+					scanFn: func(dest ...any) error {
+						return gocql.ErrNotFound
+					},
+				}
+			default:
+				t.Fatalf("unexpected query: %s", stmt)
+				return nil
+			}
+		},
+	}
+	store := &queueV2Store{session: session}
+
+	resp, err := store.ListQueues(t.Context(), &p.InternalListQueuesRequest{
+		QueueType: p.QueueTypeHistoryDLQ,
+		PageSize:  1,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.Queues, 1)
+	require.Equal(t, "queue-0", resp.Queues[0].QueueName)
+	require.Equal(t, nextPageState, resp.NextPageToken)
+	require.Len(t, session.queries, 3)
 }
 
 func TestListQueuesReturnsIteratorPageState(t *testing.T) {
@@ -575,8 +637,18 @@ func TestGetHistoryNodeTableLayout(t *testing.T) {
 		{
 			name: "unknown",
 			rows: [][]any{
-				{"tree_id", "partition_key", 0},
-				{"node_id", "clustering", 0},
+				{"tree_id", "partition_key", 0, "none"},
+				{"node_id", "clustering", 0, "asc"},
+			},
+			expected: HistoryNodeTableLayoutUnknown,
+		},
+		{
+			name: "wrong-clustering-order",
+			rows: [][]any{
+				{"tree_id", "partition_key", 0, "none"},
+				{"branch_id", "clustering", 0, "asc"},
+				{"node_id", "clustering", 1, "asc"},
+				{"txn_id", "clustering", 2, "asc"},
 			},
 			expected: HistoryNodeTableLayoutUnknown,
 		},
@@ -714,22 +786,22 @@ func historyNodeSchemaRows(layout HistoryNodeTableLayout) [][]any {
 		return nil
 	case HistoryNodeTableLayoutLegacyV1:
 		return [][]any{
-			{"txn_id", "clustering", 2},
-			{"tree_id", "partition_key", 0},
-			{"node_id", "clustering", 1},
-			{"branch_id", "clustering", 0},
-			{"data", "regular", -1},
+			{"txn_id", "clustering", 2, "desc"},
+			{"tree_id", "partition_key", 0, "none"},
+			{"node_id", "clustering", 1, "asc"},
+			{"branch_id", "clustering", 0, "asc"},
+			{"data", "regular", -1, "none"},
 		}
 	case HistoryNodeTableLayoutBranchV2:
 		return [][]any{
-			{"txn_id", "clustering", 1},
-			{"branch_id", "partition_key", 1},
-			{"node_id", "clustering", 0},
-			{"tree_id", "partition_key", 0},
+			{"txn_id", "clustering", 1, "desc"},
+			{"branch_id", "partition_key", 1, "none"},
+			{"node_id", "clustering", 0, "asc"},
+			{"tree_id", "partition_key", 0, "none"},
 		}
 	default:
 		return [][]any{
-			{"tree_id", "partition_key", 0},
+			{"tree_id", "partition_key", 0, "none"},
 		}
 	}
 }
@@ -928,6 +1000,37 @@ func TestGetTaskQueuesByBuildIDDropsRepeatedEmptyPageToken(t *testing.T) {
 	require.Len(t, session.queries, 2)
 	require.Empty(t, session.queries[0].query.pageState)
 	require.Equal(t, pageToken, session.queries[1].query.pageState)
+}
+
+func TestGetTaskQueuesByBuildIDStopsOnRepeatedPageTokenWithRows(t *testing.T) {
+	pageToken := []byte("same-page")
+	queryCalls := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			queryCalls++
+			require.Equal(t, templateListTaskQueueNamesByBuildIdQuery, stmt)
+			require.Equal(t, []any{"namespace-id", "build-id"}, args)
+			return &recordingQuery{
+				iter: &recordingIter{
+					mapRows: []map[string]any{
+						{"task_queue_name": fmt.Sprintf("task-queue-%d", queryCalls)},
+					},
+					pageState: pageToken,
+				},
+			}
+		},
+	}
+	store := userDataStore{Session: session}
+
+	taskQueues, err := store.GetTaskQueuesByBuildId(t.Context(), &p.GetTaskQueuesByBuildIdRequest{
+		NamespaceID: "namespace-id",
+		BuildID:     "build-id",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"task-queue-1", "task-queue-2"}, taskQueues)
+	require.Len(t, session.queries, 2)
 }
 
 func TestListTaskQueueUserDataEntriesClosesIteratorOnRowError(t *testing.T) {
@@ -2353,7 +2456,16 @@ func TestQueueV2EnqueueMessageIDConflictReturnsError(t *testing.T) {
 	require.ErrorIs(t, err, ErrEnqueueMessageConflict)
 }
 
-func TestQueueV2ReadMessagesCachesKnownQueue(t *testing.T) {
+func TestQueueV2ReadMessagesRefreshesQueueMetadata(t *testing.T) {
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 2,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
 	session := &recordingSession{
 		t: t,
 	}
@@ -2366,8 +2478,16 @@ func TestQueueV2ReadMessagesCachesKnownQueue(t *testing.T) {
 				},
 			}
 		case TemplateGetQueueQuery:
-			t.Fatal("read should use queue metadata cache after CreateQueue")
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*[]byte) = queueBytes
+					*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+					*dest[2].(*int64) = 1
+					return nil
+				},
+			}
 		case TemplateGetMessagesQuery:
+			require.Equal(t, int64(2), args[3])
 			return &recordingQuery{
 				iter: &recordingIter{},
 			}
@@ -2378,7 +2498,7 @@ func TestQueueV2ReadMessagesCachesKnownQueue(t *testing.T) {
 	}
 
 	store := NewQueueV2Store(session, log.NewNoopLogger())
-	_, err := store.CreateQueue(t.Context(), &p.InternalCreateQueueRequest{
+	_, err = store.CreateQueue(t.Context(), &p.InternalCreateQueueRequest{
 		QueueType: p.QueueTypeHistoryNormal,
 		QueueName: "test-queue",
 	})
@@ -2391,6 +2511,87 @@ func TestQueueV2ReadMessagesCachesKnownQueue(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{
 		TemplateCreateQueueQuery,
+		TemplateGetQueueQuery,
+		TemplateGetMessagesQuery,
+	}, recordedStatements(session.queries))
+}
+
+func TestQueueV2ReadMessagesKnownQueueContinuationDoesNotReadQueueMetadata(t *testing.T) {
+	session := &recordingSession{t: t}
+	session.queryFn = func(stmt string, args ...any) cgocql.Query {
+		switch stmt {
+		case TemplateGetQueueQuery:
+			t.Fatal("continuation token should make queue metadata unnecessary")
+		case TemplateGetMessagesQuery:
+			require.Equal(t, int64(8), args[3])
+			return &recordingQuery{iter: &recordingIter{}}
+		default:
+			t.Fatalf("unexpected query: %s", stmt)
+		}
+		return nil
+	}
+	store := NewQueueV2Store(session, log.NewNoopLogger()).(*queueV2Store)
+	store.markKnownQueue(p.QueueTypeHistoryNormal, "test-queue")
+	nextPageToken := p.GetNextPageTokenForReadMessages([]p.QueueV2Message{{
+		MetaData: p.MessageMetadata{ID: 7},
+	}})
+
+	_, err := store.ReadMessages(t.Context(), &p.InternalReadMessagesRequest{
+		QueueType:     p.QueueTypeHistoryNormal,
+		QueueName:     "test-queue",
+		PageSize:      100,
+		NextPageToken: nextPageToken,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{TemplateGetMessagesQuery}, recordedStatements(session.queries))
+}
+
+func TestQueueV2ReadMessagesColdContinuationValidatesQueue(t *testing.T) {
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 2,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
+	session := &recordingSession{t: t}
+	session.queryFn = func(stmt string, args ...any) cgocql.Query {
+		switch stmt {
+		case TemplateGetQueueQuery:
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*[]byte) = queueBytes
+					*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+					*dest[2].(*int64) = 1
+					return nil
+				},
+			}
+		case TemplateGetMessagesQuery:
+			require.Equal(t, int64(8), args[3])
+			return &recordingQuery{iter: &recordingIter{}}
+		default:
+			t.Fatalf("unexpected query: %s", stmt)
+		}
+		return nil
+	}
+	store := NewQueueV2Store(session, log.NewNoopLogger())
+	nextPageToken := p.GetNextPageTokenForReadMessages([]p.QueueV2Message{{
+		MetaData: p.MessageMetadata{ID: 7},
+	}})
+
+	_, err = store.ReadMessages(t.Context(), &p.InternalReadMessagesRequest{
+		QueueType:     p.QueueTypeHistoryNormal,
+		QueueName:     "test-queue",
+		PageSize:      100,
+		NextPageToken: nextPageToken,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		TemplateGetQueueQuery,
 		TemplateGetMessagesQuery,
 	}, recordedStatements(session.queries))
 }
@@ -2449,38 +2650,51 @@ func BenchmarkQueueV2CachedQueueLookup(b *testing.B) {
 	store := &queueV2Store{}
 	queueType := p.QueueTypeHistoryNormal
 	queueName := "test-queue"
-	store.markKnownQueue(queueType, queueName, &Queue{
-		Metadata: &persistencespb.Queue{
-			Partitions: map[int32]*persistencespb.QueuePartition{
-				0: {
-					MinMessageId: p.FirstQueueMessageID,
-				},
-			},
-		},
-		Version: 1,
-	})
+	store.markKnownQueue(queueType, queueName)
 
-	b.Run("clone", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			q, _ := store.getCachedQueue(queueType, queueName)
-			benchmarkQueueSink = q
-		}
-	})
-	b.Run("exists", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			benchmarkBoolSink = store.isKnownQueue(queueType, queueName)
-		}
-	})
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkBoolSink = store.isKnownQueue(queueType, queueName)
+	}
 }
 
-func TestQueueV2RangeDeleteUpdatesCachedQueue(t *testing.T) {
+func TestQueueV2KnownQueueCacheIsBounded(t *testing.T) {
+	store := &queueV2Store{}
+	for i := range queueV2KnownQueuesSize {
+		store.markKnownQueue(p.QueueTypeHistoryNormal, fmt.Sprintf("queue-%d", i))
+	}
+	require.Len(t, store.knownQueues, queueV2KnownQueuesSize)
+
+	store.markKnownQueue(p.QueueTypeHistoryNormal, "next-generation")
+
+	require.Len(t, store.knownQueues, 1)
+	require.False(t, store.isKnownQueue(p.QueueTypeHistoryNormal, "queue-0"))
+	require.True(t, store.isKnownQueue(p.QueueTypeHistoryNormal, "next-generation"))
+}
+
+func TestQueueV2LockIndex(t *testing.T) {
+	first := queueV2LockIndex(p.QueueTypeHistoryNormal, "test-queue")
+
+	require.Less(t, first, uint32(queueV2LockStripes))
+	require.Equal(t, first, queueV2LockIndex(p.QueueTypeHistoryNormal, "test-queue"))
+	require.NotEqual(t, first, queueV2LockIndex(p.QueueTypeHistoryDLQ, "test-queue"))
+	require.NotEqual(t, first, queueV2LockIndex(p.QueueTypeHistoryNormal, "other-queue"))
+}
+
+func TestQueueV2RangeDeleteMakesUpdatedMetadataVisibleToReads(t *testing.T) {
 	const queueName = "test-queue"
 	queueBytes, err := (&persistencespb.Queue{
 		Partitions: map[int32]*persistencespb.QueuePartition{
 			0: {
 				MinMessageId: p.FirstQueueMessageID,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+	updatedQueueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 2,
 			},
 		},
 	}).Marshal()
@@ -2497,9 +2711,14 @@ func TestQueueV2RangeDeleteUpdatesCachedQueue(t *testing.T) {
 			require.Equal(t, []any{p.QueueTypeHistoryNormal, queueName}, args)
 			return &recordingQuery{
 				scanFn: func(dest ...any) error {
-					*dest[0].(*[]byte) = queueBytes
+					if getQueueCalls == 1 {
+						*dest[0].(*[]byte) = queueBytes
+						*dest[2].(*int64) = 0
+					} else {
+						*dest[0].(*[]byte) = updatedQueueBytes
+						*dest[2].(*int64) = 1
+					}
 					*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
-					*dest[2].(*int64) = 0
 					return nil
 				},
 			}
@@ -2546,18 +2765,28 @@ func TestQueueV2RangeDeleteUpdatesCachedQueue(t *testing.T) {
 		PageSize:  100,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1, getQueueCalls)
+	require.Equal(t, 2, getQueueCalls)
 	require.Equal(t, []string{
 		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
 		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
+		TemplateGetQueueQuery,
 		TemplateGetMessagesQuery,
 	}, recordedStatements(session.queries))
 }
 
-func TestQueueV2RangeDeleteUsesCachedQueue(t *testing.T) {
+func TestQueueV2RangeDeleteRefreshesQueueMetadataAfterCreate(t *testing.T) {
 	const queueName = "test-queue"
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: p.FirstQueueMessageID,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
 	session := &recordingSession{
 		t: t,
 	}
@@ -2570,7 +2799,14 @@ func TestQueueV2RangeDeleteUsesCachedQueue(t *testing.T) {
 				},
 			}
 		case TemplateGetQueueQuery:
-			t.Fatal("range delete should use queue metadata cache after CreateQueue")
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*[]byte) = queueBytes
+					*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+					*dest[2].(*int64) = 0
+					return nil
+				},
+			}
 		case TemplateGetMaxMessageIDQuery:
 			return &recordingQuery{
 				scanFn: func(dest ...any) error {
@@ -2588,7 +2824,7 @@ func TestQueueV2RangeDeleteUsesCachedQueue(t *testing.T) {
 	}
 
 	store := NewQueueV2Store(session, log.NewNoopLogger())
-	_, err := store.CreateQueue(t.Context(), &p.InternalCreateQueueRequest{
+	_, err = store.CreateQueue(t.Context(), &p.InternalCreateQueueRequest{
 		QueueType: p.QueueTypeHistoryNormal,
 		QueueName: queueName,
 	})
@@ -2604,6 +2840,7 @@ func TestQueueV2RangeDeleteUsesCachedQueue(t *testing.T) {
 	require.Equal(t, int64(2), resp.MessagesDeleted)
 	require.Equal(t, []string{
 		TemplateCreateQueueQuery,
+		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
 		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
