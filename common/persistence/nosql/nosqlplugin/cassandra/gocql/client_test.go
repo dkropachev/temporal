@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/resolver"
+	"go.temporal.io/server/common/util"
 	"go.uber.org/mock/gomock"
 )
 
@@ -180,6 +181,22 @@ func TestNewCassandraCluster(t *testing.T) {
 				authenticator := cluster.Authenticator
 				_, _, err := authenticator.Challenge([]byte("org.apache.cassandra.auth.LDAPAuthenticator"))
 				assert.NoError(t, err)
+			},
+		},
+		"scylla_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr[float32](4),
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.InDelta(t, float32(4), cluster.MaxExcessShardConnectionsRate, 0)
+			},
+		},
+		"scylla_zero_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr[float32](0),
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.InDelta(t, float32(0), cluster.MaxExcessShardConnectionsRate, 0)
 			},
 		},
 	}
