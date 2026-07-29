@@ -267,7 +267,64 @@ func buildCLIOptions() *cli.App {
 				cliHandler(c, validateHealth, logger)
 			},
 		},
+		{
+			Name:  "backfill-history-node-v2",
+			Usage: "copy history_node into the branch-partitioned history_node_v2 table",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, backfillHistoryNodeV2, logger)
+			},
+		},
+		{
+			Name:  "backfill-history-node-v1",
+			Usage: "copy history_node_v2 into the recreated rollback-compatible history_node table",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, backfillHistoryNodeV1, logger)
+			},
+		},
+		{
+			Name:  "recreate-history-node-v2",
+			Usage: "clear and recreate history_node_v2 while history_node is authoritative",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  confirmHistoryNodeSourceRebuildFlag,
+					Usage: "confirm every Temporal process is using an authoritative-source rebuild mode",
+				},
+			},
+			Action: func(c *cli.Context) {
+				cliHandler(c, recreateHistoryNodeV2, logger)
+			},
+		},
+		{
+			Name:  "recreate-history-node-v1",
+			Usage: "replace the old branch-partitioned history_node table with the rollback-compatible V1 layout",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  confirmHistoryNodeV1RebuildFlag,
+					Usage: "confirm every Temporal process is using the authoritative-V2 V1 rebuild mode",
+				},
+			},
+			Action: func(c *cli.Context) {
+				cliHandler(c, recreateHistoryNodeV1, logger)
+			},
+		},
 	}
 
 	return app
+}
+
+func historyNodeBackfillCLIFlags() []cli.Flag {
+	return []cli.Flag{
+		cli.IntFlag{
+			Name:  historyNodeBackfillPageSizeFlag,
+			Value: defaultHistoryNodeBackfillPageSize,
+			Usage: "number of source history rows fetched per page",
+		},
+		cli.IntFlag{
+			Name:  historyNodeBackfillConcurrencyFlag,
+			Value: defaultHistoryNodeBackfillConcurrency,
+			Usage: "maximum concurrent history node writes",
+		},
+	}
 }

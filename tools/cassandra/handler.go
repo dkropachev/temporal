@@ -1,6 +1,7 @@
 package cassandra
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,11 +10,20 @@ import (
 	c "go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
+	persistencecassandra "go.temporal.io/server/common/persistence/cassandra"
 	"go.temporal.io/server/temporal/environment"
 	"go.temporal.io/server/tools/common/schema"
 )
 
-const defaultNumReplicas = 1
+const (
+	defaultNumReplicas                    = 1
+	defaultHistoryNodeBackfillPageSize    = 1000
+	defaultHistoryNodeBackfillConcurrency = 16
+	historyNodeBackfillPageSizeFlag       = "page-size"
+	historyNodeBackfillConcurrencyFlag    = "concurrency"
+	confirmHistoryNodeSourceRebuildFlag   = "confirm-source-rebuild"
+	confirmHistoryNodeV1RebuildFlag       = "confirm-v1-rebuild"
+)
 
 // SetupSchemaConfig contains the configuration params needed to setup schema tables
 type SetupSchemaConfig struct {
@@ -120,6 +130,134 @@ func validateHealth(cli *cli.Context, logger log.Logger) error {
 	}
 
 	defer client.Close()
+	return nil
+}
+
+func backfillHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		logger.Error("Unable to establish CQL session.", tag.Error(err))
+		return err
+	}
+	defer client.Close()
+
+	if err := persistencecassandra.ValidateHistoryNodeV2BackfillSchema(
+		context.Background(),
+		client.session,
+		client.keyspace,
+	); err != nil {
+		logger.Error("History node schema is not valid for V2 backfill.", tag.Error(err))
+		return err
+	}
+	copied, err := persistencecassandra.BackfillHistoryNodeV2(
+		context.Background(),
+		client.session,
+		persistencecassandra.HistoryNodeBackfillOptions{
+			PageSize:    ctx.Int(historyNodeBackfillPageSizeFlag),
+			Concurrency: ctx.Int(historyNodeBackfillConcurrencyFlag),
+		},
+	)
+	if err != nil {
+		logger.Error("Unable to backfill history_node_v2.", tag.Error(err))
+		return err
+	}
+	logger.Info(fmt.Sprintf("Backfilled %d history_node_v2 rows.", copied))
+	return nil
+}
+
+func backfillHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		logger.Error("Unable to establish CQL session.", tag.Error(err))
+		return err
+	}
+	defer client.Close()
+
+	if err := persistencecassandra.ValidateHistoryNodeV1BackfillSchema(
+		context.Background(),
+		client.session,
+		client.keyspace,
+	); err != nil {
+		logger.Error("History node schema is not valid for V1 backfill.", tag.Error(err))
+		return err
+	}
+	copied, err := persistencecassandra.BackfillHistoryNodeV1(
+		context.Background(),
+		client.session,
+		persistencecassandra.HistoryNodeBackfillOptions{
+			PageSize:    ctx.Int(historyNodeBackfillPageSizeFlag),
+			Concurrency: ctx.Int(historyNodeBackfillConcurrencyFlag),
+		},
+	)
+	if err != nil {
+		logger.Error("Unable to backfill history_node.", tag.Error(err))
+		return err
+	}
+	logger.Info(fmt.Sprintf("Backfilled %d history_node rows.", copied))
+	return nil
+}
+
+func recreateHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		logger.Error("Unable to establish CQL session.", tag.Error(err))
+		return err
+	}
+	defer client.Close()
+
+	err = persistencecassandra.RecreateHistoryNodeV1(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		ctx.Bool(confirmHistoryNodeV1RebuildFlag),
+	)
+	if err != nil {
+		logger.Error("Unable to recreate history_node with the V1 layout.", tag.Error(err))
+		return err
+	}
+	logger.Info("history_node has the V1 layout.")
+	return nil
+}
+
+func recreateHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		logger.Error("Unable to establish CQL session.", tag.Error(err))
+		return err
+	}
+	defer client.Close()
+
+	err = persistencecassandra.RecreateHistoryNodeV2(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		ctx.Bool(confirmHistoryNodeSourceRebuildFlag),
+	)
+	if err != nil {
+		logger.Error("Unable to recreate history_node_v2.", tag.Error(err))
+		return err
+	}
+	logger.Info("history_node_v2 has been cleared and recreated.")
 	return nil
 }
 

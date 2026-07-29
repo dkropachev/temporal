@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -86,9 +87,14 @@ type (
 
 var _ p.ExecutionStore = (*ExecutionStore)(nil)
 
-func NewExecutionStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *ExecutionStore {
+func NewExecutionStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	historyNodeMigrationMode ...config.CassandraHistoryNodeMigrationMode,
+) *ExecutionStore {
 	return &ExecutionStore{
-		HistoryStore:          NewHistoryStore(session, serializer),
+		HistoryStore:          NewHistoryStore(session, serializer, historyNodeMigrationMode...),
 		MutableStateStore:     NewMutableStateStore(session, serializer, logger),
 		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer),
 	}

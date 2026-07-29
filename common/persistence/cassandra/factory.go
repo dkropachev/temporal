@@ -1,6 +1,8 @@
 package cassandra
 
 import (
+	"context"
+	"fmt"
 	"sync"
 
 	"github.com/gocql/gocql"
@@ -99,7 +101,19 @@ func (f *Factory) NewClusterMetadataStore() (p.ClusterMetadataStore, error) {
 
 // NewExecutionStore returns a new ExecutionStore.
 func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
-	return NewExecutionStore(f.session, f.serializer, f.logger), nil
+	mode := normalizeHistoryNodeMigrationMode(f.cfg.HistoryNodeMigrationMode)
+	if err := ValidateHistoryNodeMigrationMode(mode); err != nil {
+		return nil, err
+	}
+	if err := ValidateHistoryNodeMigrationModeSchema(
+		context.TODO(),
+		f.session,
+		f.cfg.Keyspace,
+		mode,
+	); err != nil {
+		return nil, fmt.Errorf("validate Cassandra history node migration schema: %w", err)
+	}
+	return NewExecutionStore(f.session, f.serializer, f.logger, mode), nil
 }
 
 // NewQueue returns a new queue backed by cassandra

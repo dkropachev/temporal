@@ -40,3 +40,15 @@ You can only upgrade to a new version after the initial setup done above.
 ./temporal-cassandra-tool -ep 127.0.0.1 -k temporal update-schema -d ./schema/cassandra/temporal/versioned -v x.x    -- executes the upgrade to version x.x
 ```
 
+### History node online migration
+
+The history primary-key migration uses explicit Temporal configuration modes. See
+[`docs/development/scylla-cassandra-performance.md`](../../docs/development/scylla-cassandra-performance.md#history-upgrade-from-v1)
+for the required rollout order.
+
+```bash
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal recreate-history-node-v2 --confirm-source-rebuild
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v2 --page-size 1000 --concurrency 16
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal recreate-history-node-v1 --confirm-v1-rebuild
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v1 --page-size 1000 --concurrency 16
+```
