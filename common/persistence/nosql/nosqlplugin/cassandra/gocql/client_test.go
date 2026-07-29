@@ -9,6 +9,7 @@ import (
 
 	"github.com/gocql/gocql"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/resolver"
@@ -24,6 +25,25 @@ func TestNewCassandraCluster(t *testing.T) {
 		"emptyConfig": {
 			cfg: config.Cassandra{},
 			err: nil,
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.Equal(t, 6000, cluster.MaxPreparedStmts)
+			},
+		},
+		"max_prepared_stmts": {
+			cfg: config.Cassandra{
+				MaxPreparedStmts: 1234,
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.Equal(t, 1234, cluster.MaxPreparedStmts)
+			},
+		},
+		"max_prepared_stmts_negative_uses_default": {
+			cfg: config.Cassandra{
+				MaxPreparedStmts: -1,
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.Equal(t, 6000, cluster.MaxPreparedStmts)
+			},
 		},
 		"caCert_badBase64": {
 			cfg: config.Cassandra{

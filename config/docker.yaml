@@ -30,6 +30,7 @@ persistence:
                 {{- end }}
                 port: {{ default "9042" (env "CASSANDRA_PORT") }}
                 maxConns: {{ default "20" (env "CASSANDRA_MAX_CONNS") }}
+                maxPreparedStmts: {{ default "6000" (env "CASSANDRA_MAX_PREPARED_STMTS") }}
                 tls:
                     enabled: {{ default "false" (env "CASSANDRA_TLS_ENABLED") }}
                     caFile: {{ env "CASSANDRA_CA" }}
