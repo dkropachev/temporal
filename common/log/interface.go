@@ -49,3 +49,13 @@ type (
 	SnTaggedLogger  Logger
 	ThrottledLogger Logger
 )
+
+type debugLevelEnabler interface {
+	DebugEnabled() bool
+}
+
+// IsDebugEnabled reports whether logger can emit debug entries. Unknown logger implementations default to true.
+func IsDebugEnabled(logger Logger) bool {
+	enabler, ok := logger.(debugLevelEnabler)
+	return !ok || enabler.DebugEnabled()
+}

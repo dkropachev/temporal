@@ -53,6 +53,7 @@ func (a *taskKeyGenerator) setTaskKeys(
 	taskMaps ...map[tasks.Category][]tasks.Task,
 ) error {
 	now := a.timeSource.Now()
+	debugEnabled := log.IsDebugEnabled(a.logger)
 	// TODO: Truncation here is just to make sure task scheduled time has the same precision as the old logic.
 	// Remove this truncation once we validate the rest of the code can worker correctly with higher precision.
 	a.setTaskMinScheduledTime(now.Truncate(common.ScheduledTaskMinPrecision))
@@ -78,16 +79,18 @@ func (a *taskKeyGenerator) setTaskKeys(
 						Truncate(common.ScheduledTaskMinPrecision)
 
 					if taskScheduledTime.Before(a.taskMinScheduledTime) {
-						a.logger.Debug("New timer generated is less than min scheduled time",
-							tag.WorkflowNamespaceID(task.GetNamespaceID()),
-							tag.WorkflowID(task.GetWorkflowID()),
-							tag.WorkflowRunID(task.GetRunID()),
-							tag.TaskType(task.GetType()),
-							tag.TaskID(id),
-							tag.Timestamp(taskScheduledTime),
-							tag.CursorTimestamp(a.taskMinScheduledTime),
-							tag.ValueShardAllocateTimerBeforeRead,
-						)
+						if debugEnabled {
+							a.logger.Debug("New timer generated is less than min scheduled time",
+								tag.WorkflowNamespaceID(task.GetNamespaceID()),
+								tag.WorkflowID(task.GetWorkflowID()),
+								tag.WorkflowRunID(task.GetRunID()),
+								tag.TaskType(task.GetType()),
+								tag.TaskID(id),
+								tag.Timestamp(taskScheduledTime),
+								tag.CursorTimestamp(a.taskMinScheduledTime),
+								tag.ValueShardAllocateTimerBeforeRead,
+							)
+						}
 						// Theoritically we don't need to add the extra 1ms.
 						// Guess it's just to be extra safe here.
 						taskScheduledTime = a.taskMinScheduledTime.Add(common.ScheduledTaskMinPrecision)
@@ -95,15 +98,17 @@ func (a *taskKeyGenerator) setTaskKeys(
 				}
 				task.SetVisibilityTime(taskScheduledTime)
 
-				a.logger.Debug("Assigning new task key",
-					tag.WorkflowNamespaceID(task.GetNamespaceID()),
-					tag.WorkflowID(task.GetWorkflowID()),
-					tag.WorkflowRunID(task.GetRunID()),
-					tag.TaskType(task.GetType()),
-					tag.TaskID(id),
-					tag.Timestamp(task.GetVisibilityTime()),
-					tag.CursorTimestamp(a.taskMinScheduledTime),
-				)
+				if debugEnabled {
+					a.logger.Debug("Assigning new task key",
+						tag.WorkflowNamespaceID(task.GetNamespaceID()),
+						tag.WorkflowID(task.GetWorkflowID()),
+						tag.WorkflowRunID(task.GetRunID()),
+						tag.TaskType(task.GetType()),
+						tag.TaskID(id),
+						tag.Timestamp(task.GetVisibilityTime()),
+						tag.CursorTimestamp(a.taskMinScheduledTime),
+					)
+				}
 			}
 		}
 	}

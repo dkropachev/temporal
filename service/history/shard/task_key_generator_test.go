@@ -167,3 +167,45 @@ func (s *taskKeyGeneratorSuite) TestPeekAndGenerateTaskKey() {
 	s.NoError(err)
 	s.Zero(nextKey.CompareTo(generatedKey))
 }
+
+func BenchmarkTaskKeyGeneratorSetTaskKeysInfoLogging(b *testing.B) {
+	const (
+		rangeSizeBits = 60
+		taskCount     = 100
+	)
+
+	timeSource := clock.NewEventTimeSource()
+	now := time.Now()
+	timeSource.Update(now)
+	logger := log.NewZapLogger(log.BuildZapLogger(log.Config{Level: "info"}))
+	var rangeID int64 = 1
+	var generator *taskKeyGenerator
+	generator = newTaskKeyGenerator(
+		rangeSizeBits,
+		timeSource,
+		logger,
+		func() error {
+			rangeID++
+			generator.setRangeID(rangeID)
+			return nil
+		},
+	)
+	generator.setRangeID(rangeID)
+
+	transferTasks := make([]tasks.Task, taskCount)
+	for i := range transferTasks {
+		transferTasks[i] = tasks.NewFakeTask(
+			tests.WorkflowKey,
+			tasks.CategoryTransfer,
+			now,
+		)
+	}
+	taskMap := map[tasks.Category][]tasks.Task{
+		tasks.CategoryTransfer: transferTasks,
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		require.NoError(b, generator.setTaskKeys(taskMap))
+	}
+}

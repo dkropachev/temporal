@@ -41,6 +41,15 @@ func (s *LogSuite) TestParseLogLevel() {
 	s.Equal(zap.InfoLevel, ParseZapLevel("unknown"))
 }
 
+func TestIsDebugEnabled(t *testing.T) {
+	require.True(t, IsDebugEnabled(NewZapLogger(BuildZapLogger(Config{Level: "debug"}))))
+	require.False(t, IsDebugEnabled(NewZapLogger(BuildZapLogger(Config{Level: "info"}))))
+	require.False(t, IsDebugEnabled(NewNoopLogger()))
+
+	unknownLogger := struct{ Logger }{Logger: NewNoopLogger()}
+	require.True(t, IsDebugEnabled(unknownLogger))
+}
+
 func (s *LogSuite) TestNewLogger() {
 	dir := testutils.MkdirTemp(s.T(), "", "config.testNewLogger")
 

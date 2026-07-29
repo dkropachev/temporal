@@ -14,6 +14,7 @@ func NewNoopLogger() *noopLogger {
 }
 
 func (n *noopLogger) Debug(string, ...tag.Tag)  {}
+func (n *noopLogger) DebugEnabled() bool        { return false }
 func (n *noopLogger) Info(string, ...tag.Tag)   {}
 func (n *noopLogger) Warn(string, ...tag.Tag)   {}
 func (n *noopLogger) Error(string, ...tag.Tag)  {}
