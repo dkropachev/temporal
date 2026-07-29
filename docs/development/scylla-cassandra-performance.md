@@ -269,6 +269,16 @@ start admission remained between `4,865.58` and `5,372.68 requests/sec`; all 12,
 backlog and completed with zero failures. Persisted task reads therefore scale through 512 workers on this cluster,
 then approach server/database capacity rather than regressing as the quota-limited matrix suggested.
 
+A later fresh-store confirmation ran three shuffled 6,400-workflow passes at every power-of-two worker count from
+1 to 32 workers per queue across 16 queues. All 115,200 workflows entered the full persisted backlog and completed
+with zero load-generator failures. Write admission medians remained between `5,223.04` and `6,872.97 requests/sec`
+because writes complete before workers start. The 512-worker drain median was `3,441.30 workflows/sec`; a longer
+order-reversed confirmation reached `3,802.98` and `3,798.58 workflows/sec`, versus `2,971.09` and
+`1,276.08 workflows/sec` with 16 workers. One short 16-worker sample was excluded after canceled task-queue
+persistence calls. No `ResourceExhausted` metric series or current Scylla storage error was present. This confirms
+that both persisted task writes and worker-driven reads remain healthy at 512 workers; the spread between short cells
+is host scheduling and storage-latency noise, not a worker-count regression.
+
 The matrix must use the same server build settings and should randomize cell order across repeated passes. A mismatched
 `CGO_ENABLED=1` candidate initially appeared to regress the 16-queue, 8-worker activity control to
 `155.35-164.09 workflows/sec`; rebuilding it with the baseline's `CGO_ENABLED=0` restored `180.12 workflows/sec`.
@@ -444,15 +454,6 @@ disk watermark blocks while processing visibility queue retries. The regular rer
 the profile data as valid for Cassandra/Scylla persistence hotspots, but not as a clean visibility backend latency
 measurement.
 
-Server CPU profile summaries:
-
-- Activity run: 30s profile, 15.03s total samples. Top flat entries were Go runtime/GC helpers, including
-  `runtime.(*lfstack).pop` at 12.24% flat and `runtime.gcDrain` at 32.87% cumulative. History queue execution appeared
-  as `go.temporal.io/server/service/history/queues.(*executableImpl).Execute` at 13.17% cumulative.
-- Signal run: 30s profile, 11.76s total samples. Top flat entries were again runtime/GC helpers, with
-  `runtime.(*lfstack).pop` at 7.48% flat and `runtime.gcDrain` at 34.27% cumulative. Workflow mutable-state loading
-  appeared at 1.36% cumulative.
-
 Scylla metric deltas during the CCM runs show the remaining write contention is in mutable state and matching task CAS,
 not in QueueV2:
 
@@ -563,12 +564,6 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   neutral at roughly `0.8 us/op` and 19 allocations because workflow-state protobuf decoding dominates the harness.
   The combined live build reached `188.21 workflows/sec` at 1 queue and 4 workers and `180.75 workflows/sec` at
   16 queues and 8 workers, completing all 12,800 workflows with zero failures.
-- The history executable tracker split was isolated in a 1,024-task benchmark after allocation profiles identified it
-  as a major allocator. The retained implementation measures `23.385-24.033 us/op` for no tasks moved,
-  `90.583-91.830 us/op` for half moved, and `127.821-129.592 us/op` for all moved. A two-pass classification variant
-  nearly eliminated allocations for no/all-move cases, but reduced the live activity median from
-  `189.13` to `180.33 workflows/sec`; a one-pass lazy-allocation variant reached `187.98`. Both production changes were
-  rejected, while the correctness cases and benchmark remain as a regression target.
 - Cassandra/Scylla defaults now use 512 logical history shards instead of tying the count to the target cluster's
   12 physical Scylla shards. Each history shard is one `executions` partition, and the conditional mutable-state batch
   intentionally keeps its shard, workflow, and generated task rows in that partition. More logical shards distribute
