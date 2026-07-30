@@ -12,7 +12,7 @@ The Matching Service instance responds by sending Workflow Tasks and Activity Ta
 A single Task Queue is responsible for delivering tasks relating to many Workflow Executions.
 
 ### Task Queue Partitions
-Matching Service splits Task Queues into partitions to provide higher throughput overall. Default is 4, but there can be less or more. Partition ownership can be reassigned, and partitions' metadata and task backlog can be loaded/unloaded from storage.
+Matching Service splits Task Queues into partitions to provide higher throughput overall. Writes default to 1 partition while readers cover 4 during the staged default reduction, and both counts are configurable. Partition ownership can be reassigned, and partitions' metadata and task backlog can be loaded/unloaded from storage.
 
 When throughput of tasks is low or polling by workers is rare, a polling worker can be "forwarded" from an empty partition to its parent partition. This is also true for a task on a partition which is not being polled, the task can be "forwarded" to a parent partition, hoping to find a poller. For small numbers of partitions, the root partition is the direct parent of all children, but with more partitions, the parent relationship forms a tree of depth > 2, converging at the root partition. If a root partition of a Task Queue is loaded, this will force all other partitions of that Task Queue to also load. This ensures that forwarding can occur between a child partition with a task in its backlog and a long-awaited poller.
 

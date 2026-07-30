@@ -647,19 +647,21 @@ func (m *executionManagerImpl) readRawHistoryBranch(
 	}
 	branchID := currentBranch.GetBranchId()
 	resp, err := m.persistence.ReadHistoryBranch(ctx, &InternalReadHistoryBranchRequest{
-		BranchToken:   branchToken,
-		ShardID:       shardID,
-		BranchID:      branchID,
-		MinNodeID:     minNodeID,
-		MaxNodeID:     maxNodeID,
-		NextPageToken: token.StoreToken,
-		PageSize:      pageSize,
-		MetadataOnly:  metadataOnly,
+		BranchToken:           branchToken,
+		ShardID:               shardID,
+		BranchID:              branchID,
+		MinNodeID:             minNodeID,
+		MaxNodeID:             maxNodeID,
+		NextPageToken:         token.StoreToken,
+		NextPageTokenMetadata: token.StoreTokenMetadata,
+		PageSize:              pageSize,
+		MetadataOnly:          metadataOnly,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	token.StoreToken = resp.NextPageToken
+	token.StoreTokenMetadata = resp.NextPageTokenMetadata
 	return resp.Nodes, token, nil
 }
 
@@ -707,20 +709,22 @@ func (m *executionManagerImpl) readRawHistoryBranchReverse(
 	branchID := currentBranch.GetBranchId()
 
 	resp, err := m.persistence.ReadHistoryBranch(ctx, &InternalReadHistoryBranchRequest{
-		BranchToken:   branchToken,
-		ShardID:       shardID,
-		BranchID:      branchID,
-		MinNodeID:     minNodeID,
-		MaxNodeID:     maxNodeID,
-		NextPageToken: token.StoreToken,
-		PageSize:      pageSize,
-		MetadataOnly:  metadataOnly,
-		ReverseOrder:  true,
+		BranchToken:           branchToken,
+		ShardID:               shardID,
+		BranchID:              branchID,
+		MinNodeID:             minNodeID,
+		MaxNodeID:             maxNodeID,
+		NextPageToken:         token.StoreToken,
+		NextPageTokenMetadata: token.StoreTokenMetadata,
+		PageSize:              pageSize,
+		MetadataOnly:          metadataOnly,
+		ReverseOrder:          true,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	token.StoreToken = resp.NextPageToken
+	token.StoreTokenMetadata = resp.NextPageTokenMetadata
 	return resp.Nodes, token, nil
 }
 
@@ -1121,6 +1125,7 @@ func (m *executionManagerImpl) serializeToken(
 ) ([]byte, error) {
 
 	if len(pagingToken.StoreToken) == 0 {
+		pagingToken.StoreTokenMetadata = nil
 		if pagingToken.CurrentRangeIndex == pagingToken.FinalRangeIndex {
 			// this means that we have reached the final page of final branchRange
 			return nil, nil

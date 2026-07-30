@@ -300,7 +300,7 @@ func (d *MutableStateTaskStore) getTransferTasks(
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetHistoryTasksResponse{
-		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
 	}
 	var taskID int64
 	var data []byte
@@ -383,7 +383,7 @@ func (d *MutableStateTaskStore) getTimerTasks(
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetHistoryTasksResponse{
-		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
 	}
 	var timestamp time.Time
 	var taskID int64
@@ -640,7 +640,7 @@ func (d *MutableStateTaskStore) getVisibilityTasks(
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetHistoryTasksResponse{
-		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
 	}
 	var taskID int64
 	var data []byte
@@ -771,7 +771,7 @@ func (d *MutableStateTaskStore) getHistoryImmedidateTasks(
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetHistoryTasksResponse{
-		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
 	}
 	var taskID int64
 	var data []byte
@@ -820,7 +820,7 @@ func (d *MutableStateTaskStore) getHistoryScheduledTasks(
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetHistoryTasksResponse{
-		Tasks: make([]p.InternalHistoryTask, 0, nonNegativeCapacity(request.BatchSize)),
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
 	}
 	var timestamp time.Time
 	var taskID int64

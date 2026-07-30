@@ -576,6 +576,158 @@ func TestHistoryNodeMigrationModeRoutesQueries(t *testing.T) {
 	}
 }
 
+func TestAppendHistoryNodesWritesMirrorOutsideBatch(t *testing.T) {
+	events := []byte("events")
+	session := &recordingSession{
+		t: t,
+		queryFn: func(string, ...any) cgocql.Query {
+			return &recordingQuery{}
+		},
+	}
+	store := NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+
+	err := store.AppendHistoryNodes(t.Context(), testHistoryNodeAppendRequest(events))
+
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		v2templateUpsertHistoryNode,
+		v2templateUpsertHistoryNodeV2,
+	}, recordedStatements(session.queries))
+	require.Equal(t, events, session.queries[0].args[5])
+	require.Equal(t, events, session.queries[1].args[5])
+}
+
+func TestAppendHistoryNodesDualWriteFailureHandling(t *testing.T) {
+	testCases := []struct {
+		name           string
+		mode           config.CassandraHistoryNodeMigrationMode
+		failureQuery   string
+		failure        error
+		wantError      bool
+		wantStatements []string
+	}{
+		{
+			name:         "primary failure stops before mirror",
+			mode:         config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+			failureQuery: v2templateUpsertHistoryNode,
+			failure:      errors.New("primary failed"),
+			wantError:    true,
+			wantStatements: []string{
+				v2templateUpsertHistoryNode,
+			},
+		},
+		{
+			name:         "required mirror failure is returned",
+			mode:         config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+			failureQuery: v2templateUpsertHistoryNodeV2,
+			failure:      errors.New("mirror failed"),
+			wantError:    true,
+			wantStatements: []string{
+				v2templateUpsertHistoryNode,
+				v2templateUpsertHistoryNodeV2,
+			},
+		},
+		{
+			name:         "missing optional mirror is ignored",
+			mode:         config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+			failureQuery: v2templateUpsertHistoryNodeV2,
+			failure: historyNodeRequestError{
+				code:    gocql.ErrCodeInvalid,
+				message: "unconfigured table history_node_v2",
+			},
+			wantStatements: []string{
+				v2templateUpsertHistoryNode,
+				v2templateUpsertHistoryNodeV2,
+			},
+		},
+		{
+			name:         "other optional mirror failure is returned",
+			mode:         config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+			failureQuery: v2templateUpsertHistoryNodeV2,
+			failure:      errors.New("mirror failed"),
+			wantError:    true,
+			wantStatements: []string{
+				v2templateUpsertHistoryNode,
+				v2templateUpsertHistoryNodeV2,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &recordingSession{
+				t: t,
+				queryFn: func(stmt string, _ ...any) cgocql.Query {
+					return &recordingQuery{
+						execFn: func() error {
+							if stmt == tc.failureQuery {
+								return tc.failure
+							}
+							return nil
+						},
+					}
+				},
+			}
+			store := NewHistoryStore(session, serialization.NewSerializer(), tc.mode)
+
+			err := store.AppendHistoryNodes(t.Context(), testHistoryNodeAppendRequest([]byte("events")))
+
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.wantStatements, recordedStatements(session.queries))
+		})
+	}
+}
+
+func TestAppendHistoryNodesRetryRepairsRequiredMirror(t *testing.T) {
+	persisted := make(map[string]bool)
+	mirrorAttempts := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, _ ...any) cgocql.Query {
+			return &recordingQuery{
+				execFn: func() error {
+					if stmt == v2templateUpsertHistoryNodeV2 {
+						mirrorAttempts++
+						if mirrorAttempts == 1 {
+							return errors.New("mirror failed")
+						}
+					}
+					persisted[stmt] = true
+					return nil
+				},
+			}
+		},
+	}
+	store := NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+	request := testHistoryNodeAppendRequest([]byte("events"))
+
+	require.Error(t, store.AppendHistoryNodes(t.Context(), request))
+	require.True(t, persisted[v2templateUpsertHistoryNode])
+	require.False(t, persisted[v2templateUpsertHistoryNodeV2])
+
+	require.NoError(t, store.AppendHistoryNodes(t.Context(), request))
+	require.True(t, persisted[v2templateUpsertHistoryNode])
+	require.True(t, persisted[v2templateUpsertHistoryNodeV2])
+	require.Equal(t, []string{
+		v2templateUpsertHistoryNode,
+		v2templateUpsertHistoryNodeV2,
+		v2templateUpsertHistoryNode,
+		v2templateUpsertHistoryNodeV2,
+	}, recordedStatements(session.queries))
+}
+
 func TestHistoryNodeMigrationModeRejectsUnknownMode(t *testing.T) {
 	mode := config.CassandraHistoryNodeMigrationMode("invalid")
 	require.Error(t, ValidateHistoryNodeMigrationMode(mode))
@@ -2102,6 +2254,11 @@ func TestReadHistoryBranchUsesReturnedRowCountAndPageTokenAfterScan(t *testing.T
 
 	require.NoError(t, err)
 	require.Equal(t, pageToken, response.NextPageToken)
+	require.Equal(
+		t,
+		encodeHistoryNodePageTokenMetadata(historyNodeReadLayoutLegacyV1),
+		response.NextPageTokenMetadata,
+	)
 	require.Len(t, response.Nodes, 1)
 	require.Equal(t, 1, cap(response.Nodes))
 }
@@ -2993,6 +3150,33 @@ type recordedQuery struct {
 	stmt  string
 	args  []any
 	query *recordingQuery
+}
+
+type historyNodeRequestError struct {
+	code    int
+	message string
+}
+
+func (e historyNodeRequestError) Code() int       { return e.code }
+func (e historyNodeRequestError) Message() string { return e.message }
+func (e historyNodeRequestError) Error() string   { return e.message }
+
+func testHistoryNodeAppendRequest(events []byte) *p.InternalAppendHistoryNodesRequest {
+	return &p.InternalAppendHistoryNodesRequest{
+		BranchInfo: &persistencespb.HistoryBranch{
+			TreeId:   "11111111-1111-1111-1111-111111111111",
+			BranchId: "22222222-2222-2222-2222-222222222222",
+		},
+		Node: p.InternalHistoryNode{
+			NodeID:            10,
+			PrevTransactionID: 9,
+			TransactionID:     11,
+			Events: &commonpb.DataBlob{
+				Data:         events,
+				EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+			},
+		},
+	}
 }
 
 type recordingSession struct {

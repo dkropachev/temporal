@@ -6,9 +6,16 @@ import (
 	"go.temporal.io/server/common/primitives"
 )
 
-const GlobalDefaultNumTaskQueuePartitions = 1
+// GlobalDefaultNumTaskQueuePartitions keeps readers on existing partitions while writes drain to partition zero.
+const GlobalDefaultNumTaskQueuePartitions = 4
 
-var defaultNumTaskQueuePartitions = []TypedConstrainedValue[int]{
+var defaultNumTaskQueueWritePartitions = []TypedConstrainedValue[int]{
+	{
+		Value: 1,
+	},
+}
+
+var defaultNumTaskQueueReadPartitions = []TypedConstrainedValue[int]{
 	// The per-ns worker task queue in all namespaces should only have one partition, since
 	// we'll only run one worker per task queue.
 	{

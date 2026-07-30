@@ -395,6 +395,56 @@ func TestRunBacklogLoadStartsWorkersAfterTasksArePersisted(t *testing.T) {
 	require.Positive(t, result.DrainWorkflowsPerSec)
 }
 
+func TestRunBacklogLoadIncludesWorkerStartupInDrainElapsed(t *testing.T) {
+	starter := func(context.Context, client.Client, runConfig, []byte, int64, int) (client.WorkflowRun, error) {
+		return &fakeWorkflowRun{
+			id:     "workflow",
+			getErr: func() error { return nil },
+		}, nil
+	}
+	waiter := func(_ context.Context, _ client.Client, _ runConfig, expected int64) (int64, error) {
+		return expected, nil
+	}
+	workerStart := make(chan struct{})
+	releaseWorkerStart := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseWorkerStart:
+		default:
+			close(releaseWorkerStart)
+		}
+	})
+	startWorkers := func(client.Client, runConfig) ([]worker.Worker, error) {
+		close(workerStart)
+		<-releaseWorkerStart
+		return nil, nil
+	}
+	type backlogLoadOutcome struct {
+		result runResult
+		err    error
+	}
+	resultCh := make(chan backlogLoadOutcome, 1)
+	go func() {
+		result, _, err := runBacklogLoadWithDependencies(t.Context(), nil, runConfig{
+			workflows:            1,
+			concurrency:          1,
+			backlogBeforeWorkers: true,
+		}, starter, waiter, startWorkers)
+		resultCh <- backlogLoadOutcome{result: result, err: err}
+	}()
+
+	<-workerStart
+	workerStartBlockedAt := time.Now()
+	require.Eventually(t, func() bool {
+		return time.Since(workerStartBlockedAt) >= 50*time.Millisecond
+	}, time.Second, time.Millisecond)
+	close(releaseWorkerStart)
+	outcome := <-resultCh
+
+	require.NoError(t, outcome.err)
+	require.GreaterOrEqual(t, outcome.result.DrainElapsed, outcome.result.WorkerStartElapsed)
+}
+
 func TestRunBacklogLoadReportsEnqueueAndDrainFailures(t *testing.T) {
 	starter := func(_ context.Context, _ client.Client, _ runConfig, _ []byte, _ int64, index int) (client.WorkflowRun, error) {
 		if index == 0 {
@@ -594,6 +644,7 @@ func TestWriteRunMetadata(t *testing.T) {
 	t.Setenv("CASSANDRA_SEEDS", "node1,node2,node3")
 	t.Setenv("CASSANDRA_MAX_CONNS", "12")
 	t.Setenv("CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE", "2")
+	t.Setenv("CASSANDRA_MAX_PREPARED_STMTS", "1000")
 
 	outputPath := t.TempDir() + "/metadata.json"
 	require.NoError(t, writeRunMetadata(t.Context(), runConfig{
@@ -624,6 +675,7 @@ func TestWriteRunMetadata(t *testing.T) {
 	metadata.StartedAt = time.Time{}
 	require.Equal(t, "12", metadata.Environment["CASSANDRA_MAX_CONNS"])
 	require.Equal(t, "2", metadata.Environment["CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE"])
+	require.Equal(t, "1000", metadata.Environment["CASSANDRA_MAX_PREPARED_STMTS"])
 	require.Equal(t, "node1,node2,node3", metadata.Environment["CASSANDRA_SEEDS"])
 	metadata.Environment = nil
 	require.Equal(t, runMetadata{

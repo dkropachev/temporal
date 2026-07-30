@@ -561,6 +561,7 @@ func runBacklogLoadWithDependencies(
 		return result, nil, err
 	}
 
+	drainStart := time.Now()
 	workerStart := time.Now()
 	workers, err := startWorkers(c, cfg)
 	result.WorkerStartElapsed = time.Since(workerStart)
@@ -568,7 +569,6 @@ func runBacklogLoadWithDependencies(
 		return result, nil, err
 	}
 
-	drainStart := time.Now()
 	completed := drainWorkflowBacklog(ctx, enqueueResult.runs, cfg.concurrency)
 	result.DrainElapsed = time.Since(drainStart)
 	result.Completed = completed
@@ -813,6 +813,7 @@ func selectedEnvironment() map[string]string {
 		"CASSANDRA_SEEDS",
 		"CASSANDRA_MAX_CONNS",
 		"CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE",
+		"CASSANDRA_MAX_PREPARED_STMTS",
 		"CASSANDRA_USER",
 		"DB",
 		"GOMAXPROCS",

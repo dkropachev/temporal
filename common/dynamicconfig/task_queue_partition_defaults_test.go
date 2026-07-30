@@ -9,7 +9,12 @@ import (
 )
 
 func TestDefaultNumTaskQueuePartitions(t *testing.T) {
-	require.Equal(t, 1, GlobalDefaultNumTaskQueuePartitions)
+	require.Equal(t, 4, GlobalDefaultNumTaskQueuePartitions)
+	require.Equal(t, []TypedConstrainedValue[int]{
+		{
+			Value: 1,
+		},
+	}, defaultNumTaskQueueWritePartitions)
 	require.Equal(t, []TypedConstrainedValue[int]{
 		{
 			Constraints: Constraints{
@@ -39,16 +44,16 @@ func TestDefaultNumTaskQueuePartitions(t *testing.T) {
 			Value: 1,
 		},
 		{
-			Value: 1,
+			Value: 4,
 		},
-	}, defaultNumTaskQueuePartitions)
+	}, defaultNumTaskQueueReadPartitions)
 
 	collection := NewNoopCollection()
 	writePartitions := MatchingNumTaskqueueWritePartitions.Get(collection)
 	readPartitions := MatchingNumTaskqueueReadPartitions.Get(collection)
 
 	require.Equal(t, 1, writePartitions("default", "hot-queue", enumspb.TASK_QUEUE_TYPE_ACTIVITY))
-	require.Equal(t, 1, readPartitions("default", "hot-queue", enumspb.TASK_QUEUE_TYPE_ACTIVITY))
+	require.Equal(t, 4, readPartitions("default", "hot-queue", enumspb.TASK_QUEUE_TYPE_ACTIVITY))
 	require.Equal(t, 1, writePartitions("default", primitives.PerNSWorkerTaskQueue, enumspb.TASK_QUEUE_TYPE_ACTIVITY))
 	require.Equal(t, 1, readPartitions(primitives.SystemLocalNamespace, primitives.AddSearchAttributesActivityTQ, enumspb.TASK_QUEUE_TYPE_ACTIVITY))
 }

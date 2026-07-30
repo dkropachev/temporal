@@ -1090,7 +1090,7 @@ func (d *MutableStateStore) ListConcreteExecutions(
 	iter := query.PageSize(request.PageSize).PageState(request.PageToken).Iter()
 
 	response := &p.InternalListConcreteExecutionsResponse{
-		States: make([]*p.InternalWorkflowMutableState, 0, nonNegativeCapacity(request.PageSize)),
+		States: make([]*p.InternalWorkflowMutableState, 0, preallocatedResultCapacity(request.PageSize)),
 	}
 	closeIterator := func() error {
 		if err := iter.Close(); err != nil {

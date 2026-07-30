@@ -159,7 +159,7 @@ func (d *matchingTaskStoreV2) GetTasks(
 	iter := query.WithContext(ctx).PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalGetTasksResponse{
-		Tasks: make([]*commonpb.DataBlob, 0, nonNegativeCapacity(request.PageSize)),
+		Tasks: make([]*commonpb.DataBlob, 0, preallocatedResultCapacity(request.PageSize)),
 	}
 	closeIterator := func() error {
 		if err := iter.Close(); err != nil {

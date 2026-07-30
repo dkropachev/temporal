@@ -6,6 +6,9 @@ import (
 	"github.com/gocql/gocql"
 )
 
+// Limit speculative allocations because page sizes can originate from user requests.
+const maxPreallocatedResultCapacity = 1000
+
 type (
 	// FieldNotFoundError is an error type returned when an untyped query return does not contain the expected fields.
 	FieldNotFoundError struct {
@@ -67,11 +70,8 @@ func getTypedFieldFromRow[T any](fieldName string, row map[string]any) (T, error
 	return typed, nil
 }
 
-func nonNegativeCapacity(size int) int {
-	if size < 0 {
-		return 0
-	}
-	return size
+func preallocatedResultCapacity(size int) int {
+	return min(max(size, 0), maxPreallocatedResultCapacity)
 }
 
 func (n *nullableInt64) UnmarshalCQL(info gocql.TypeInfo, data []byte) error {
