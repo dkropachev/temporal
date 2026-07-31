@@ -50,6 +50,7 @@ type (
 		workersPerTaskQueue   int
 		workflows             int
 		concurrency           int
+		targetRPS             float64
 		activitiesEach        int
 		signalsEach           int
 		eagerStart            bool
@@ -99,6 +100,10 @@ type (
 		WorkflowsPerSec          float64       `json:"workflowsPerSec"`
 		Requests                 int64         `json:"requests"`
 		RequestsPerSec           float64       `json:"requestsPerSec"`
+		TargetWorkflowsPerSec    float64       `json:"targetWorkflowsPerSec,omitempty"`
+		WorkflowLatencyP50       time.Duration `json:"workflowLatencyP50,omitempty"`
+		WorkflowLatencyP95       time.Duration `json:"workflowLatencyP95,omitempty"`
+		WorkflowLatencyP99       time.Duration `json:"workflowLatencyP99,omitempty"`
 		BacklogBeforeWorkers     bool          `json:"backlogBeforeWorkers,omitempty"`
 		EnqueueElapsed           time.Duration `json:"enqueueElapsed,omitempty"`
 		Enqueued                 int64         `json:"enqueued,omitempty"`
@@ -132,6 +137,7 @@ type (
 		WorkersPerTaskQueue      int               `json:"workersPerTaskQueue"`
 		Workflows                int               `json:"workflows"`
 		Concurrency              int               `json:"concurrency"`
+		TargetWorkflowsPerSec    float64           `json:"targetWorkflowsPerSec,omitempty"`
 		ActivitiesEach           int               `json:"activitiesEach"`
 		SignalsEach              int               `json:"signalsEach"`
 		EagerStart               bool              `json:"eagerStart"`
@@ -395,6 +401,7 @@ func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
 	flags.IntVar(&cfg.workersPerTaskQueue, "workers-per-task-queue", 1, "workers to start for each task queue")
 	flags.IntVar(&cfg.workflows, "workflows", 1000, "number of workflows to execute")
 	flags.IntVar(&cfg.concurrency, "concurrency", 100, "maximum concurrent workflow executions")
+	flags.Float64Var(&cfg.targetRPS, "target-workflows-per-second", 0, "pace workflow starts at this rate; zero submits as fast as possible")
 	flags.IntVar(&cfg.activitiesEach, "activities-each", 1, "activities executed by each workflow")
 	flags.IntVar(&cfg.signalsEach, "signals-each", 0, "signals sent to each workflow before completion")
 	flags.BoolVar(&cfg.eagerStart, "eager-start", false, "request eager workflow start from a colocated worker")
@@ -425,6 +432,9 @@ func validateConfig(cfg runConfig) error {
 	}
 	if cfg.concurrency <= 0 {
 		return errors.New("-concurrency must be positive")
+	}
+	if cfg.targetRPS < 0 {
+		return errors.New("-target-workflows-per-second must be non-negative")
 	}
 	if cfg.taskQueues <= 0 {
 		return errors.New("-task-queues must be positive")
@@ -700,6 +710,7 @@ type workflowRunResult struct {
 	completed bool
 	requests  int64
 	run       client.WorkflowRun
+	latency   time.Duration
 }
 
 type backlogEnqueueResult struct {
@@ -725,10 +736,15 @@ func runLoadWithRunner(
 	var wg sync.WaitGroup
 	var incompleteMu sync.Mutex
 	var incomplete []client.WorkflowRun
+	var latenciesMu sync.Mutex
+	latencies := make([]time.Duration, 0, cfg.workflows)
 
 	launched := 0
 launch:
 	for i := 0; i < cfg.workflows; i++ {
+		if err := waitForLaunchSlot(ctx, start, cfg.targetRPS, i); err != nil {
+			break launch
+		}
 		select {
 		case <-ctx.Done():
 			break launch
@@ -738,10 +754,15 @@ launch:
 		workflowIndex := i
 		wg.Go(func() {
 			defer func() { <-sem }()
+			workflowStart := time.Now()
 			runResult := runner(ctx, c, cfg, payload, start.UnixNano(), workflowIndex)
+			runResult.latency = time.Since(workflowStart)
 			requests.Add(runResult.requests)
 			if runResult.completed {
 				completed.Add(1)
+				latenciesMu.Lock()
+				latencies = append(latencies, runResult.latency)
+				latenciesMu.Unlock()
 			} else {
 				failed.Add(1)
 				if runResult.run != nil {
@@ -763,11 +784,45 @@ launch:
 	result.Completed = completed.Load()
 	result.Failed = failed.Load()
 	result.Requests = requests.Load()
+	result.TargetWorkflowsPerSec = cfg.targetRPS
+	result.WorkflowLatencyP50, result.WorkflowLatencyP95, result.WorkflowLatencyP99 = workflowLatencyPercentiles(latencies)
 	if elapsed > 0 {
 		result.WorkflowsPerSec = float64(result.Completed) / elapsed.Seconds()
 		result.RequestsPerSec = float64(result.Requests) / elapsed.Seconds()
 	}
 	return result, terminateIncompleteWorkflowRuns(ctx, c, incomplete, cfg.concurrency)
+}
+
+func waitForLaunchSlot(ctx context.Context, started time.Time, targetRPS float64, index int) error {
+	if targetRPS == 0 || index == 0 {
+		return ctx.Err()
+	}
+	due := started.Add(time.Duration(float64(index) / targetRPS * float64(time.Second)))
+	wait := time.Until(due)
+	if wait <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func workflowLatencyPercentiles(latencies []time.Duration) (p50 time.Duration, p95 time.Duration, p99 time.Duration) {
+	if len(latencies) == 0 {
+		return 0, 0, 0
+	}
+	ordered := slices.Clone(latencies)
+	slices.Sort(ordered)
+	percentile := func(p float64) time.Duration {
+		index := int(float64(len(ordered))*p+0.999999999) - 1
+		return ordered[max(0, min(index, len(ordered)-1))]
+	}
+	return percentile(0.50), percentile(0.95), percentile(0.99)
 }
 
 func newRunResult(cfg runConfig) runResult {
@@ -779,6 +834,7 @@ func newRunResult(cfg runConfig) runResult {
 		WorkersPerTaskQueue:      cfg.workersPerTaskQueue,
 		Workflows:                cfg.workflows,
 		Concurrency:              cfg.concurrency,
+		TargetWorkflowsPerSec:    cfg.targetRPS,
 		ActivitiesEach:           cfg.activitiesEach,
 		SignalsEach:              cfg.signalsEach,
 		EagerStart:               cfg.eagerStart,
@@ -1304,6 +1360,7 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 		WorkersPerTaskQueue:      cfg.workersPerTaskQueue,
 		Workflows:                cfg.workflows,
 		Concurrency:              cfg.concurrency,
+		TargetWorkflowsPerSec:    cfg.targetRPS,
 		ActivitiesEach:           cfg.activitiesEach,
 		SignalsEach:              cfg.signalsEach,
 		EagerStart:               cfg.eagerStart,

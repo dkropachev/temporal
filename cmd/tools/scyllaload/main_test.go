@@ -137,6 +137,7 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 		"-workers-per-task-queue=2",
 		"-workflows=7",
 		"-concurrency=3",
+		"-target-workflows-per-second=12.5",
 		"-activities-each=2",
 		"-signals-each=1",
 		"-eager-start=true",
@@ -170,6 +171,7 @@ func TestRegisterFlagsUpdatesConfig(t *testing.T) {
 	require.Equal(t, 2, cfg.workersPerTaskQueue)
 	require.Equal(t, 7, cfg.workflows)
 	require.Equal(t, 3, cfg.concurrency)
+	require.InDelta(t, 12.5, cfg.targetRPS, 0)
 	require.Equal(t, 2, cfg.activitiesEach)
 	require.Equal(t, 1, cfg.signalsEach)
 	require.True(t, cfg.eagerStart)
@@ -230,6 +232,38 @@ func TestValidateConfigRequiresPositiveTimeout(t *testing.T) {
 	}
 
 	require.ErrorContains(t, validateConfig(cfg), "-timeout")
+}
+
+func TestValidateConfigRejectsNegativeTargetRate(t *testing.T) {
+	cfg := runConfig{
+		workflows: 1, concurrency: 1, taskQueues: 1, workersPerTaskQueue: 1,
+		targetRPS: -1, timeout: time.Second, serverCPUTime: time.Second,
+	}
+
+	require.ErrorContains(t, validateConfig(cfg), "-target-workflows-per-second")
+}
+
+func TestWorkflowLatencyPercentiles(t *testing.T) {
+	p50, p95, p99 := workflowLatencyPercentiles([]time.Duration{
+		10 * time.Millisecond,
+		time.Millisecond,
+		5 * time.Millisecond,
+		2 * time.Millisecond,
+		3 * time.Millisecond,
+	})
+
+	require.Equal(t, 3*time.Millisecond, p50)
+	require.Equal(t, 10*time.Millisecond, p95)
+	require.Equal(t, 10*time.Millisecond, p99)
+}
+
+func TestWaitForLaunchSlotHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := waitForLaunchSlot(ctx, time.Now(), 1, 1)
+
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestValidateConfigRequiresWorkerForEagerStart(t *testing.T) {
