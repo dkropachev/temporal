@@ -6,6 +6,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,9 @@ const (
 	// TODO hard code this dir for now
 	//  need to merge persistence test config / initialization in one place
 	testCassandraExecutionSchema = "../../../schema/cassandra/temporal/schema.cql"
+
+	testCassandraMaxConnsEnv                  = "CASSANDRA_MAX_CONNS"
+	testCassandraMaxExcessShardConnectionsEnv = "CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE"
 )
 
 // TODO merge the initialization with existing persistence setup
@@ -49,9 +53,35 @@ type (
 	}
 )
 
-func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
+func setUpCassandraTest(t testing.TB) (CassandraTestData, func()) {
+	return setUpCassandraTestWithConfig(t, nil)
+}
+
+func setUpCassandraTestWithHistoryNodeV2Reads(t testing.TB) (CassandraTestData, func()) {
+	return setUpCassandraTestWithHistoryNodeMigrationMode(
+		t,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+}
+
+func setUpCassandraTestWithHistoryNodeMigrationMode(
+	t testing.TB,
+	mode config.CassandraHistoryNodeMigrationMode,
+) (CassandraTestData, func()) {
+	return setUpCassandraTestWithConfig(t, func(cfg *config.Cassandra) {
+		cfg.HistoryNodeMigrationMode = mode
+	})
+}
+
+func setUpCassandraTestWithConfig(
+	t testing.TB,
+	configure func(*config.Cassandra),
+) (CassandraTestData, func()) {
 	var testData CassandraTestData
 	testData.Cfg = NewCassandraConfig()
+	if configure != nil {
+		configure(testData.Cfg)
+	}
 	testData.Logger = log.NewZapLogger(zaptest.NewLogger(t))
 	SetUpCassandraDatabase(t, testData.Cfg, testData.Logger)
 	SetUpCassandraSchema(t, testData.Cfg, testData.Logger)
@@ -73,7 +103,7 @@ func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
 	return testData, tearDown
 }
 
-func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func SetUpCassandraDatabase(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"
@@ -101,21 +131,12 @@ func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logg
 	}
 }
 
-func SetUpCassandraSchema(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func SetUpCassandraSchema(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	ApplySchemaUpdate(t, cfg, testCassandraExecutionSchema, logger)
 }
 
-func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
-	session, err := commongocql.NewSession(
-		func() (*gocql.ClusterConfig, error) {
-			return commongocql.NewCassandraCluster(*cfg, resolver.NewNoopResolver())
-		},
-		logger,
-		metrics.NoopMetricsHandler,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+func ApplySchemaUpdate(t testing.TB, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
+	session := newCassandraTestSession(t, cfg, logger)
 	defer session.Close()
 
 	schemaPath, err := filepath.Abs(schemaFile)
@@ -136,7 +157,25 @@ func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, l
 	}
 }
 
-func TearDownCassandraKeyspace(t *testing.T, cfg *config.Cassandra) {
+func newCassandraTestSession(
+	t testing.TB,
+	cfg *config.Cassandra,
+	logger log.Logger,
+) commongocql.Session {
+	session, err := commongocql.NewSession(
+		func() (*gocql.ClusterConfig, error) {
+			return commongocql.NewCassandraCluster(*cfg, resolver.NewNoopResolver())
+		},
+		logger,
+		metrics.NoopMetricsHandler,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func TearDownCassandraKeyspace(t testing.TB, cfg *config.Cassandra) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"
@@ -222,11 +261,30 @@ func GetSchemaFiles(t *testing.T, schemaDir string, logger log.Logger) []string 
 // NewCassandraConfig returns a new Cassandra config for test
 func NewCassandraConfig() *config.Cassandra {
 	return &config.Cassandra{
-		User:           testCassandraUser,
-		Password:       testCassandraPassword,
-		Hosts:          environment.GetCassandraAddress(),
-		Port:           environment.GetCassandraPort(),
-		Keyspace:       testCassandraDatabaseNamePrefix + shuffle.String(testCassandraDatabaseNameSuffix),
-		ConnectTimeout: 30 * time.Second,
+		User:                          testCassandraUser,
+		Password:                      testCassandraPassword,
+		Hosts:                         environment.GetCassandraAddress(),
+		Port:                          environment.GetCassandraPort(),
+		MaxConns:                      testCassandraMaxConns(),
+		MaxExcessShardConnectionsRate: testCassandraMaxExcessShardConnectionsRate(),
+		Keyspace:                      testCassandraDatabaseNamePrefix + shuffle.String(testCassandraDatabaseNameSuffix),
+		ConnectTimeout:                30 * time.Second,
 	}
+}
+
+func testCassandraMaxConns() int {
+	maxConns, err := strconv.Atoi(os.Getenv(testCassandraMaxConnsEnv))
+	if err != nil {
+		return 0
+	}
+	return maxConns
+}
+
+func testCassandraMaxExcessShardConnectionsRate() *float32 {
+	rate, err := strconv.ParseFloat(os.Getenv(testCassandraMaxExcessShardConnectionsEnv), 32)
+	if err != nil {
+		return nil
+	}
+	rate32 := float32(rate)
+	return &rate32
 }

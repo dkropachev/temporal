@@ -63,12 +63,7 @@ func (q *QueueStore) EnqueueMessage(
 	ctx context.Context,
 	blob *commonpb.DataBlob,
 ) error {
-	lastMessageID, err := q.getLastMessageID(ctx, q.queueType)
-	if err != nil {
-		return err
-	}
-
-	_, err = q.tryEnqueue(ctx, q.queueType, lastMessageID+1, blob)
+	_, err := q.enqueueMessage(ctx, q.queueType, blob)
 	return err
 }
 
@@ -77,13 +72,24 @@ func (q *QueueStore) EnqueueMessageToDLQ(
 	blob *commonpb.DataBlob,
 ) (int64, error) {
 	// Use negative queue type as the dlq type
-	lastMessageID, err := q.getLastMessageID(ctx, q.getDLQTypeFromQueueType())
+	return q.enqueueMessage(ctx, q.getDLQTypeFromQueueType(), blob)
+}
+
+func (q *QueueStore) enqueueMessage(
+	ctx context.Context,
+	queueType persistence.QueueType,
+	blob *commonpb.DataBlob,
+) (int64, error) {
+	lastMessageID, err := q.getLastMessageID(ctx, queueType)
 	if err != nil {
 		return persistence.EmptyQueueMessageID, err
 	}
-
-	// Use negative queue type as the dlq type
-	return q.tryEnqueue(ctx, q.getDLQTypeFromQueueType(), lastMessageID+1, blob)
+	messageID := lastMessageID + 1
+	err = q.tryEnqueue(ctx, queueType, messageID, blob)
+	if err != nil {
+		return persistence.EmptyQueueMessageID, err
+	}
+	return messageID, nil
 }
 
 func (q *QueueStore) tryEnqueue(
@@ -91,19 +97,16 @@ func (q *QueueStore) tryEnqueue(
 	queueType persistence.QueueType,
 	messageID int64,
 	blob *commonpb.DataBlob,
-) (int64, error) {
-	query := q.session.Query(templateEnqueueMessageQuery, queueType, messageID, blob.Data, blob.EncodingType.String()).WithContext(ctx)
-	previous := make(map[string]any)
-	applied, err := query.MapScanCAS(previous)
+) error {
+	applied, err := q.session.Query(templateEnqueueMessageQuery, queueType, messageID, blob.Data, blob.EncodingType.String()).WithContext(ctx).MapScanCAS(make(map[string]any))
 	if err != nil {
-		return persistence.EmptyQueueMessageID, gocql.ConvertError("tryEnqueue", err)
+		return gocql.ConvertError("tryEnqueue", err)
 	}
-
 	if !applied {
-		return persistence.EmptyQueueMessageID, &persistence.ConditionFailedError{Msg: fmt.Sprintf("message ID %v exists in queue", previous["message_id"])}
+		return ErrEnqueueMessageConflict
 	}
 
-	return messageID, nil
+	return nil
 }
 
 func (q *QueueStore) getLastMessageID(

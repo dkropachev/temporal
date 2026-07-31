@@ -44,6 +44,7 @@ type (
 	Iter interface {
 		Scan(...any) bool
 		MapScan(map[string]any) bool
+		NumRows() int
 		PageState() []byte
 		Close() error
 	}

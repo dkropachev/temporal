@@ -69,6 +69,20 @@ CREATE TABLE history_node (
      'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
 };
 
+CREATE TABLE history_node_v2 (
+  tree_id             uuid,
+  branch_id           uuid,
+  node_id             bigint,
+  txn_id              bigint,
+  prev_txn_id         bigint,
+  data                blob,
+  data_encoding       text,
+  PRIMARY KEY ((tree_id, branch_id), node_id, txn_id )
+) WITH CLUSTERING ORDER BY (node_id ASC, txn_id DESC)
+  AND COMPACTION = {
+     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+};
+
 CREATE TABLE history_tree (
   tree_id               uuid,
   branch_id             uuid,
@@ -228,6 +242,28 @@ CREATE TABLE queue_messages
     message_payload  blob,
     message_encoding text,
     PRIMARY KEY ((queue_type, queue_name, queue_partition), message_id)
+) WITH COMPACTION = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+    };
+
+-- Deprecated and retained so fresh and upgraded v1.15 keyspaces have the same schema.
+CREATE TABLE queue_message_id_range
+(
+    queue_type      int,
+    next_message_id bigint,
+    version         bigint,
+    PRIMARY KEY (queue_type)
+) WITH COMPACTION = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+    };
+
+CREATE TABLE queue_message_id_ranges
+(
+    queue_type      int,
+    queue_name      text,
+    next_message_id bigint,
+    version         bigint,
+    PRIMARY KEY ((queue_type, queue_name))
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
     };

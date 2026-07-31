@@ -193,6 +193,47 @@ func TestLoadEmbeddedCassandraMaxPreparedStmts(t *testing.T) {
 	}
 }
 
+func TestLoadEmbeddedCassandraScyllaDefaults(t *testing.T) {
+	t.Setenv("DB", "cassandra")
+	t.Setenv("CASSANDRA_SEEDS", "127.0.0.1")
+
+	cfg, err := Load(WithEmbedded())
+
+	require.NoError(t, err)
+	require.Equal(t, int32(4), cfg.Persistence.NumHistoryShards)
+	cassandraConfig := cfg.Persistence.DataStores[cfg.Persistence.DefaultStore].Cassandra
+	require.Equal(t, 12, cassandraConfig.MaxConns)
+	require.InDelta(t, float32(2), *cassandraConfig.MaxExcessShardConnectionsRate, 0)
+	require.Equal(
+		t,
+		CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		cassandraConfig.HistoryNodeMigrationMode,
+	)
+}
+
+func TestLoadEmbeddedCassandraHistoryShardsOverride(t *testing.T) {
+	t.Setenv("DB", "cassandra")
+	t.Setenv("CASSANDRA_SEEDS", "127.0.0.1")
+	t.Setenv("NUM_HISTORY_SHARDS", "512")
+
+	cfg, err := Load(WithEmbedded())
+
+	require.NoError(t, err)
+	require.Equal(t, int32(512), cfg.Persistence.NumHistoryShards)
+}
+
+func TestLoadEmbeddedCassandraHistoryNodeMigrationMode(t *testing.T) {
+	t.Setenv("DB", "cassandra")
+	t.Setenv("CASSANDRA_SEEDS", "127.0.0.1")
+	t.Setenv("CASSANDRA_HISTORY_NODE_MIGRATION_MODE", string(CassandraHistoryNodeMigrationModeV2Only))
+
+	cfg, err := Load(WithEmbedded())
+
+	require.NoError(t, err)
+	cassandraConfig := cfg.Persistence.DataStores[cfg.Persistence.DefaultStore].Cassandra
+	require.Equal(t, CassandraHistoryNodeMigrationModeV2Only, cassandraConfig.HistoryNodeMigrationMode)
+}
+
 func createFile(t *testing.T, dir string, file string, uid, uid2 string) {
 	err := os.WriteFile(path(dir, file), []byte(buildConfig(uid, uid2)), fileMode)
 	require.NoError(t, err)

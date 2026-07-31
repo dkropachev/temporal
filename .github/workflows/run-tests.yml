@@ -119,6 +119,10 @@ jobs:
               persistence_driver: cassandra
               containers: [cassandra, elasticsearch]
               required: true
+            scylla_es:
+              persistence_type: nosql
+              persistence_driver: cassandra
+              containers: [scylla, elasticsearch]
             cass_es8:
               persistence_type: nosql
               persistence_driver: cassandra

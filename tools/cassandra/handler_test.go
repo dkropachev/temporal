@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/urfave/cli"
 	"go.temporal.io/server/temporal/environment"
 )
 
@@ -71,4 +72,39 @@ func (s *HandlerTestSuite) TestCreateKeyspaceError() {
 	app := buildCLIOptions()
 	err := app.Run(args)
 	s.Nil(err)
+}
+
+func (s *HandlerTestSuite) TestHistoryNodeMigrationCommands() {
+	app := buildCLIOptions()
+	commands := make(map[string]cli.Command, len(app.Commands))
+	for _, command := range app.Commands {
+		commands[command.Name] = command
+	}
+
+	s.Contains(commands, "backfill-history-node-v2")
+	s.Len(commands["backfill-history-node-v2"].Flags, 4)
+	s.Contains(commands, "backfill-history-node-v1")
+	s.Len(commands["backfill-history-node-v1"].Flags, 4)
+	s.Equal(16, defaultHistoryNodeBackfillPageSize)
+	s.Equal(4096, defaultHistoryNodeBackfillTokenRanges)
+	s.Contains(commands, "recreate-history-node-v2")
+	s.Len(commands["recreate-history-node-v2"].Flags, 1)
+	s.Contains(commands, "recreate-history-node-v1")
+	s.Len(commands["recreate-history-node-v1"].Flags, 1)
+}
+
+func (s *HandlerTestSuite) TestHistoryNodeBackfillRequiresCheckpoint() {
+	originalExit := osExit
+	defer func() {
+		osExit = originalExit
+	}()
+	exitCode := 0
+	osExit = func(code int) {
+		exitCode = code
+	}
+
+	err := buildCLIOptions().Run([]string{"./tool", "backfill-history-node-v2"})
+
+	s.NoError(err)
+	s.Equal(1, exitCode)
 }
