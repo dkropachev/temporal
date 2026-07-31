@@ -2,7 +2,6 @@ package gocql
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,26 +15,29 @@ import (
 
 var _ Session = (*session)(nil)
 
-const (
-	sessionRefreshMinInternal = 5 * time.Second
-)
+const sessionRefreshMinInternal = 5 * time.Second
 
 const (
 	refreshThrottleTagValue = "throttle"
 	refreshErrorTagValue    = "error"
-	missingPeersV2Table     = "unconfigured table peers_v2"
 )
 
 type (
 	session struct {
 		status               int32
 		newClusterConfigFunc func() (*gocql.ClusterConfig, error)
-		atomic.Value         // *gocql.Session
+		initSessionFunc      func() (*sessionHandle, error)
+		handle               atomic.Pointer[sessionHandle]
 		logger               log.Logger
 
 		sync.Mutex
 		sessionInitTime time.Time
 		metricsHandler  metrics.Handler
+	}
+
+	sessionHandle struct {
+		session *gocql.Session
+		closeFn func()
 	}
 )
 
@@ -45,7 +47,7 @@ func NewSession(
 	metricsHandler metrics.Handler,
 ) (*session, error) {
 
-	gocqlSession, err := initSession(logger, newClusterConfigFunc, metricsHandler)
+	handle, err := initSession(logger, newClusterConfigFunc, metricsHandler)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +60,7 @@ func NewSession(
 
 		sessionInitTime: time.Now().UTC(),
 	}
-	session.Value.Store(gocqlSession)
+	session.handle.Store(handle)
 	return session, nil
 }
 
@@ -70,6 +72,9 @@ func (s *session) refresh() {
 	s.Lock()
 	defer s.Unlock()
 
+	if atomic.LoadInt32(&s.status) != common.DaemonStatusStarted {
+		return
+	}
 	if time.Now().UTC().Sub(s.sessionInitTime) < sessionRefreshMinInternal {
 		s.logger.Warn("gocql wrapper: did not refresh gocql session because the last refresh was too close",
 			tag.Duration("min_refresh_interval_seconds", sessionRefreshMinInternal))
@@ -78,7 +83,7 @@ func (s *session) refresh() {
 		return
 	}
 
-	newSession, err := initSession(s.logger, s.newClusterConfigFunc, s.metricsHandler)
+	newHandle, err := s.initSession()
 	if err != nil {
 		s.logger.Error("gocql wrapper: unable to refresh gocql session", tag.Error(err))
 		handler := s.metricsHandler.WithTags(metrics.FailureTag(refreshErrorTagValue))
@@ -87,17 +92,24 @@ func (s *session) refresh() {
 	}
 
 	s.sessionInitTime = time.Now().UTC()
-	oldSession := s.Value.Load().(*gocql.Session)
-	s.Value.Store(newSession)
-	go oldSession.Close()
+	oldHandle := s.getHandle()
+	s.handle.Store(newHandle)
+	go oldHandle.close()
 	s.logger.Warn("gocql wrapper: successfully refreshed gocql session")
+}
+
+func (s *session) initSession() (*sessionHandle, error) {
+	if s.initSessionFunc != nil {
+		return s.initSessionFunc()
+	}
+	return initSession(s.logger, s.newClusterConfigFunc, s.metricsHandler)
 }
 
 func initSession(
 	logger log.Logger,
 	newClusterConfigFunc func() (*gocql.ClusterConfig, error),
 	metricsHandler metrics.Handler,
-) (gs *gocql.Session, retErr error) {
+) (handle *sessionHandle, retErr error) {
 	defer log.CapturePanic(logger, &retErr)
 	cluster, err := newClusterConfigFunc()
 	if err != nil {
@@ -107,35 +119,18 @@ func initSession(
 	defer func() {
 		metrics.CassandraInitSessionLatency.With(metricsHandler).Record(time.Since(start))
 	}()
-	session, err := cluster.CreateSession()
-	if err == nil {
-		return session, nil
-	}
-	if !shouldRetryWithoutInitialHostLookup(cluster, err) {
+	gocqlSession, err := cluster.CreateSession()
+	if err != nil {
 		return nil, err
 	}
-	logger.Warn("gocql wrapper: retrying session initialization with initial host lookup disabled", tag.Error(err))
-	retryCluster, retryErr := newClusterConfigFunc()
-	if retryErr != nil {
-		return nil, retryErr
-	}
-	retryCluster.DisableInitialHostLookup = true
-	return retryCluster.CreateSession()
-}
-
-func shouldRetryWithoutInitialHostLookup(cluster *gocql.ClusterConfig, err error) bool {
-	return !cluster.DisableInitialHostLookup && isMissingPeersV2TableError(err)
-}
-
-func isMissingPeersV2TableError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), missingPeersV2Table)
+	return &sessionHandle{session: gocqlSession}, nil
 }
 
 func (s *session) Query(
 	stmt string,
 	values ...any,
 ) Query {
-	q := s.Value.Load().(*gocql.Session).Query(stmt, values...)
+	q := s.getHandle().session.Query(stmt, values...)
 	if q == nil {
 		return nil
 	}
@@ -149,7 +144,7 @@ func (s *session) Query(
 func (s *session) NewBatch(
 	batchType BatchType,
 ) *Batch {
-	b := s.Value.Load().(*gocql.Session).NewBatch(mustConvertBatchType(batchType))
+	b := s.getHandle().session.Batch(mustConvertBatchType(batchType))
 	if b == nil {
 		return nil
 	}
@@ -164,7 +159,7 @@ func (s *session) ExecuteBatch(
 ) (retError error) {
 	defer func() { s.handleError(retError) }()
 
-	return s.Value.Load().(*gocql.Session).ExecuteBatch(b.gocqlBatch)
+	return s.getHandle().session.ExecuteBatch(b.gocqlBatch)
 }
 
 func (s *session) MapExecuteBatchCAS(
@@ -173,7 +168,7 @@ func (s *session) MapExecuteBatchCAS(
 ) (_ bool, _ Iter, retError error) {
 	defer func() { s.handleError(retError) }()
 
-	applied, iter, err := s.Value.Load().(*gocql.Session).MapExecuteBatchCAS(b.gocqlBatch, previous)
+	applied, iter, err := s.getHandle().session.MapExecuteBatchCAS(b.gocqlBatch, previous)
 	return applied, iter, err
 }
 
@@ -182,16 +177,17 @@ func (s *session) AwaitSchemaAgreement(
 ) (retError error) {
 	defer func() { s.handleError(retError) }()
 
-	if err := s.Value.Load().(*gocql.Session).AwaitSchemaAgreement(ctx); err != nil {
-		if isMissingPeersV2TableError(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return s.getHandle().session.AwaitSchemaAgreement(ctx)
+}
+
+func (s *session) getHandle() *sessionHandle {
+	return s.handle.Load()
 }
 
 func (s *session) Close() {
+	s.Lock()
+	defer s.Unlock()
+
 	if !atomic.CompareAndSwapInt32(
 		&s.status,
 		common.DaemonStatusStarted,
@@ -199,7 +195,15 @@ func (s *session) Close() {
 	) {
 		return
 	}
-	s.Value.Load().(*gocql.Session).Close()
+	s.getHandle().close()
+}
+
+func (h *sessionHandle) close() {
+	if h.closeFn != nil {
+		h.closeFn()
+		return
+	}
+	h.session.Close()
 }
 
 func (s *session) handleError(
