@@ -319,12 +319,21 @@ func historyNodeBackfillCLIFlags() []cli.Flag {
 		cli.IntFlag{
 			Name:  historyNodeBackfillPageSizeFlag,
 			Value: defaultHistoryNodeBackfillPageSize,
-			Usage: "number of source history rows fetched per page",
+			Usage: "number of source history rows fetched per page; keep low because each row can contain a 4 MiB blob",
 		},
 		cli.IntFlag{
 			Name:  historyNodeBackfillConcurrencyFlag,
 			Value: defaultHistoryNodeBackfillConcurrency,
 			Usage: "maximum concurrent history node writes",
+		},
+		cli.IntFlag{
+			Name:  historyNodeBackfillTokenRangesFlag,
+			Value: defaultHistoryNodeBackfillTokenRanges,
+			Usage: "number of contiguous Murmur3 token ranges in the scan",
+		},
+		cli.StringFlag{
+			Name:  historyNodeBackfillCheckpointFileFlag,
+			Usage: "required durable checkpoint file; use a new path for each complete backfill pass",
 		},
 	}
 }

@@ -18,6 +18,7 @@ const (
 
 	templateGetHistoryNodeSchemaColumns = `SELECT column_name, kind, position, clustering_order FROM system_schema.columns ` +
 		`WHERE keyspace_name = ? AND table_name = ?`
+	templateGetHistoryNodeTableID = `SELECT id FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?`
 
 	templateDropHistoryNodeTable   = `DROP TABLE IF EXISTS %s.history_node`
 	templateDropHistoryNodeV2Table = `DROP TABLE IF EXISTS %s.history_node_v2`
@@ -47,6 +48,11 @@ type historyNodeKeyColumn struct {
 	name            string
 	position        int
 	clusteringOrder string
+}
+
+type historyNodeTableGenerations struct {
+	historyNode   [16]byte
+	historyNodeV2 [16]byte
 }
 
 type historyNodeModeLayouts struct {
@@ -83,10 +89,14 @@ func ValidateHistoryNodeMigrationMode(mode config.CassandraHistoryNodeMigrationM
 	switch normalizeHistoryNodeMigrationMode(mode) {
 	case config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
 		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
 		config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
 		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
 		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
 		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
 		config.CassandraHistoryNodeMigrationModeV2Only,
 		config.CassandraHistoryNodeMigrationModeCanonicalDual:
 		return nil
@@ -169,6 +179,51 @@ func GetHistoryNodeTableLayout(
 	default:
 		return HistoryNodeTableLayoutUnknown, nil
 	}
+}
+
+func getHistoryNodeTableGenerations(
+	ctx context.Context,
+	session gocql.Session,
+	keyspace string,
+) (historyNodeTableGenerations, error) {
+	if keyspace == "" {
+		return historyNodeTableGenerations{}, errors.New(
+			"history node table generation lookup requires a keyspace",
+		)
+	}
+	get := func(table string) ([16]byte, error) {
+		var id [16]byte
+		err := session.Query(
+			templateGetHistoryNodeTableID,
+			keyspace,
+			table,
+		).WithContext(ctx).Scan(&id)
+		if gocql.IsNotFoundError(err) {
+			return [16]byte{}, nil
+		}
+		if err != nil {
+			return [16]byte{}, fmt.Errorf(
+				"read table generation for %s.%s: %w",
+				keyspace,
+				table,
+				err,
+			)
+		}
+		return id, nil
+	}
+
+	historyNode, err := get(historyNodeTableName)
+	if err != nil {
+		return historyNodeTableGenerations{}, err
+	}
+	historyNodeV2, err := get(historyNodeV2TableName)
+	if err != nil {
+		return historyNodeTableGenerations{}, err
+	}
+	return historyNodeTableGenerations{
+		historyNode:   historyNode,
+		historyNodeV2: historyNodeV2,
+	}, nil
 }
 
 func historyNodeKeyColumnsEqual(columns []historyNodeKeyColumn, names ...string) bool {
@@ -255,12 +310,16 @@ func allowedHistoryNodeModeLayouts(
 			historyNodeV2: []HistoryNodeTableLayout{HistoryNodeTableLayoutBranchV2, HistoryNodeTableLayoutMissing},
 		}, nil
 	case config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
 		config.CassandraHistoryNodeMigrationModeCanonicalDual:
 		return historyNodeModeLayouts{
 			historyNode:   []HistoryNodeTableLayout{HistoryNodeTableLayoutLegacyV1},
 			historyNodeV2: []HistoryNodeTableLayout{HistoryNodeTableLayoutBranchV2},
 		}, nil
 	case config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
 		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual:
 		return historyNodeModeLayouts{
 			historyNode:   []HistoryNodeTableLayout{HistoryNodeTableLayoutBranchV2},
@@ -430,7 +489,7 @@ func RecreateHistoryNodeV2(
 	)
 }
 
-// RecreateHistoryNodeV1 replaces the old branch-partitioned table with the legacy layout.
+// RecreateHistoryNodeV1 recreates history_node with the legacy layout.
 // Callers must first move every Temporal process to V1-rebuild mode.
 func RecreateHistoryNodeV1(
 	ctx context.Context,
@@ -458,13 +517,11 @@ func RecreateHistoryNodeV1(
 		return err
 	}
 	switch currentLayout {
-	case HistoryNodeTableLayoutLegacyV1:
-		return nil
-	case HistoryNodeTableLayoutBranchV2:
+	case HistoryNodeTableLayoutLegacyV1, HistoryNodeTableLayoutBranchV2:
 		if err := session.Query(
 			fmt.Sprintf(templateDropHistoryNodeTable, quoteCQLIdentifier(keyspace)),
 		).WithContext(ctx).Exec(); err != nil {
-			return fmt.Errorf("drop old branch-partitioned history_node: %w", err)
+			return fmt.Errorf("drop history_node before rebuild: %w", err)
 		}
 		if err := session.AwaitSchemaAgreement(ctx); err != nil {
 			return fmt.Errorf("wait for history_node drop schema agreement: %w", err)

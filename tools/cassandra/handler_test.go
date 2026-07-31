@@ -82,11 +82,29 @@ func (s *HandlerTestSuite) TestHistoryNodeMigrationCommands() {
 	}
 
 	s.Contains(commands, "backfill-history-node-v2")
-	s.Len(commands["backfill-history-node-v2"].Flags, 2)
+	s.Len(commands["backfill-history-node-v2"].Flags, 4)
 	s.Contains(commands, "backfill-history-node-v1")
-	s.Len(commands["backfill-history-node-v1"].Flags, 2)
+	s.Len(commands["backfill-history-node-v1"].Flags, 4)
+	s.Equal(16, defaultHistoryNodeBackfillPageSize)
+	s.Equal(4096, defaultHistoryNodeBackfillTokenRanges)
 	s.Contains(commands, "recreate-history-node-v2")
 	s.Len(commands["recreate-history-node-v2"].Flags, 1)
 	s.Contains(commands, "recreate-history-node-v1")
 	s.Len(commands["recreate-history-node-v1"].Flags, 1)
+}
+
+func (s *HandlerTestSuite) TestHistoryNodeBackfillRequiresCheckpoint() {
+	originalExit := osExit
+	defer func() {
+		osExit = originalExit
+	}()
+	exitCode := 0
+	osExit = func(code int) {
+		exitCode = code
+	}
+
+	err := buildCLIOptions().Run([]string{"./tool", "backfill-history-node-v2"})
+
+	s.NoError(err)
+	s.Equal(1, exitCode)
 }

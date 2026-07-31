@@ -93,8 +93,33 @@ func NewExecutionStore(
 	logger log.Logger,
 	historyNodeMigrationMode ...config.CassandraHistoryNodeMigrationMode,
 ) *ExecutionStore {
+	mode := config.CassandraHistoryNodeMigrationMode("")
+	if len(historyNodeMigrationMode) > 0 {
+		mode = historyNodeMigrationMode[0]
+	}
+	return newExecutionStore(
+		session,
+		serializer,
+		logger,
+		mode,
+		historyNodeTableGenerations{},
+	)
+}
+
+func newExecutionStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyNodeGenerations historyNodeTableGenerations,
+) *ExecutionStore {
 	return &ExecutionStore{
-		HistoryStore:          NewHistoryStore(session, serializer, historyNodeMigrationMode...),
+		HistoryStore: newHistoryStore(
+			session,
+			serializer,
+			historyNodeMigrationMode,
+			historyNodeGenerations,
+		),
 		MutableStateStore:     NewMutableStateStore(session, serializer, logger),
 		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer),
 	}

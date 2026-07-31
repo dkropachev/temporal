@@ -636,7 +636,7 @@ type (
 		PageSize int
 		// Pagination token
 		NextPageToken []byte
-		// Kept separate so older binaries can continue consuming the raw NextPageToken
+		// Datastore-specific validation metadata for NextPageToken.
 		NextPageTokenMetadata []byte `json:",omitempty"`
 		// Used in sharded data stores to identify which shard to use
 		ShardID int32
@@ -662,7 +662,7 @@ type (
 		Nodes []InternalHistoryNode `json:",omitempty"`
 		// Pagination token
 		NextPageToken []byte
-		// Kept separate so older binaries can continue consuming the raw NextPageToken
+		// Datastore-specific validation metadata for NextPageToken.
 		NextPageTokenMetadata []byte `json:",omitempty"`
 	}
 

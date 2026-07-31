@@ -17,10 +17,13 @@ import (
 
 const (
 	defaultNumReplicas                    = 1
-	defaultHistoryNodeBackfillPageSize    = 1000
+	defaultHistoryNodeBackfillPageSize    = 16
 	defaultHistoryNodeBackfillConcurrency = 16
+	defaultHistoryNodeBackfillTokenRanges = persistencecassandra.DefaultHistoryNodeBackfillTokenRangeCount
 	historyNodeBackfillPageSizeFlag       = "page-size"
 	historyNodeBackfillConcurrencyFlag    = "concurrency"
+	historyNodeBackfillTokenRangesFlag    = "token-ranges"
+	historyNodeBackfillCheckpointFileFlag = "checkpoint-file"
 	confirmHistoryNodeSourceRebuildFlag   = "confirm-source-rebuild"
 	confirmHistoryNodeV1RebuildFlag       = "confirm-v1-rebuild"
 )
@@ -134,6 +137,12 @@ func validateHealth(cli *cli.Context, logger log.Logger) error {
 }
 
 func backfillHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
+	checkpointPath := strings.TrimSpace(ctx.String(historyNodeBackfillCheckpointFileFlag))
+	if checkpointPath == "" {
+		err := fmt.Errorf("missing %s argument", flag(historyNodeBackfillCheckpointFileFlag))
+		logger.Error("Unable to read history node backfill config.", tag.Error(err))
+		return err
+	}
 	config, err := newCQLClientConfig(ctx)
 	if err != nil {
 		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
@@ -154,12 +163,59 @@ func backfillHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
 		logger.Error("History node schema is not valid for V2 backfill.", tag.Error(err))
 		return err
 	}
-	copied, err := persistencecassandra.BackfillHistoryNodeV2(
+	sourceLayout, err := persistencecassandra.GetHistoryNodeTableLayout(
 		context.Background(),
 		client.session,
-		persistencecassandra.HistoryNodeBackfillOptions{
-			PageSize:    ctx.Int(historyNodeBackfillPageSizeFlag),
-			Concurrency: ctx.Int(historyNodeBackfillConcurrencyFlag),
+		client.keyspace,
+		"history_node",
+	)
+	if err != nil {
+		logger.Error("Unable to read history_node layout.", tag.Error(err))
+		return err
+	}
+	tokenRangeCount := ctx.Int(historyNodeBackfillTokenRangesFlag)
+	identity, err := newHistoryNodeBackfillCheckpointIdentity(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		"history-node-v2",
+		"history_node",
+		sourceLayout,
+		"history_node_v2",
+		tokenRangeCount,
+	)
+	if err != nil {
+		logger.Error("Unable to identify history node backfill tables.", tag.Error(err))
+		return err
+	}
+	options := persistencecassandra.HistoryNodeBackfillOptions{
+		PageSize:        ctx.Int(historyNodeBackfillPageSizeFlag),
+		Concurrency:     ctx.Int(historyNodeBackfillConcurrencyFlag),
+		TokenRangeCount: tokenRangeCount,
+		SourceLayout:    sourceLayout,
+		Partitioner:     identity.Partitioner,
+	}
+	copied, err := runHistoryNodeBackfill(
+		context.Background(),
+		checkpointPath,
+		identity,
+		func(validateCtx context.Context) error {
+			return validateHistoryNodeBackfillCheckpointIdentity(
+				validateCtx,
+				client.session,
+				identity,
+			)
+		},
+		func(
+			rangeCtx context.Context,
+			tokenRange persistencecassandra.HistoryNodeBackfillTokenRange,
+		) (int64, error) {
+			return persistencecassandra.BackfillHistoryNodeV2Range(
+				rangeCtx,
+				client.session,
+				options,
+				tokenRange,
+			)
 		},
 	)
 	if err != nil {
@@ -171,6 +227,12 @@ func backfillHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
 }
 
 func backfillHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
+	checkpointPath := strings.TrimSpace(ctx.String(historyNodeBackfillCheckpointFileFlag))
+	if checkpointPath == "" {
+		err := fmt.Errorf("missing %s argument", flag(historyNodeBackfillCheckpointFileFlag))
+		logger.Error("Unable to read history node backfill config.", tag.Error(err))
+		return err
+	}
 	config, err := newCQLClientConfig(ctx)
 	if err != nil {
 		logger.Error("Unable to read config.", tag.Error(schema.NewConfigError(err.Error())))
@@ -191,12 +253,49 @@ func backfillHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
 		logger.Error("History node schema is not valid for V1 backfill.", tag.Error(err))
 		return err
 	}
-	copied, err := persistencecassandra.BackfillHistoryNodeV1(
+	tokenRangeCount := ctx.Int(historyNodeBackfillTokenRangesFlag)
+	identity, err := newHistoryNodeBackfillCheckpointIdentity(
 		context.Background(),
 		client.session,
-		persistencecassandra.HistoryNodeBackfillOptions{
-			PageSize:    ctx.Int(historyNodeBackfillPageSizeFlag),
-			Concurrency: ctx.Int(historyNodeBackfillConcurrencyFlag),
+		client.keyspace,
+		"history-node-v1",
+		"history_node_v2",
+		persistencecassandra.HistoryNodeTableLayoutBranchV2,
+		"history_node",
+		tokenRangeCount,
+	)
+	if err != nil {
+		logger.Error("Unable to identify history node backfill tables.", tag.Error(err))
+		return err
+	}
+	options := persistencecassandra.HistoryNodeBackfillOptions{
+		PageSize:        ctx.Int(historyNodeBackfillPageSizeFlag),
+		Concurrency:     ctx.Int(historyNodeBackfillConcurrencyFlag),
+		TokenRangeCount: tokenRangeCount,
+		SourceLayout:    persistencecassandra.HistoryNodeTableLayoutBranchV2,
+		Partitioner:     identity.Partitioner,
+	}
+	copied, err := runHistoryNodeBackfill(
+		context.Background(),
+		checkpointPath,
+		identity,
+		func(validateCtx context.Context) error {
+			return validateHistoryNodeBackfillCheckpointIdentity(
+				validateCtx,
+				client.session,
+				identity,
+			)
+		},
+		func(
+			rangeCtx context.Context,
+			tokenRange persistencecassandra.HistoryNodeBackfillTokenRange,
+		) (int64, error) {
+			return persistencecassandra.BackfillHistoryNodeV1Range(
+				rangeCtx,
+				client.session,
+				options,
+				tokenRange,
+			)
 		},
 	)
 	if err != nil {

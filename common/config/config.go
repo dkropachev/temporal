@@ -29,14 +29,18 @@ const (
 type CassandraHistoryNodeMigrationMode string
 
 const (
-	CassandraHistoryNodeMigrationModeLegacyV1RebuildV2 CassandraHistoryNodeMigrationMode = "legacy-v1-rebuild-v2"
-	CassandraHistoryNodeMigrationModeLegacyV1Dual      CassandraHistoryNodeMigrationMode = "legacy-v1-dual"
-	CassandraHistoryNodeMigrationModeOldV2RebuildV2    CassandraHistoryNodeMigrationMode = "old-v2-rebuild-v2"
-	CassandraHistoryNodeMigrationModeOldV2Dual         CassandraHistoryNodeMigrationMode = "old-v2-dual"
-	CassandraHistoryNodeMigrationModeOldV2CutoverDual  CassandraHistoryNodeMigrationMode = "old-v2-cutover-dual"
-	CassandraHistoryNodeMigrationModeV1RebuildDual     CassandraHistoryNodeMigrationMode = "v1-rebuild-dual"
-	CassandraHistoryNodeMigrationModeV2Only            CassandraHistoryNodeMigrationMode = "v2-only"
-	CassandraHistoryNodeMigrationModeCanonicalDual     CassandraHistoryNodeMigrationMode = "canonical-dual"
+	CassandraHistoryNodeMigrationModeLegacyV1RebuildV2       CassandraHistoryNodeMigrationMode = "legacy-v1-rebuild-v2"
+	CassandraHistoryNodeMigrationModeLegacyV1Dual            CassandraHistoryNodeMigrationMode = "legacy-v1-dual"
+	CassandraHistoryNodeMigrationModeLegacyV1RollbackDual    CassandraHistoryNodeMigrationMode = "legacy-v1-rollback-dual"
+	CassandraHistoryNodeMigrationModeLegacyV1CutoverDual     CassandraHistoryNodeMigrationMode = "legacy-v1-cutover-dual"
+	CassandraHistoryNodeMigrationModeOldV2RebuildV2          CassandraHistoryNodeMigrationMode = "old-v2-rebuild-v2"
+	CassandraHistoryNodeMigrationModeOldV2Dual               CassandraHistoryNodeMigrationMode = "old-v2-dual"
+	CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual CassandraHistoryNodeMigrationMode = "old-v2-prepare-cutover-dual"
+	CassandraHistoryNodeMigrationModeOldV2CutoverDual        CassandraHistoryNodeMigrationMode = "old-v2-cutover-dual"
+	CassandraHistoryNodeMigrationModeV1RebuildDual           CassandraHistoryNodeMigrationMode = "v1-rebuild-dual"
+	CassandraHistoryNodeMigrationModeV1CutoverDual           CassandraHistoryNodeMigrationMode = "v1-cutover-dual"
+	CassandraHistoryNodeMigrationModeV2Only                  CassandraHistoryNodeMigrationMode = "v2-only"
+	CassandraHistoryNodeMigrationModeCanonicalDual           CassandraHistoryNodeMigrationMode = "canonical-dual"
 )
 
 type (

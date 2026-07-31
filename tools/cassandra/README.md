@@ -48,7 +48,14 @@ for the required rollout order.
 
 ```bash
 ./temporal-cassandra-tool -ep 127.0.0.1 -k temporal recreate-history-node-v2 --confirm-source-rebuild
-./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v2 --page-size 1000 --concurrency 16
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v2 \
+  --checkpoint-file ./history-node-v2-pass-1.json
 ./temporal-cassandra-tool -ep 127.0.0.1 -k temporal recreate-history-node-v1 --confirm-v1-rebuild
-./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v1 --page-size 1000 --concurrency 16
+./temporal-cassandra-tool -ep 127.0.0.1 -k temporal backfill-history-node-v1 \
+  --checkpoint-file ./history-node-v1-pass-1.json
 ```
+
+Reuse a checkpoint path to resume a failed pass and use a new path for each deliberate complete pass. The defaults scan
+4096 token ranges with 16-row pages and 16 concurrent writes; tune them with `--token-ranges`, `--page-size`, and
+`--concurrency`. Backfills require Murmur3 partitioning and revalidate the source and target table generations after
+the copy.

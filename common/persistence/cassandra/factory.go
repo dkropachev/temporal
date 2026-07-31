@@ -113,7 +113,21 @@ func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
 	); err != nil {
 		return nil, fmt.Errorf("validate Cassandra history node migration schema: %w", err)
 	}
-	return NewExecutionStore(f.session, f.serializer, f.logger, mode), nil
+	generations, err := getHistoryNodeTableGenerations(
+		context.TODO(),
+		f.session,
+		f.cfg.Keyspace,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read Cassandra history node table generations: %w", err)
+	}
+	return newExecutionStore(
+		f.session,
+		f.serializer,
+		f.logger,
+		mode,
+		generations,
+	), nil
 }
 
 // NewQueue returns a new queue backed by cassandra
