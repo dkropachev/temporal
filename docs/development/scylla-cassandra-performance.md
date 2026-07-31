@@ -5,12 +5,13 @@ optimization complete.
 
 ## Current 3 Node x 4 Shard Target
 
-- Use 512 logical history shards by default for new Cassandra/Scylla deployments. History shards map one-to-one to
+- Consider 512 logical history shards for new Cassandra/Scylla deployments. History shards map one-to-one to
   `executions` partitions and are independent of the 12 physical Scylla shards in the target cluster.
-- The history shard count is fixed when a Temporal cluster is created. Existing clusters must retain their original
-  value; changing this default only affects new clusters that do not set `NUM_HISTORY_SHARDS`.
-- Use 1 matching task queue write partition by default. Keep 4 read partitions during upgrades until partitions 1-3
-  are drained, then lower reads to 1 through dynamic config. New clusters can start with 1 read partition.
+- The history shard count is fixed when a Temporal cluster is created. Defaults remain at 4 so upgrades cannot
+  silently change it; set `NUM_HISTORY_SHARDS=512` explicitly before creating a cluster that should use 512.
+- Keep the backend-neutral matching default at 4 read/write partitions. Measured Scylla deployments with many cold
+  task queues can set both values to 1 through constrained dynamic config; retain reads on old partitions until they
+  are drained.
 - Keep Scylla gocql shard-aware port enabled. It is enabled by default in the Scylla gocql fork; use
   `maxExcessShardConnectionsRate` to tune per-shard connection reuse/ramp behavior.
 
@@ -62,15 +63,19 @@ Install the Temporal Cassandra schema with NetworkTopologyStrategy RF=3:
   experiment was removed because independent writers could commit reserved ranges out of order, causing a reader to
   advance past messages that committed later. Crashes also left gaps that made QueueV2 list and delete counts inexact.
 - Schema `v1.14` remains unchanged so clusters that already applied this branch's range-table migration can advance to
-  `v1.15`. Those tables are now unused and may remain in the keyspace.
+  `v1.15`. Those tables are unused but remain in both the fresh schema and upgraded keyspaces so the same reported
+  schema version converges on the same table set.
 - The legacy `queue` table still partitions messages by `queue_type`. Bucketing it by message-ID range would reduce
   partition growth, but it also requires range-aware reads and a persisted delete cursor; otherwise
   `DeleteMessagesBefore` becomes an unbounded fanout over bucket partitions as ack levels advance.
 
-Layout-aware history pagination keeps each Cassandra continuation on the table that issued it. Complete the
-migration-aware binary rollout before changing the history read mode, and let tokens issued by older binaries finish
-or restart their pagination before cutover because those raw Cassandra paging states do not identify their source
-layout.
+Layout-aware history pagination keeps each Cassandra continuation on the table that issued it while that physical
+layout remains valid. Raw tokens issued by older binaries are accepted in the pre-cutover source modes, but they do
+not identify their source layout. Drain them or let clients restart pagination before entering a read-cutover mode.
+The server rejects a continuation with a layout that may have been destructively recreated instead of passing stale
+Cassandra state to a different table generation. Canonical-V2 continuations guard the raw Cassandra page state in an
+envelope that migration-aware binaries unwrap. An older binary cannot silently apply that state to V1; Cassandra
+rejects the deliberately malformed legacy view of the envelope.
 
 ### History Upgrade From V1
 
@@ -84,18 +89,27 @@ layout.
      recreate-history-node-v2 --confirm-source-rebuild
    ```
 
-4. Run `backfill-history-node-v2 --page-size 1000 --concurrency 16`. Writes continue against V1 while V2 is absent and
-   during the backfill.
+4. Run `backfill-history-node-v2 --checkpoint-file ./history-node-v2-initial.json`. Writes continue against V1 while
+   V2 is absent and during the backfill.
 5. Roll every process to `historyNodeMigrationMode: legacy-v1-dual`, which requires both writes while still reading
    V1.
-6. Run `backfill-history-node-v2` again after the dual-write rollout completes to repair any mirror insert interrupted
-   before V2 was written.
-7. Roll every process to `historyNodeMigrationMode: canonical-dual`. Reads now use `history_node_v2`; mutations
-   continue to update both tables.
+6. Roll every process to `historyNodeMigrationMode: legacy-v1-cutover-dual`. Reads remain on V1, but every append now
+   writes V2 first.
+7. Run `backfill-history-node-v2 --checkpoint-file ./history-node-v2-cutover.json` after the cutover-mode rollout
+   completes. Use a new checkpoint because this is a new complete pass. This repairs any V1-only append left by a
+   pre-cutover writer; a cutover-mode process that exits between statements has already written the future V2
+   authority.
+8. Roll every process to `historyNodeMigrationMode: canonical-dual`. Reads now use `history_node_v2`; mutations keep
+   the same V2-first order.
 
-Before switching reads back to V1, run `backfill-history-node-v1` while every process still reads V2, then return every
-process to `legacy-v1-dual` before rolling back to an older binary. If an older version writes history during a rollback,
-repeat the V2 rebuild before returning to `canonical-dual`.
+Before switching reads back to V1, first ensure V1 has the legacy layout and has been rebuilt from V2. Then roll every
+process to `v1-cutover-dual`, which still reads V2 but writes V1 first, run
+`backfill-history-node-v1 --checkpoint-file ./history-node-v1-cutover.json` after that rollout, and only then roll to
+`legacy-v1-rollback-dual`. This mode rejects raw page tokens that cannot prove they were issued after the V1 table
+recreation. Before introducing an older binary, drain or abandon every unguarded raw token issued against a prior
+physical `history_node`; older binaries discard generation metadata and cannot detect those stale tokens.
+Canonical-V2 tokens are guarded and fail safely on an older binary. If an older version writes history during a
+rollback, repeat the V2 rebuild before returning to `canonical-dual`.
 
 ### Online Upgrade From The Previous Branch V2 Layout
 
@@ -106,43 +120,56 @@ converted without stopping Temporal writes:
 2. Roll every Temporal process to `historyNodeMigrationMode: old-v2-rebuild-v2`. The old branch-partitioned
    `history_node` remains authoritative and V2 is an optional mirror, so source-only old binaries can coexist.
 3. After every process is in rebuild mode, run `recreate-history-node-v2 --confirm-source-rebuild`.
-4. Run `backfill-history-node-v2`.
+4. Run `backfill-history-node-v2 --checkpoint-file ./old-v2-to-history-node-v2-initial.json`.
 5. Roll every process to `historyNodeMigrationMode: old-v2-dual`, which requires both writes and still reads the old
    table.
-6. Run `backfill-history-node-v2` again after the dual-write rollout completes.
-7. Roll every process to `historyNodeMigrationMode: old-v2-cutover-dual`. Reads switch to `history_node_v2`, but
-   mutations continue to update both tables so old readers remain correct during the rolling change.
-8. Roll every process to `historyNodeMigrationMode: v1-rebuild-dual`. V2 is now authoritative and the old table is an
+6. Roll every process to `historyNodeMigrationMode: old-v2-prepare-cutover-dual`. Reads remain on the old table, but
+   every append now writes `history_node_v2` first.
+7. Run `backfill-history-node-v2 --checkpoint-file ./old-v2-to-history-node-v2-cutover.json` after the
+   prepare-cutover rollout completes.
+8. Roll every process to `historyNodeMigrationMode: old-v2-cutover-dual`. Reads switch to `history_node_v2` without
+   changing the V2-first mutation order.
+9. Roll every process to `historyNodeMigrationMode: v1-rebuild-dual`. V2 is now authoritative and the old table is an
    optional mirror.
-9. Recreate the rollback-compatible table:
+10. Recreate the rollback-compatible table:
 
    ```bash
    temporal-cassandra-tool --endpoint HOST --keyspace KEYSPACE \
      recreate-history-node-v1 --confirm-v1-rebuild
    ```
 
-10. Restore historical rows to the recreated table:
+11. Restore historical rows to the recreated table:
 
    ```bash
    temporal-cassandra-tool --endpoint HOST --keyspace KEYSPACE \
-     backfill-history-node-v1 --page-size 1000 --concurrency 16
+     backfill-history-node-v1 --checkpoint-file ./history-node-v1-rebuild.json
    ```
 
-11. Roll every process to `historyNodeMigrationMode: canonical-dual`.
-12. Validate both read paths before considering the migration complete.
+12. Roll every process to `historyNodeMigrationMode: canonical-dual`.
+13. Validate both read paths before considering the migration complete.
 
 Do not recreate either inactive table until every process is in its corresponding rebuild mode. Each command requires
-an explicit confirmation flag, validates the authoritative layout, and is restartable if it exits after the drop. A
-rebuild-mode mutation commits the authoritative table first and only suppresses an exact missing-mirror-table error;
-timeouts, overload, and other database errors still fail the request.
+an explicit confirmation flag, validates the authoritative layout, and is restartable if it exits after the drop.
+Appends in rebuild mode commit the authoritative table first and suppress only an exact missing-mirror-table error.
+History-node deletes use one logged batch across both tables and fail while the mirror table is absent; retry them
+after recreation. This prevents a source tombstone from racing the target recreation and becoming impossible for an
+insert-only backfill to propagate.
+
+Backfills divide the Murmur3 ring into 4096 ranges and atomically checkpoint each completed range. Reuse the same
+checkpoint path after a failure; the command verifies the keyspace, table generations, partitioner, source layout,
+direction, and range count before resuming, then revalidates the table generations and partitioner after the copy.
+Non-Murmur3 clusters are rejected. Use a new path for each deliberate complete pass. The default page size is 16 so a
+page of maximum-size 4 MiB history blobs remains well below the driver's 256 MiB frame limit. Lower the page size
+further if rows or protocol overhead require it; `--token-ranges`, `--page-size`, and `--concurrency` are configurable.
 
 History event blobs are inserted into the source and mirror with separate idempotent statements so Cassandra and Scylla
-do not reject a cross-table batch containing two copies of a large blob. Workflow mutations append history before
-committing mutable state; a required mirror error aborts that state commit, and the retrying persistence client completes
-the pair. A process exit between statements can still leave a source-only history row, but workflow state does not
-reference that row. Raw-history appends are not coupled to a mutable-state commit, so rerun the appropriate directional
-backfill after an interrupted writer and immediately before changing read authority. The backfills preserve source
-timestamps, so concurrent writes and tombstones in the target table win over older copied rows.
+do not reject a cross-table batch containing two copies of a large blob. Both statements use one explicit timestamp,
+so a delete interleaved between them wins in both tables. Workflow mutations append history before committing mutable
+state; a required mirror error aborts that state commit, and the retrying persistence client completes the pair. The
+prepare-cutover modes change write order before the final backfill, ensuring that a process exit cannot leave the
+future read authority missing an append after that pass. Raw-history appends are not coupled to a mutable-state commit,
+so the same staged order is required. Backfills preserve source timestamps, allowing newer concurrent target
+mutations and tombstones to win.
 
 ## LWT Audit
 
@@ -404,6 +431,11 @@ are written. Keep those text summaries with the result JSON and metrics snapshot
 are the easiest way to prove whether remaining server time is in persistence calls, matching/history scheduling, SDK
 worker code, serialization, or Scylla driver work.
 
+Built-in load-generator and server CPU profiling starts after pre-run snapshots and endpoint metadata probes,
+immediately before workload submission. The load-generator profile covers the whole workload. The server pprof
+endpoint uses the fixed `-server-cpu-profile-duration` window: it captures the beginning of a longer workload, while a
+shorter workload waits for the requested window and may include an idle tail.
+
 Temporal server profiles can also be captured manually during the same workload window. The development Cassandra
 configs expose pprof on `127.0.0.1:7936`; the Docker template enables it when `PPROF_PORT` is set.
 
@@ -661,9 +693,9 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   `434.36 requests/sec` to `900.19 workflows/sec` / `1800.38 requests/sec`. Four partitions was also tested with the
   same 16-task-queue shape and reached only `115.79 workflows/sec` for activity and `255.63 workflows/sec` /
   `511.25 requests/sec` for signal. The bottleneck is matching partition fanout and manager/poller overhead across many
-  queues, not Scylla write capacity. The write default is therefore 1 partition; the read default remains 4 until old
-  partitions are drained. Use constrained dynamic config values for specifically measured hot task queues that benefit
-  from more partitioning.
+  queues, not Scylla write capacity. This Scylla-specific workload supports a constrained value of 1, but does not
+  justify changing the backend-neutral default for SQL, Apache Cassandra, or hot queues. Keep reads on old partitions
+  until they are drained, and use constrained dynamic config only for measured task queues.
 - Increasing normal matching task queue read/write partitions from `12` to `24` was tested and rejected on the same
   3 node x 4 shard cluster. Activity throughput dropped to `97.82 workflows/sec`, and signal throughput dropped to
   `240.02 workflows/sec` / `480.03 requests/sec`, compared with same-server 12-partition controls of
@@ -742,8 +774,9 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   neutral at roughly `0.8 us/op` and 19 allocations because workflow-state protobuf decoding dominates the harness.
   The combined live build reached `188.21 workflows/sec` at 1 queue and 4 workers and `180.75 workflows/sec` at
   16 queues and 8 workers, completing all 12,800 workflows with zero failures.
-- Cassandra/Scylla defaults now use 512 logical history shards instead of tying the count to the target cluster's
-  12 physical Scylla shards. Each history shard is one `executions` partition, and the conditional mutable-state batch
+- New Cassandra/Scylla clusters can opt into 512 logical history shards instead of tying the count to the target
+  cluster's 12 physical Scylla shards. The upgrade-safe default remains 4 because this value is immutable after
+  cluster creation. Each history shard is one `executions` partition, and the conditional mutable-state batch
   intentionally keeps its shard, workflow, and generated task rows in that partition. More logical shards distribute
   those atomic batches without weakening their fencing or splitting them across partitions.
 

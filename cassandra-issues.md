@@ -1,8 +1,7 @@
 # Pre-existing Cassandra and Scylla Issues
 
-These issues were verified against merge base
-`cc9d6f11398185e5268205e1b4e01cbd80a7ae74`. They are not regressions from
-this branch and are intentionally not fixed in this PR.
+These issues were verified against the upstream `v1.31.2` baseline. They are
+not regressions from this branch and are intentionally not fixed in this PR.
 
 ## Legacy queue hot partition and conditional tail writes
 
@@ -55,9 +54,10 @@ Relevant code:
 
 The `executions` table partitions mutable state and history tasks by
 `shard_id`. A low shard count creates larger, hotter partitions and limits
-parallelism. This branch raises the Cassandra default for new clusters, but an
-existing cluster's shard count is persisted in cluster metadata and cannot be
-changed by configuration.
+parallelism. A cluster's shard count is persisted in cluster metadata and
+cannot be changed by configuration. The upgrade-safe default remains 4; new
+clusters can opt into the measured 512-shard configuration by setting
+`NUM_HISTORY_SHARDS` before cluster creation.
 
 Existing low-shard clusters need a supported online resharding/data-migration
 design to receive the same partition-size and throughput benefits.
