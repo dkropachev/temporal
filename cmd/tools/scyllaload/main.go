@@ -12,12 +12,16 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
@@ -25,12 +29,17 @@ import (
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-const signalName = "load-signal"
+const (
+	signalName                          = "load-signal"
+	postRunCleanupTimeout               = 30 * time.Second
+	incompleteWorkflowTerminationReason = "scyllaload run ended before workflow completion"
+)
 
 type (
 	runConfig struct {
@@ -72,71 +81,73 @@ type (
 	}
 
 	runResult struct {
-		Address               string        `json:"address"`
-		Namespace             string        `json:"namespace"`
-		TaskQueue             string        `json:"taskQueue"`
-		TaskQueues            int           `json:"taskQueues"`
-		WorkersPerTaskQueue   int           `json:"workersPerTaskQueue"`
-		Workflows             int           `json:"workflows"`
-		Concurrency           int           `json:"concurrency"`
-		ActivitiesEach        int           `json:"activitiesEach"`
-		SignalsEach           int           `json:"signalsEach"`
-		EagerStart            bool          `json:"eagerStart"`
-		EagerActivities       bool          `json:"eagerActivities"`
-		PayloadBytes          int           `json:"payloadBytes"`
-		Elapsed               time.Duration `json:"elapsed"`
-		Completed             int64         `json:"completed"`
-		Failed                int64         `json:"failed"`
-		WorkflowsPerSec       float64       `json:"workflowsPerSec"`
-		Requests              int64         `json:"requests"`
-		RequestsPerSec        float64       `json:"requestsPerSec"`
-		BacklogBeforeWorkers  bool          `json:"backlogBeforeWorkers,omitempty"`
-		EnqueueElapsed        time.Duration `json:"enqueueElapsed,omitempty"`
-		Enqueued              int64         `json:"enqueued,omitempty"`
-		EnqueueFailed         int64         `json:"enqueueFailed,omitempty"`
-		EnqueueRequestsPerSec float64       `json:"enqueueRequestsPerSec,omitempty"`
-		BacklogWaitElapsed    time.Duration `json:"backlogWaitElapsed,omitempty"`
-		BacklogTasks          int64         `json:"backlogTasks,omitempty"`
-		WorkerStartElapsed    time.Duration `json:"workerStartElapsed,omitempty"`
-		DrainElapsed          time.Duration `json:"drainElapsed,omitempty"`
-		DrainFailed           int64         `json:"drainFailed,omitempty"`
-		DrainWorkflowsPerSec  float64       `json:"drainWorkflowsPerSec,omitempty"`
-		CPUProfile            string        `json:"cpuProfile,omitempty"`
-		HeapProfile           string        `json:"heapProfile,omitempty"`
-		ServerCPUProfile      string        `json:"serverCpuProfile,omitempty"`
-		ServerHeapProfile     string        `json:"serverHeapProfile,omitempty"`
-		MetricSnapshotsBefore []string      `json:"metricSnapshotsBefore,omitempty"`
-		MetricSnapshotsAfter  []string      `json:"metricSnapshotsAfter,omitempty"`
-		PreparedStats         *prepStats    `json:"scyllaPreparedStatements,omitempty"`
-		ProfileSummaries      []string      `json:"profileSummaries,omitempty"`
-		ResultFile            string        `json:"resultFile,omitempty"`
-		RunMetadataFile       string        `json:"runMetadataFile,omitempty"`
+		Address                  string        `json:"address"`
+		Namespace                string        `json:"namespace"`
+		TaskQueue                string        `json:"taskQueue"`
+		TaskQueues               int           `json:"taskQueues"`
+		WorkersPerTaskQueue      int           `json:"workersPerTaskQueue"`
+		Workflows                int           `json:"workflows"`
+		Concurrency              int           `json:"concurrency"`
+		ActivitiesEach           int           `json:"activitiesEach"`
+		SignalsEach              int           `json:"signalsEach"`
+		EagerStart               bool          `json:"eagerStart"`
+		EagerActivities          bool          `json:"eagerActivities"`
+		PayloadBytes             int           `json:"payloadBytes"`
+		Elapsed                  time.Duration `json:"elapsed"`
+		Completed                int64         `json:"completed"`
+		Failed                   int64         `json:"failed"`
+		WorkflowsPerSec          float64       `json:"workflowsPerSec"`
+		Requests                 int64         `json:"requests"`
+		RequestsPerSec           float64       `json:"requestsPerSec"`
+		BacklogBeforeWorkers     bool          `json:"backlogBeforeWorkers,omitempty"`
+		EnqueueElapsed           time.Duration `json:"enqueueElapsed,omitempty"`
+		Enqueued                 int64         `json:"enqueued,omitempty"`
+		EnqueueFailed            int64         `json:"enqueueFailed,omitempty"`
+		EnqueueRequestsPerSec    float64       `json:"enqueueRequestsPerSec,omitempty"`
+		BacklogWaitElapsed       time.Duration `json:"backlogWaitElapsed,omitempty"`
+		BacklogTasks             int64         `json:"backlogTasks,omitempty"`
+		WorkerStartElapsed       time.Duration `json:"workerStartElapsed,omitempty"`
+		DrainElapsed             time.Duration `json:"drainElapsed,omitempty"`
+		DrainFailed              int64         `json:"drainFailed,omitempty"`
+		DrainWorkflowsPerSec     float64       `json:"drainWorkflowsPerSec,omitempty"`
+		CPUProfile               string        `json:"cpuProfile,omitempty"`
+		HeapProfile              string        `json:"heapProfile,omitempty"`
+		ServerCPUProfile         string        `json:"serverCpuProfile,omitempty"`
+		ServerCPUProfileDuration time.Duration `json:"serverCpuProfileDuration,omitempty"`
+		ServerHeapProfile        string        `json:"serverHeapProfile,omitempty"`
+		MetricSnapshotsBefore    []string      `json:"metricSnapshotsBefore,omitempty"`
+		MetricSnapshotsAfter     []string      `json:"metricSnapshotsAfter,omitempty"`
+		PreparedStats            *prepStats    `json:"scyllaPreparedStatements,omitempty"`
+		ProfileSummaries         []string      `json:"profileSummaries,omitempty"`
+		ResultFile               string        `json:"resultFile,omitempty"`
+		RunMetadataFile          string        `json:"runMetadataFile,omitempty"`
 	}
 
 	runMetadata struct {
-		StartedAt               time.Time         `json:"startedAt"`
-		Address                 string            `json:"address"`
-		Namespace               string            `json:"namespace"`
-		TaskQueue               string            `json:"taskQueue"`
-		TaskQueues              int               `json:"taskQueues"`
-		WorkersPerTaskQueue     int               `json:"workersPerTaskQueue"`
-		Workflows               int               `json:"workflows"`
-		Concurrency             int               `json:"concurrency"`
-		ActivitiesEach          int               `json:"activitiesEach"`
-		SignalsEach             int               `json:"signalsEach"`
-		EagerStart              bool              `json:"eagerStart"`
-		EagerActivities         bool              `json:"eagerActivities"`
-		PayloadBytes            int               `json:"payloadBytes"`
-		BacklogBeforeWorkers    bool              `json:"backlogBeforeWorkers,omitempty"`
-		BacklogWaitTimeout      time.Duration     `json:"backlogWaitTimeout,omitempty"`
-		GoVersion               string            `json:"goVersion"`
-		GOOS                    string            `json:"goos"`
-		GOARCH                  string            `json:"goarch"`
-		NumCPU                  int               `json:"numCpu"`
-		GOMAXPROCS              int               `json:"gomaxprocs"`
-		Environment             map[string]string `json:"environment,omitempty"`
-		PProfEndpoint           *endpointCheck    `json:"pprofEndpoint,omitempty"`
-		MetricSnapshotEndpoints []endpointCheck   `json:"metricSnapshotEndpoints,omitempty"`
+		StartedAt                time.Time         `json:"startedAt"`
+		Address                  string            `json:"address"`
+		Namespace                string            `json:"namespace"`
+		TaskQueue                string            `json:"taskQueue"`
+		TaskQueues               int               `json:"taskQueues"`
+		WorkersPerTaskQueue      int               `json:"workersPerTaskQueue"`
+		Workflows                int               `json:"workflows"`
+		Concurrency              int               `json:"concurrency"`
+		ActivitiesEach           int               `json:"activitiesEach"`
+		SignalsEach              int               `json:"signalsEach"`
+		EagerStart               bool              `json:"eagerStart"`
+		EagerActivities          bool              `json:"eagerActivities"`
+		PayloadBytes             int               `json:"payloadBytes"`
+		BacklogBeforeWorkers     bool              `json:"backlogBeforeWorkers,omitempty"`
+		BacklogWaitTimeout       time.Duration     `json:"backlogWaitTimeout,omitempty"`
+		ServerCPUProfileDuration time.Duration     `json:"serverCpuProfileDuration,omitempty"`
+		GoVersion                string            `json:"goVersion"`
+		GOOS                     string            `json:"goos"`
+		GOARCH                   string            `json:"goarch"`
+		NumCPU                   int               `json:"numCpu"`
+		GOMAXPROCS               int               `json:"gomaxprocs"`
+		Environment              map[string]string `json:"environment,omitempty"`
+		PProfEndpoint            *endpointCheck    `json:"pprofEndpoint,omitempty"`
+		MetricSnapshotEndpoints  []endpointCheck   `json:"metricSnapshotEndpoints,omitempty"`
 	}
 
 	endpointCheck struct {
@@ -147,8 +158,10 @@ type (
 	}
 
 	metricSnapshot struct {
-		url  string
-		path string
+		url               string
+		path              string
+		captureStartedAt  time.Time
+		captureFinishedAt time.Time
 	}
 
 	profileSummary struct {
@@ -170,92 +183,208 @@ func main() {
 	if err := validateConfig(cfg); err != nil {
 		log.Fatal(err)
 	}
+	if err := run(cfg); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+func run(cfg runConfig) error {
+	signalCtx, stopSignals := loadSignalContext(context.Background())
+	defer stopSignals()
+	ctx, cancel := context.WithTimeout(signalCtx, cfg.timeout)
 	defer cancel()
 
-	c, err := client.Dial(client.Options{
+	c, err := client.DialContext(ctx, client.Options{
 		HostPort:  cfg.address,
 		Namespace: cfg.namespace,
 		Logger:    nopLogger{},
 	})
 	if err != nil {
-		log.Fatalf("dial Temporal: %v", err)
+		return fmt.Errorf("dial Temporal: %w", err)
 	}
 	defer c.Close()
 
 	if cfg.registerNS {
 		if err := ensureNamespace(ctx, c, cfg.namespace); err != nil {
-			log.Fatalf("register namespace: %v", err)
+			return fmt.Errorf("register namespace: %w", err)
 		}
 	}
 
+	return runWithClient(ctx, c, cfg)
+}
+
+func runWithClient(ctx context.Context, c client.Client, cfg runConfig) (retErr error) {
 	var workers []worker.Worker
+	var err error
 	if !cfg.backlogBeforeWorkers {
 		workers, err = startWorker(c, cfg)
 		if err != nil {
-			log.Fatalf("start worker: %v", err)
+			return fmt.Errorf("start worker: %w", err)
 		}
 	}
 	defer func() {
 		stopWorkers(workers)
 	}()
 
-	stopCPUProfile, err := startCPUProfile(cfg.cpuProfile)
-	if err != nil {
-		log.Fatalf("start CPU profile: %v", err)
-	}
-	serverCPUProfileDone, err := startServerCPUProfile(ctx, cfg)
-	if err != nil {
-		log.Fatalf("start server CPU profile: %v", err)
+	var backlogBaseline []int64
+	if cfg.backlogBeforeWorkers {
+		backlogBaseline, err = workflowTaskBacklogCounts(ctx, c, cfg)
+		if err != nil {
+			return fmt.Errorf("read workflow task backlog baseline: %w", err)
+		}
+		if err := requireEmptyWorkflowTaskBacklog(backlogBaseline); err != nil {
+			return err
+		}
 	}
 	if err := writeMetricSnapshots(ctx, cfg.metricSnapshotsBefore); err != nil {
-		log.Fatalf("write pre-run metric snapshots: %v", err)
+		return fmt.Errorf("write pre-run metric snapshots: %w", err)
 	}
 	if err := writeRunMetadata(ctx, cfg); err != nil {
-		log.Fatalf("write run metadata: %v", err)
+		return fmt.Errorf("write run metadata: %w", err)
 	}
+	stopCPUProfile, err := startCPUProfile(cfg.cpuProfile)
+	if err != nil {
+		return fmt.Errorf("start CPU profile: %w", err)
+	}
+	cpuProfileStopped := false
+	defer func() {
+		if !cpuProfileStopped {
+			if err := stopCPUProfile(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("write CPU profile: %w", err))
+			}
+		}
+	}()
+
+	serverCPUProfileCtx, cancelServerCPUProfile := context.WithCancel(ctx)
+	serverCPUProfileDone, err := startServerCPUProfile(serverCPUProfileCtx, cfg)
+	if err != nil {
+		cancelServerCPUProfile()
+		return fmt.Errorf("start server CPU profile: %w", err)
+	}
+	serverCPUProfileFinished := false
+	defer func() {
+		cancelServerCPUProfile()
+		if !serverCPUProfileFinished {
+			_ = serverCPUProfileDone()
+		}
+	}()
+
 	var result runResult
+	var runErr error
 	if cfg.backlogBeforeWorkers {
-		result, workers, err = runBacklogLoad(ctx, c, cfg)
-		if err != nil {
-			log.Fatalf("run persisted task backlog load: %v", err)
+		result, workers, runErr = runBacklogLoad(ctx, c, cfg, backlogBaseline)
+		if runErr != nil {
+			runErr = fmt.Errorf("run persisted task backlog load: %w", runErr)
 		}
 	} else {
-		result = runLoad(ctx, c, cfg)
+		result, runErr = runLoad(ctx, c, cfg)
+		if runErr != nil {
+			runErr = fmt.Errorf("run load: %w", runErr)
+		}
 	}
-	stopCPUProfile()
-	if err := serverCPUProfileDone(); err != nil {
-		log.Fatalf("write server CPU profile: %v", err)
+
+	cpuProfileErr := stopCPUProfile()
+	cpuProfileStopped = true
+	stopWorkers(workers)
+	workers = nil
+	if runErr != nil {
+		cancelServerCPUProfile()
+	}
+	serverCPUProfileErr := serverCPUProfileDone()
+	serverCPUProfileFinished = true
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		postRunCleanupTimeout,
+	)
+	defer cancelCleanup()
+
+	return finalizeRunResult(
+		cleanupCtx,
+		cfg,
+		&result,
+		runErr,
+		cpuProfileErr,
+		serverCPUProfileErr,
+	)
+}
+
+func finalizeRunResult(
+	ctx context.Context,
+	cfg runConfig,
+	result *runResult,
+	runErr error,
+	cpuProfileErr error,
+	serverCPUProfileErr error,
+) error {
+	var resultErrs []error
+	failedProfiles := make(map[string]error)
+	if runErr != nil {
+		resultErrs = append(resultErrs, runErr)
+	}
+	if cpuProfileErr != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write CPU profile: %w", cpuProfileErr))
+		recordFailedProfile(failedProfiles, cfg.cpuProfile, cpuProfileErr)
+		result.CPUProfile = ""
+	}
+	if serverCPUProfileErr != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write server CPU profile: %w", serverCPUProfileErr))
+		recordFailedProfile(failedProfiles, cfg.serverCPU, serverCPUProfileErr)
+		result.ServerCPUProfile = ""
+		result.ServerCPUProfileDuration = 0
 	}
 	if err := writeHeapProfile(cfg.heapProfile); err != nil {
-		log.Fatalf("write heap profile: %v", err)
+		resultErrs = append(resultErrs, fmt.Errorf("write heap profile: %w", err))
+		recordFailedProfile(failedProfiles, cfg.heapProfile, err)
+		result.HeapProfile = ""
 	}
 	if err := writeServerHeapProfile(ctx, cfg); err != nil {
-		log.Fatalf("write server heap profile: %v", err)
+		resultErrs = append(resultErrs, fmt.Errorf("write server heap profile: %w", err))
+		recordFailedProfile(failedProfiles, cfg.serverHeap, err)
+		result.ServerHeapProfile = ""
 	}
-	if err := writeMetricSnapshots(ctx, cfg.metricSnapshotsAfter); err != nil {
-		log.Fatalf("write post-run metric snapshots: %v", err)
+	postSnapshotErr := writeMetricSnapshots(ctx, cfg.metricSnapshotsAfter)
+	if postSnapshotErr != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write post-run metric snapshots: %w", postSnapshotErr))
+		result.MetricSnapshotsAfter = nil
+	} else {
+		var err error
+		result.PreparedStats, err = readScyllaPreparedStatementMetrics(
+			cfg.metricSnapshotsBefore,
+			cfg.metricSnapshotsAfter,
+		)
+		if err != nil {
+			resultErrs = append(resultErrs, fmt.Errorf("read Scylla prepared statement metrics: %w", err))
+		}
 	}
-	result.PreparedStats, err = readScyllaPreparedStatementMetrics(
-		cfg.metricSnapshotsBefore,
-		cfg.metricSnapshotsAfter,
+	profileSummaries, skippedSummaryErr := filterFailedProfileSummaries(
+		cfg.profileSummaries,
+		failedProfiles,
 	)
-	if err != nil {
-		log.Fatalf("read Scylla prepared statement metrics: %v", err)
+	if skippedSummaryErr != nil {
+		resultErrs = append(resultErrs, skippedSummaryErr)
 	}
-	if err := writeProfileSummaries(ctx, cfg.profileSummaries); err != nil {
-		log.Fatalf("write profile summaries: %v", err)
+	result.ProfileSummaries = profileSummaries.paths()
+	if err := writeProfileSummaries(ctx, profileSummaries); err != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write profile summaries: %w", err))
+		result.ProfileSummaries = nil
 	}
-	if err := writeResult(result); err != nil {
-		log.Fatalf("write result: %v", err)
+	if err := writeResultFile(cfg.resultFile, *result); err != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write result file: %w", err))
+		result.ResultFile = ""
 	}
-	if err := writeResultFile(cfg.resultFile, result); err != nil {
-		log.Fatalf("write result file: %v", err)
+	if err := writeResult(*result); err != nil {
+		resultErrs = append(resultErrs, fmt.Errorf("write result: %w", err))
 	}
 	if result.Failed > 0 || result.Completed != int64(cfg.workflows) {
-		os.Exit(1)
+		resultErrs = append(resultErrs, fmt.Errorf(
+			"load completed %d of %d workflows (%d failed)",
+			result.Completed,
+			cfg.workflows,
+			result.Failed,
+		))
 	}
+	return errors.Join(resultErrs...)
 }
 
 func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
@@ -279,7 +408,7 @@ func registerFlags(flags *flag.FlagSet, cfg *runConfig) {
 	flags.StringVar(&cfg.cpuProfile, "cpu-profile", "", "write Go CPU profile for the load generator")
 	flags.StringVar(&cfg.heapProfile, "heap-profile", "", "write Go heap profile for the load generator after the run")
 	flags.StringVar(&cfg.serverPProf, "server-pprof", "", "Temporal server pprof base URL, for example http://127.0.0.1:7936")
-	flags.StringVar(&cfg.serverCPU, "server-cpu-profile", "", "write Temporal server CPU profile from -server-pprof during the run")
+	flags.StringVar(&cfg.serverCPU, "server-cpu-profile", "", "write a Temporal server CPU profile starting with the run")
 	flags.StringVar(&cfg.serverHeap, "server-heap-profile", "", "write Temporal server heap profile from -server-pprof after the run")
 	flags.DurationVar(&cfg.serverCPUTime, "server-cpu-profile-duration", 30*time.Second, "Temporal server CPU profile duration")
 	flags.Var(&cfg.metricSnapshotsBefore, "metrics-snapshot-before", "fetch a Prometheus metrics snapshot before the run, formatted as URL=output_path; repeatable")
@@ -312,19 +441,14 @@ func validateConfig(cfg runConfig) error {
 	if cfg.payloadBytes < 0 {
 		return errors.New("-payload-bytes must be non-negative")
 	}
-	if cfg.backlogBeforeWorkers {
-		if !cfg.runWorker {
-			return errors.New("-worker must be enabled when -backlog-before-workers is set")
-		}
-		if cfg.signalsEach != 0 {
-			return errors.New("-signals-each must be zero when -backlog-before-workers is set")
-		}
-		if cfg.eagerStart {
-			return errors.New("-eager-start must be disabled when -backlog-before-workers is set")
-		}
-		if cfg.backlogWaitTimeout <= 0 {
-			return errors.New("-backlog-wait-timeout must be positive when -backlog-before-workers is set")
-		}
+	if cfg.timeout <= 0 {
+		return errors.New("-timeout must be positive")
+	}
+	if cfg.eagerStart && !cfg.runWorker {
+		return errors.New("-worker must be enabled when -eager-start is set")
+	}
+	if err := validateBacklogConfig(cfg); err != nil {
+		return err
 	}
 	if cfg.serverCPU != "" && cfg.serverPProf == "" {
 		return errors.New("-server-pprof must be set when -server-cpu-profile is set")
@@ -332,10 +456,198 @@ func validateConfig(cfg runConfig) error {
 	if cfg.serverHeap != "" && cfg.serverPProf == "" {
 		return errors.New("-server-pprof must be set when -server-heap-profile is set")
 	}
-	if cfg.serverCPUTime <= 0 {
-		return errors.New("-server-cpu-profile-duration must be positive")
+	if cfg.serverCPU != "" {
+		if _, err := serverCPUProfileSeconds(cfg.serverCPUTime); err != nil {
+			return err
+		}
+	}
+	if err := validateMetricSnapshotURLs("-metrics-snapshot-before", cfg.metricSnapshotsBefore); err != nil {
+		return err
+	}
+	if err := validateMetricSnapshotURLs("-metrics-snapshot-after", cfg.metricSnapshotsAfter); err != nil {
+		return err
+	}
+	return validateOutputPaths(cfg)
+}
+
+func validateBacklogConfig(cfg runConfig) error {
+	if !cfg.backlogBeforeWorkers {
+		return nil
+	}
+	if !cfg.runWorker {
+		return errors.New("-worker must be enabled when -backlog-before-workers is set")
+	}
+	if cfg.signalsEach != 0 {
+		return errors.New("-signals-each must be zero when -backlog-before-workers is set")
+	}
+	if cfg.eagerStart {
+		return errors.New("-eager-start must be disabled when -backlog-before-workers is set")
+	}
+	if cfg.backlogWaitTimeout <= 0 {
+		return errors.New("-backlog-wait-timeout must be positive when -backlog-before-workers is set")
 	}
 	return nil
+}
+
+func loadSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
+func configuredServerCPUProfileDuration(cfg runConfig) time.Duration {
+	if cfg.serverCPU == "" {
+		return 0
+	}
+	return cfg.serverCPUTime
+}
+
+func validateMetricSnapshotURLs(name string, snapshots metricSnapshotFlags) error {
+	seen := make(map[string]int, len(snapshots))
+	for index, snapshot := range snapshots {
+		if previous, ok := seen[snapshot.url]; ok {
+			return fmt.Errorf(
+				"%s[%d] duplicates URL %q from %s[%d]",
+				name,
+				index,
+				snapshot.url,
+				name,
+				previous,
+			)
+		}
+		seen[snapshot.url] = index
+	}
+	return nil
+}
+
+func validateOutputPaths(cfg runConfig) error {
+	outputs := []struct {
+		name string
+		path string
+	}{
+		{name: "-cpu-profile", path: cfg.cpuProfile},
+		{name: "-heap-profile", path: cfg.heapProfile},
+		{name: "-server-cpu-profile", path: cfg.serverCPU},
+		{name: "-server-heap-profile", path: cfg.serverHeap},
+		{name: "-result-file", path: cfg.resultFile},
+		{name: "-run-metadata-file", path: cfg.runMetadataFile},
+	}
+	for i, snapshot := range cfg.metricSnapshotsBefore {
+		outputs = append(outputs, struct {
+			name string
+			path string
+		}{
+			name: fmt.Sprintf("-metrics-snapshot-before[%d]", i),
+			path: snapshot.path,
+		})
+	}
+	for i, snapshot := range cfg.metricSnapshotsAfter {
+		outputs = append(outputs, struct {
+			name string
+			path string
+		}{
+			name: fmt.Sprintf("-metrics-snapshot-after[%d]", i),
+			path: snapshot.path,
+		})
+	}
+	for i, summary := range cfg.profileSummaries {
+		outputs = append(outputs, struct {
+			name string
+			path string
+		}{
+			name: fmt.Sprintf("-profile-summary[%d]", i),
+			path: summary.path,
+		})
+	}
+
+	seen := make(map[string]string, len(outputs))
+	for _, output := range outputs {
+		if output.path == "" {
+			continue
+		}
+		path, err := filepath.Abs(output.path)
+		if err != nil {
+			return fmt.Errorf("resolve %s output path: %w", output.name, err)
+		}
+		if previous, ok := seen[path]; ok {
+			return fmt.Errorf(
+				"%s and %s resolve to the same output path %q",
+				previous,
+				output.name,
+				path,
+			)
+		}
+		seen[path] = output.name
+	}
+
+	generatedProfiles := make(map[string]struct{}, 4)
+	for _, path := range []string{
+		cfg.cpuProfile,
+		cfg.heapProfile,
+		cfg.serverCPU,
+		cfg.serverHeap,
+	} {
+		if path == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve generated profile path %q: %w", path, err)
+		}
+		generatedProfiles[absolute] = struct{}{}
+	}
+	for i, summary := range cfg.profileSummaries {
+		path, err := filepath.Abs(summary.profile)
+		if err != nil {
+			return fmt.Errorf("resolve -profile-summary[%d] profile input path: %w", i, err)
+		}
+		output, isOutput := seen[path]
+		_, isGeneratedProfile := generatedProfiles[path]
+		if isOutput && !isGeneratedProfile {
+			return fmt.Errorf(
+				"-profile-summary[%d] profile input and %s output resolve to the same path %q",
+				i,
+				output,
+				path,
+			)
+		}
+	}
+	return nil
+}
+
+func recordFailedProfile(failed map[string]error, path string, err error) {
+	if path == "" || err == nil {
+		return
+	}
+	failed[normalizedOutputPath(path)] = err
+}
+
+func filterFailedProfileSummaries(
+	summaries profileSummaryFlags,
+	failedProfiles map[string]error,
+) (profileSummaryFlags, error) {
+	filtered := make(profileSummaryFlags, 0, len(summaries))
+	var errs []error
+	for _, summary := range summaries {
+		producerErr, failed := failedProfiles[normalizedOutputPath(summary.profile)]
+		if !failed {
+			filtered = append(filtered, summary)
+			continue
+		}
+		errs = append(errs, fmt.Errorf(
+			"skip profile summary %s because profile %s failed: %w",
+			summary.path,
+			summary.profile,
+			producerErr,
+		))
+	}
+	return filtered, errors.Join(errs...)
+}
+
+func normalizedOutputPath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return absolute
 }
 
 func (nopLogger) Debug(string, ...any) {}
@@ -372,30 +684,38 @@ func stopWorkers(workers []worker.Worker) {
 	}
 }
 
-func runLoad(ctx context.Context, c client.Client, cfg runConfig) runResult {
+func runLoad(ctx context.Context, c client.Client, cfg runConfig) (runResult, error) {
 	return runLoadWithRunner(ctx, c, cfg, runOneWorkflow)
 }
 
 type (
 	workflowRunner  func(context.Context, client.Client, runConfig, []byte, int64, int) workflowRunResult
 	workflowStarter func(context.Context, client.Client, runConfig, []byte, int64, int) (client.WorkflowRun, error)
-	backlogWaiter   func(context.Context, client.Client, runConfig, int64) (int64, error)
+	backlogCounter  func(context.Context, client.Client, runConfig) ([]int64, error)
+	backlogWaiter   func(context.Context, client.Client, runConfig, []int64, []int64) (int64, error)
 	workerStarter   func(client.Client, runConfig) ([]worker.Worker, error)
 )
 
 type workflowRunResult struct {
 	completed bool
 	requests  int64
+	run       client.WorkflowRun
 }
 
 type backlogEnqueueResult struct {
-	runs     []client.WorkflowRun
-	elapsed  time.Duration
-	enqueued int64
-	requests int64
+	runs                []client.WorkflowRun
+	enqueuedByTaskQueue []int64
+	elapsed             time.Duration
+	enqueued            int64
+	requests            int64
 }
 
-func runLoadWithRunner(ctx context.Context, c client.Client, cfg runConfig, runner workflowRunner) runResult {
+func runLoadWithRunner(
+	ctx context.Context,
+	c client.Client,
+	cfg runConfig,
+	runner workflowRunner,
+) (runResult, error) {
 	payload := makePayload(cfg.payloadBytes)
 	start := time.Now()
 	var completed atomic.Int64
@@ -403,6 +723,8 @@ func runLoadWithRunner(ctx context.Context, c client.Client, cfg runConfig, runn
 	var requests atomic.Int64
 	sem := make(chan struct{}, cfg.concurrency)
 	var wg sync.WaitGroup
+	var incompleteMu sync.Mutex
+	var incomplete []client.WorkflowRun
 
 	launched := 0
 launch:
@@ -422,6 +744,11 @@ launch:
 				completed.Add(1)
 			} else {
 				failed.Add(1)
+				if runResult.run != nil {
+					incompleteMu.Lock()
+					incomplete = append(incomplete, runResult.run)
+					incompleteMu.Unlock()
+				}
 			}
 		})
 	}
@@ -440,33 +767,34 @@ launch:
 		result.WorkflowsPerSec = float64(result.Completed) / elapsed.Seconds()
 		result.RequestsPerSec = float64(result.Requests) / elapsed.Seconds()
 	}
-	return result
+	return result, terminateIncompleteWorkflowRuns(ctx, c, incomplete, cfg.concurrency)
 }
 
 func newRunResult(cfg runConfig) runResult {
 	return runResult{
-		Address:               cfg.address,
-		Namespace:             cfg.namespace,
-		TaskQueue:             cfg.taskQueue,
-		TaskQueues:            cfg.taskQueues,
-		WorkersPerTaskQueue:   cfg.workersPerTaskQueue,
-		Workflows:             cfg.workflows,
-		Concurrency:           cfg.concurrency,
-		ActivitiesEach:        cfg.activitiesEach,
-		SignalsEach:           cfg.signalsEach,
-		EagerStart:            cfg.eagerStart,
-		EagerActivities:       cfg.eagerActivities,
-		PayloadBytes:          cfg.payloadBytes,
-		BacklogBeforeWorkers:  cfg.backlogBeforeWorkers,
-		CPUProfile:            cfg.cpuProfile,
-		HeapProfile:           cfg.heapProfile,
-		ServerCPUProfile:      cfg.serverCPU,
-		ServerHeapProfile:     cfg.serverHeap,
-		MetricSnapshotsBefore: cfg.metricSnapshotsBefore.paths(),
-		MetricSnapshotsAfter:  cfg.metricSnapshotsAfter.paths(),
-		ProfileSummaries:      cfg.profileSummaries.paths(),
-		ResultFile:            cfg.resultFile,
-		RunMetadataFile:       cfg.runMetadataFile,
+		Address:                  cfg.address,
+		Namespace:                cfg.namespace,
+		TaskQueue:                cfg.taskQueue,
+		TaskQueues:               cfg.taskQueues,
+		WorkersPerTaskQueue:      cfg.workersPerTaskQueue,
+		Workflows:                cfg.workflows,
+		Concurrency:              cfg.concurrency,
+		ActivitiesEach:           cfg.activitiesEach,
+		SignalsEach:              cfg.signalsEach,
+		EagerStart:               cfg.eagerStart,
+		EagerActivities:          cfg.eagerActivities,
+		PayloadBytes:             cfg.payloadBytes,
+		BacklogBeforeWorkers:     cfg.backlogBeforeWorkers,
+		CPUProfile:               cfg.cpuProfile,
+		HeapProfile:              cfg.heapProfile,
+		ServerCPUProfile:         cfg.serverCPU,
+		ServerCPUProfileDuration: configuredServerCPUProfileDuration(cfg),
+		ServerHeapProfile:        cfg.serverHeap,
+		MetricSnapshotsBefore:    cfg.metricSnapshotsBefore.paths(),
+		MetricSnapshotsAfter:     cfg.metricSnapshotsAfter.paths(),
+		ProfileSummaries:         cfg.profileSummaries.paths(),
+		ResultFile:               cfg.resultFile,
+		RunMetadataFile:          cfg.runMetadataFile,
 	}
 }
 
@@ -485,6 +813,7 @@ func runOneWorkflow(
 		log.Printf("start workflow %s: %v", workflowID, err)
 		return result
 	}
+	result.run = run
 
 	for signalIndex := 0; signalIndex < cfg.signalsEach; signalIndex++ {
 		result.requests++
@@ -496,6 +825,10 @@ func runOneWorkflow(
 
 	if err := run.Get(ctx, nil); err != nil {
 		log.Printf("workflow %s failed: %v", workflowID, err)
+		var executionErr *temporal.WorkflowExecutionError
+		if errors.As(err, &executionErr) {
+			result.run = nil
+		}
 		return result
 	}
 	result.completed = true
@@ -510,16 +843,36 @@ func startOneWorkflow(
 	startNanos int64,
 	workflowIndex int,
 ) (client.WorkflowRun, error) {
+	executionTimeout, err := remainingWorkflowExecutionTimeout(ctx, cfg.timeout)
+	if err != nil {
+		return nil, err
+	}
 	return c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:               workflowID(startNanos, workflowIndex),
-		TaskQueue:        taskQueueName(cfg, workflowIndex%cfg.taskQueues),
-		EnableEagerStart: cfg.eagerStart,
+		ID:                       workflowID(startNanos, workflowIndex),
+		TaskQueue:                taskQueueName(cfg, workflowIndex%cfg.taskQueues),
+		WorkflowExecutionTimeout: executionTimeout,
+		EnableEagerStart:         cfg.eagerStart,
 	}, loadWorkflow, workflowInput{
 		Activities: cfg.activitiesEach,
 		Signals:    cfg.signalsEach,
 		Eager:      cfg.eagerActivities,
 		Payload:    payload,
 	})
+}
+
+func remainingWorkflowExecutionTimeout(ctx context.Context, configured time.Duration) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return configured, nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+	return min(configured, remaining), nil
 }
 
 func workflowID(startNanos int64, workflowIndex int) string {
@@ -530,8 +883,19 @@ func runBacklogLoad(
 	ctx context.Context,
 	c client.Client,
 	cfg runConfig,
+	baseline []int64,
 ) (runResult, []worker.Worker, error) {
-	return runBacklogLoadWithDependencies(ctx, c, cfg, startOneWorkflow, waitForWorkflowTaskBacklog, startWorker)
+	return runBacklogLoadWithDependencies(
+		ctx,
+		c,
+		cfg,
+		startOneWorkflow,
+		func(context.Context, client.Client, runConfig) ([]int64, error) {
+			return slices.Clone(baseline), nil
+		},
+		waitForWorkflowTaskBacklog,
+		startWorker,
+	)
 }
 
 func runBacklogLoadWithDependencies(
@@ -539,12 +903,23 @@ func runBacklogLoadWithDependencies(
 	c client.Client,
 	cfg runConfig,
 	starter workflowStarter,
+	counter backlogCounter,
 	waiter backlogWaiter,
 	startWorkers workerStarter,
 ) (runResult, []worker.Worker, error) {
 	result := newRunResult(cfg)
 	start := time.Now()
-	enqueueResult := enqueueWorkflowBacklog(ctx, c, cfg, starter, start)
+	baseline, err := counter(ctx, c, cfg)
+	if err != nil {
+		finishBacklogResult(&result, cfg, start)
+		return result, nil, fmt.Errorf("read workflow task backlog baseline: %w", err)
+	}
+	if err := requireEmptyWorkflowTaskBacklog(baseline); err != nil {
+		finishBacklogResult(&result, cfg, start)
+		return result, nil, err
+	}
+	enqueueStart := time.Now()
+	enqueueResult := enqueueWorkflowBacklog(ctx, c, cfg, starter, enqueueStart)
 	result.EnqueueElapsed = enqueueResult.elapsed
 	result.Enqueued = enqueueResult.enqueued
 	result.EnqueueFailed = int64(cfg.workflows) - result.Enqueued
@@ -554,11 +929,24 @@ func runBacklogLoadWithDependencies(
 	}
 
 	backlogWaitStart := time.Now()
-	backlogTasks, err := waiter(ctx, c, cfg, result.Enqueued)
+	backlogTasks, err := waiter(
+		ctx,
+		c,
+		cfg,
+		baseline,
+		enqueueResult.enqueuedByTaskQueue,
+	)
 	result.BacklogWaitElapsed = time.Since(backlogWaitStart)
 	result.BacklogTasks = backlogTasks
 	if err != nil {
-		return result, nil, err
+		terminationErr := terminateIncompleteWorkflowRuns(
+			ctx,
+			c,
+			enqueueResult.runs,
+			cfg.concurrency,
+		)
+		finishBacklogResult(&result, cfg, start)
+		return result, nil, errors.Join(err, terminationErr)
 	}
 
 	drainStart := time.Now()
@@ -566,12 +954,26 @@ func runBacklogLoadWithDependencies(
 	workers, err := startWorkers(c, cfg)
 	result.WorkerStartElapsed = time.Since(workerStart)
 	if err != nil {
-		return result, nil, err
+		stopWorkers(workers)
+		terminationErr := terminateIncompleteWorkflowRuns(
+			ctx,
+			c,
+			enqueueResult.runs,
+			cfg.concurrency,
+		)
+		finishBacklogResult(&result, cfg, start)
+		return result, nil, errors.Join(err, terminationErr)
 	}
 
-	completed := drainWorkflowBacklog(ctx, enqueueResult.runs, cfg.concurrency)
+	completed, incomplete := drainWorkflowBacklog(ctx, enqueueResult.runs, cfg.concurrency)
 	result.DrainElapsed = time.Since(drainStart)
 	result.Completed = completed
+	terminationErr := terminateIncompleteWorkflowRuns(ctx, c, incomplete, cfg.concurrency)
+	finishBacklogResult(&result, cfg, start)
+	return result, workers, terminationErr
+}
+
+func finishBacklogResult(result *runResult, cfg runConfig, start time.Time) {
 	result.DrainFailed = result.Enqueued - result.Completed
 	result.Failed = int64(cfg.workflows) - result.Completed
 	result.Elapsed = time.Since(start)
@@ -582,7 +984,6 @@ func runBacklogLoadWithDependencies(
 	if result.DrainElapsed > 0 {
 		result.DrainWorkflowsPerSec = float64(result.Completed) / result.DrainElapsed.Seconds()
 	}
-	return result, workers, nil
 }
 
 func enqueueWorkflowBacklog(
@@ -620,11 +1021,18 @@ enqueue:
 		})
 	}
 	wg.Wait()
+	enqueuedByTaskQueue := make([]int64, cfg.taskQueues)
+	for index, run := range runs {
+		if run != nil {
+			enqueuedByTaskQueue[index%cfg.taskQueues]++
+		}
+	}
 	return backlogEnqueueResult{
-		runs:     runs,
-		elapsed:  time.Since(start),
-		enqueued: enqueued.Load(),
-		requests: requests.Load(),
+		runs:                runs,
+		enqueuedByTaskQueue: enqueuedByTaskQueue,
+		elapsed:             time.Since(start),
+		enqueued:            enqueued.Load(),
+		requests:            requests.Load(),
 	}
 }
 
@@ -632,13 +1040,17 @@ func drainWorkflowBacklog(
 	ctx context.Context,
 	runs []client.WorkflowRun,
 	concurrency int,
-) int64 {
+) (int64, []client.WorkflowRun) {
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var completed atomic.Int64
+	incomplete := make([]atomic.Bool, len(runs))
+	for index, run := range runs {
+		incomplete[index].Store(run != nil)
+	}
 
 drain:
-	for _, run := range runs {
+	for index, run := range runs {
 		if run == nil {
 			continue
 		}
@@ -647,27 +1059,113 @@ drain:
 			break drain
 		case sem <- struct{}{}:
 		}
+		runIndex := index
 		workflowRun := run
 		wg.Go(func() {
 			defer func() { <-sem }()
 			if err := workflowRun.Get(ctx, nil); err != nil {
 				log.Printf("workflow %s failed: %v", workflowRun.GetID(), err)
+				var executionErr *temporal.WorkflowExecutionError
+				if errors.As(err, &executionErr) {
+					incomplete[runIndex].Store(false)
+				}
 				return
 			}
+			incomplete[runIndex].Store(false)
 			completed.Add(1)
 		})
 	}
 	wg.Wait()
-	return completed.Load()
+	incompleteRuns := make([]client.WorkflowRun, 0, len(runs)-int(completed.Load()))
+	for index, run := range runs {
+		if incomplete[index].Load() {
+			incompleteRuns = append(incompleteRuns, run)
+		}
+	}
+	return completed.Load(), incompleteRuns
+}
+
+func terminateIncompleteWorkflowRuns(
+	ctx context.Context,
+	c client.Client,
+	runs []client.WorkflowRun,
+	concurrency int,
+) error {
+	runCount := 0
+	for _, run := range runs {
+		if run != nil {
+			runCount++
+		}
+	}
+	if runCount == 0 {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		postRunCleanupTimeout,
+	)
+	defer cancel()
+
+	sem := make(chan struct{}, min(max(concurrency, 1), runCount))
+	var wg sync.WaitGroup
+	var errsMu sync.Mutex
+	var errs []error
+terminate:
+	for _, run := range runs {
+		if run == nil {
+			continue
+		}
+		select {
+		case <-cleanupCtx.Done():
+			errsMu.Lock()
+			errs = append(errs, cleanupCtx.Err())
+			errsMu.Unlock()
+			break terminate
+		case sem <- struct{}{}:
+		}
+		workflowRun := run
+		wg.Go(func() {
+			defer func() { <-sem }()
+			if err := c.TerminateWorkflow(
+				cleanupCtx,
+				workflowRun.GetID(),
+				workflowRun.GetRunID(),
+				incompleteWorkflowTerminationReason,
+			); err != nil {
+				errsMu.Lock()
+				errs = append(errs, fmt.Errorf(
+					"terminate workflow %s: %w",
+					workflowRun.GetID(),
+					err,
+				))
+				errsMu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("terminate incomplete workflows: %w", err)
+	}
+	return nil
 }
 
 func waitForWorkflowTaskBacklog(
 	ctx context.Context,
 	c client.Client,
 	cfg runConfig,
-	expected int64,
+	baseline []int64,
+	expected []int64,
 ) (int64, error) {
-	if expected == 0 {
+	if len(baseline) != cfg.taskQueues || len(expected) != cfg.taskQueues {
+		return 0, fmt.Errorf(
+			"workflow task backlog counts have %d baseline and %d expected queues, want %d",
+			len(baseline),
+			len(expected),
+			cfg.taskQueues,
+		)
+	}
+	expectedTotal := sumInt64(expected)
+	if expectedTotal == 0 {
 		return 0, nil
 	}
 
@@ -677,31 +1175,36 @@ func waitForWorkflowTaskBacklog(
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	var backlog int64
+	var confirmed int64
 	for {
-		var err error
-		backlog, err = workflowTaskBacklogCount(waitCtx, c, cfg)
+		backlog, err := workflowTaskBacklogCounts(waitCtx, c, cfg)
 		if err != nil {
-			return backlog, err
+			return confirmed, err
 		}
-		if backlog >= expected {
-			return backlog, nil
+		confirmed = confirmedWorkflowTaskBacklog(baseline, expected, backlog)
+		if confirmed == expectedTotal {
+			return confirmed, nil
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return backlog, fmt.Errorf("wait for workflow task backlog: got %d of %d tasks: %w", backlog, expected, waitCtx.Err())
+			return confirmed, fmt.Errorf(
+				"wait for workflow task backlog: confirmed %d of %d tasks: %w",
+				confirmed,
+				expectedTotal,
+				waitCtx.Err(),
+			)
 		case <-ticker.C:
 		}
 	}
 }
 
-func workflowTaskBacklogCount(
+func workflowTaskBacklogCounts(
 	ctx context.Context,
 	c client.Client,
 	cfg runConfig,
-) (int64, error) {
-	var backlog int64
+) ([]int64, error) {
+	backlog := make([]int64, cfg.taskQueues)
 	for taskQueueIndex := 0; taskQueueIndex < cfg.taskQueues; taskQueueIndex++ {
 		response, err := c.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
 			Namespace: cfg.namespace,
@@ -715,9 +1218,45 @@ func workflowTaskBacklogCount(
 		if err != nil {
 			return backlog, err
 		}
-		backlog += response.GetStats().GetApproximateBacklogCount()
+		backlog[taskQueueIndex] = response.GetStats().GetApproximateBacklogCount()
 	}
 	return backlog, nil
+}
+
+func confirmedWorkflowTaskBacklog(baseline []int64, expected []int64, backlog []int64) int64 {
+	var confirmed int64
+	for index := range expected {
+		if index >= len(baseline) || index >= len(backlog) {
+			break
+		}
+		delta := max(backlog[index]-baseline[index], 0)
+		confirmed += min(delta, expected[index])
+	}
+	return confirmed
+}
+
+func requireEmptyWorkflowTaskBacklog(backlog []int64) error {
+	var occupied []string
+	for index, count := range backlog {
+		if count != 0 {
+			occupied = append(occupied, fmt.Sprintf("%d=%d", index, count))
+		}
+	}
+	if len(occupied) != 0 {
+		return fmt.Errorf(
+			"workflow task backlog baseline must be empty; task queue indexes with tasks: %s",
+			strings.Join(occupied, ", "),
+		)
+	}
+	return nil
+}
+
+func sumInt64(values []int64) int64 {
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	return total
 }
 
 func taskQueueName(cfg runConfig, index int) string {
@@ -745,17 +1284,11 @@ func writeResultFile(path string, result runResult) error {
 	if path == "" {
 		return nil
 	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(result); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return writeOutputFile(path, func(f *os.File) error {
+		encoder := json.NewEncoder(f)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(result)
+	})
 }
 
 func writeRunMetadata(ctx context.Context, cfg runConfig) error {
@@ -763,27 +1296,28 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 		return nil
 	}
 	metadata := runMetadata{
-		StartedAt:            time.Now().UTC(),
-		Address:              cfg.address,
-		Namespace:            cfg.namespace,
-		TaskQueue:            cfg.taskQueue,
-		TaskQueues:           cfg.taskQueues,
-		WorkersPerTaskQueue:  cfg.workersPerTaskQueue,
-		Workflows:            cfg.workflows,
-		Concurrency:          cfg.concurrency,
-		ActivitiesEach:       cfg.activitiesEach,
-		SignalsEach:          cfg.signalsEach,
-		EagerStart:           cfg.eagerStart,
-		EagerActivities:      cfg.eagerActivities,
-		PayloadBytes:         cfg.payloadBytes,
-		BacklogBeforeWorkers: cfg.backlogBeforeWorkers,
-		BacklogWaitTimeout:   cfg.backlogWaitTimeout,
-		GoVersion:            runtime.Version(),
-		GOOS:                 runtime.GOOS,
-		GOARCH:               runtime.GOARCH,
-		NumCPU:               runtime.NumCPU(),
-		GOMAXPROCS:           runtime.GOMAXPROCS(0),
-		Environment:          selectedEnvironment(),
+		StartedAt:                time.Now().UTC(),
+		Address:                  cfg.address,
+		Namespace:                cfg.namespace,
+		TaskQueue:                cfg.taskQueue,
+		TaskQueues:               cfg.taskQueues,
+		WorkersPerTaskQueue:      cfg.workersPerTaskQueue,
+		Workflows:                cfg.workflows,
+		Concurrency:              cfg.concurrency,
+		ActivitiesEach:           cfg.activitiesEach,
+		SignalsEach:              cfg.signalsEach,
+		EagerStart:               cfg.eagerStart,
+		EagerActivities:          cfg.eagerActivities,
+		PayloadBytes:             cfg.payloadBytes,
+		BacklogBeforeWorkers:     cfg.backlogBeforeWorkers,
+		BacklogWaitTimeout:       cfg.backlogWaitTimeout,
+		ServerCPUProfileDuration: configuredServerCPUProfileDuration(cfg),
+		GoVersion:                runtime.Version(),
+		GOOS:                     runtime.GOOS,
+		GOARCH:                   runtime.GOARCH,
+		NumCPU:                   runtime.NumCPU(),
+		GOMAXPROCS:               runtime.GOMAXPROCS(0),
+		Environment:              selectedEnvironment(),
 	}
 	if cfg.serverPProf != "" {
 		pprofURL, err := serverPProfURL(cfg.serverPProf, "/debug/pprof/", nil)
@@ -795,17 +1329,11 @@ func writeRunMetadata(ctx context.Context, cfg runConfig) error {
 	for _, snapshot := range append(cfg.metricSnapshotsBefore, cfg.metricSnapshotsAfter...) {
 		metadata.MetricSnapshotEndpoints = append(metadata.MetricSnapshotEndpoints, endpointStatus(ctx, "metrics", snapshot.url))
 	}
-	f, err := os.Create(cfg.runMetadataFile)
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(metadata); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return writeOutputFile(cfg.runMetadataFile, func(f *os.File) error {
+		encoder := json.NewEncoder(f)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(metadata)
+	})
 }
 
 func selectedEnvironment() map[string]string {
@@ -851,45 +1379,90 @@ func ptr[T any](value T) *T {
 	return &value
 }
 
-func startCPUProfile(path string) (func(), error) {
+func startCPUProfile(path string) (func() error, error) {
+	return startCPUProfileWithWriter(path, nil)
+}
+
+func startCPUProfileWithWriter(
+	path string,
+	decorate func(io.Writer) io.Writer,
+) (func() error, error) {
 	if path == "" {
-		return func() {}, nil
+		return func() error { return nil }, nil
 	}
-	f, err := os.Create(path)
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return nil, err
 	}
-	if err := pprof.StartCPUProfile(f); err != nil {
-		_ = f.Close()
-		return nil, err
+	tempPath := f.Name()
+	var destination io.Writer = f
+	if decorate != nil {
+		destination = decorate(destination)
 	}
-	return func() {
+	profileWriter := &errorTrackingWriter{writer: destination}
+	if err := pprof.StartCPUProfile(profileWriter); err != nil {
+		return nil, errors.Join(err, f.Close(), os.Remove(tempPath))
+	}
+	return func() error {
 		pprof.StopCPUProfile()
-		_ = f.Close()
+		if err := errors.Join(profileWriter.Err(), f.Close()); err != nil {
+			_ = os.Remove(tempPath)
+			return err
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			_ = os.Remove(tempPath)
+			return err
+		}
+		return nil
 	}, nil
+}
+
+type errorTrackingWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+	err    error
+}
+
+func (w *errorTrackingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if n != len(data) && err == nil {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.mu.Lock()
+		if w.err == nil {
+			w.err = err
+		}
+		w.mu.Unlock()
+	}
+	return n, err
+}
+
+func (w *errorTrackingWriter) Err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }
 
 func writeHeapProfile(path string) error {
 	if path == "" {
 		return nil
 	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	if err := pprof.WriteHeapProfile(f); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return writeOutputFile(path, func(f *os.File) error {
+		return pprof.WriteHeapProfile(f)
+	})
 }
 
 func startServerCPUProfile(ctx context.Context, cfg runConfig) (func() error, error) {
 	if cfg.serverCPU == "" {
 		return func() error { return nil }, nil
 	}
+	seconds, err := serverCPUProfileSeconds(cfg.serverCPUTime)
+	if err != nil {
+		return nil, err
+	}
 	profileURL, err := serverPProfURL(cfg.serverPProf, "/debug/pprof/profile", map[string]string{
-		"seconds": strconv.FormatInt(serverCPUProfileSeconds(cfg.serverCPUTime), 10),
+		"seconds": strconv.FormatInt(seconds, 10),
 	})
 	if err != nil {
 		return nil, err
@@ -915,21 +1488,37 @@ func writeServerHeapProfile(ctx context.Context, cfg runConfig) error {
 }
 
 func writeMetricSnapshots(ctx context.Context, snapshots []metricSnapshot) error {
-	for _, snapshot := range snapshots {
+	var errs []error
+	for index := range snapshots {
+		snapshot := &snapshots[index]
+		snapshot.captureStartedAt = time.Now()
+		snapshot.captureFinishedAt = time.Time{}
 		if err := fetchProfile(ctx, snapshot.url, snapshot.path); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf(
+				"fetch %s to %s: %w",
+				snapshot.url,
+				snapshot.path,
+				err,
+			))
 		}
+		snapshot.captureFinishedAt = time.Now()
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func writeProfileSummaries(ctx context.Context, summaries []profileSummary) error {
+	var errs []error
 	for _, summary := range summaries {
 		if err := writeProfileSummary(ctx, summary); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf(
+				"summarize %s to %s: %w",
+				summary.profile,
+				summary.path,
+				err,
+			))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func writeProfileSummary(ctx context.Context, summary profileSummary) error {
@@ -938,23 +1527,20 @@ func writeProfileSummary(ctx context.Context, summary profileSummary) error {
 	if err != nil {
 		return fmt.Errorf("summarize profile %s: %w: %s", summary.profile, err, strings.TrimSpace(string(output)))
 	}
-	f, err := os.Create(summary.path)
-	if err != nil {
+	return writeOutputFile(summary.path, func(f *os.File) error {
+		_, err := f.Write(output)
 		return err
-	}
-	if _, err := f.Write(output); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	})
 }
 
-func serverCPUProfileSeconds(duration time.Duration) int64 {
-	seconds := int64(duration / time.Second)
-	if seconds < 1 {
-		return 1
+func serverCPUProfileSeconds(duration time.Duration) (int64, error) {
+	if duration <= 0 {
+		return 0, errors.New("-server-cpu-profile-duration must be positive")
 	}
-	return seconds
+	if duration%time.Second != 0 {
+		return 0, errors.New("-server-cpu-profile-duration must be a whole number of seconds")
+	}
+	return int64(duration / time.Second), nil
 }
 
 func serverPProfURL(base string, endpoint string, query map[string]string) (string, error) {
@@ -984,15 +1570,29 @@ func fetchProfile(ctx context.Context, profileURL string, outputPath string) err
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetch %s: %s", profileURL, resp.Status)
 	}
-	f, err := os.Create(outputPath)
+	return writeOutputFile(outputPath, func(f *os.File) error {
+		_, err := io.Copy(f, resp.Body)
+		return err
+	})
+}
+
+func writeOutputFile(path string, write func(*os.File) error) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	tempPath := f.Name()
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+	if err := write(f); err != nil {
 		_ = f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func (f *metricSnapshotFlags) String() string {

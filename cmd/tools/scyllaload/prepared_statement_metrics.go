@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -20,6 +23,9 @@ const (
 	scyllaForwardedPreparedNotFoundMetric        = "scylla_transport_requests_forwarded_prepared_not_found"
 	scyllaAuthorizedPreparedCacheEvictionsMetric = "scylla_cql_authorized_prepared_statements_cache_evictions"
 	scyllaPreparedCacheSizeMetric                = "scylla_cql_prepared_cache_size"
+	scyllaReactorAwakeTimeMetric                 = "scylla_reactor_awake_time_ms_total"
+	scyllaReactorSleepTimeMetric                 = "scylla_reactor_sleep_time_ms_total"
+	scyllaReactorUptimeTolerance                 = 10 * time.Millisecond
 )
 
 type (
@@ -47,6 +53,8 @@ type (
 		oneOffPreparedCacheEvictions     metricSeries
 		authorizedPreparedCacheEvictions metricSeries
 		preparedCacheEntries             float64
+		reactorAwakeTime                 metricSeries
+		reactorSleepTime                 metricSeries
 	}
 
 	metricSeries map[string]float64
@@ -66,9 +74,37 @@ func readScyllaPreparedStatementMetrics(
 	}
 
 	metrics := &prepStats{}
-	for endpoint, afterSnapshot := range afterByURL {
-		beforeSnapshot, ok := beforeByURL[endpoint]
-		if !ok {
+	endpoints := make([]string, 0, len(beforeByURL)+len(afterByURL))
+	for endpoint := range beforeByURL {
+		endpoints = append(endpoints, endpoint)
+	}
+	for endpoint := range afterByURL {
+		if _, ok := beforeByURL[endpoint]; !ok {
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+	sort.Strings(endpoints)
+	for _, endpoint := range endpoints {
+		beforeSnapshot, hasBefore := beforeByURL[endpoint]
+		afterSnapshot, hasAfter := afterByURL[endpoint]
+		if !hasBefore || !hasAfter {
+			snapshot := beforeSnapshot
+			missingPhase := "post-run"
+			if !hasBefore {
+				snapshot = afterSnapshot
+				missingPhase = "pre-run"
+			}
+			parsed, err := readScyllaPreparedStatementSnapshot(snapshot.path)
+			if err != nil {
+				return nil, fmt.Errorf("%s: read metrics: %w", endpoint, err)
+			}
+			if parsed.found {
+				return nil, fmt.Errorf(
+					"%s: Scylla prepared statement metrics are missing from %s snapshots",
+					endpoint,
+					missingPhase,
+				)
+			}
 			continue
 		}
 		delta, found, err := readScyllaPreparedStatementDelta(beforeSnapshot, afterSnapshot)
@@ -112,14 +148,29 @@ func readScyllaPreparedStatementDelta(
 	if !before.found && !after.found {
 		return prepStats{}, false, nil
 	}
-	delta, err := calculatePreparedStatementDelta(before, after)
+	if before.found != after.found {
+		return prepStats{}, false, errors.New(
+			"scylla prepared statement metrics are present in only one snapshot",
+		)
+	}
+	delta, err := calculatePreparedStatementDelta(
+		before,
+		after,
+		beforeSnapshot,
+		afterSnapshot,
+	)
 	return delta, true, err
 }
 
 func calculatePreparedStatementDelta(
 	before scyllaPreparedStatementSnapshot,
 	after scyllaPreparedStatementSnapshot,
+	beforeCapture metricSnapshot,
+	afterCapture metricSnapshot,
 ) (prepStats, error) {
+	if err := validateScyllaMetricGeneration(before, after, beforeCapture, afterCapture); err != nil {
+		return prepStats{}, err
+	}
 	delta := prepStats{
 		MetricEndpoints:            1,
 		PreparedCacheEntriesBefore: before.preparedCacheEntries,
@@ -245,7 +296,127 @@ func parseScyllaPreparedStatementSnapshot(r io.Reader) (scyllaPreparedStatementS
 	snapshot.found = snapshot.found || found
 	snapshot.preparedCacheEntries, found = metricFamilySum(families[scyllaPreparedCacheSizeMetric], nil)
 	snapshot.found = snapshot.found || found
+	snapshot.reactorAwakeTime, _ = metricFamilySeries(families[scyllaReactorAwakeTimeMetric], nil)
+	snapshot.reactorSleepTime, _ = metricFamilySeries(families[scyllaReactorSleepTimeMetric], nil)
 	return snapshot, nil
+}
+
+func validateScyllaMetricGeneration(
+	before scyllaPreparedStatementSnapshot,
+	after scyllaPreparedStatementSnapshot,
+	beforeCapture metricSnapshot,
+	afterCapture metricSnapshot,
+) error {
+	beforeUptime, err := reactorUptimeSeries("pre-run", before)
+	if err != nil {
+		return err
+	}
+	afterUptime, err := reactorUptimeSeries("post-run", after)
+	if err != nil {
+		return err
+	}
+	if err := requireSameMetricSeries(
+		"Scylla reactor wall uptime",
+		beforeUptime,
+		afterUptime,
+	); err != nil {
+		return err
+	}
+	minimumElapsed, maximumElapsed, err := metricCaptureElapsedBounds(
+		beforeCapture,
+		afterCapture,
+	)
+	if err != nil {
+		return err
+	}
+	minimumMilliseconds := float64(max(minimumElapsed-scyllaReactorUptimeTolerance, 0)) /
+		float64(time.Millisecond)
+	maximumMilliseconds := float64(maximumElapsed+scyllaReactorUptimeTolerance) /
+		float64(time.Millisecond)
+	for series, beforeValue := range beforeUptime {
+		afterValue := afterUptime[series]
+		if math.IsNaN(beforeValue) || math.IsInf(beforeValue, 0) ||
+			math.IsNaN(afterValue) || math.IsInf(afterValue, 0) {
+			return fmt.Errorf("scylla reactor wall uptime for series %s is not finite", series)
+		}
+		delta := afterValue - beforeValue
+		if delta < minimumMilliseconds || delta > maximumMilliseconds {
+			return fmt.Errorf(
+				"scylla reactor wall uptime advanced by %vms for series %s, "+
+					"outside the capture interval %vms to %vms; process generation changed",
+				delta,
+				series,
+				minimumMilliseconds,
+				maximumMilliseconds,
+			)
+		}
+	}
+	return nil
+}
+
+func reactorUptimeSeries(
+	phase string,
+	snapshot scyllaPreparedStatementSnapshot,
+) (metricSeries, error) {
+	if len(snapshot.reactorAwakeTime) == 0 || len(snapshot.reactorSleepTime) == 0 {
+		return nil, fmt.Errorf(
+			"%s and %s are required in the %s snapshot to validate "+
+				"Scylla process generation and shard identity",
+			scyllaReactorAwakeTimeMetric,
+			scyllaReactorSleepTimeMetric,
+			phase,
+		)
+	}
+	if err := requireSameMetricSeries(
+		phase+" Scylla reactor wall uptime components",
+		snapshot.reactorAwakeTime,
+		snapshot.reactorSleepTime,
+	); err != nil {
+		return nil, err
+	}
+	uptime := make(metricSeries, len(snapshot.reactorAwakeTime))
+	for series, awakeTime := range snapshot.reactorAwakeTime {
+		uptime[series] = awakeTime + snapshot.reactorSleepTime[series]
+	}
+	return uptime, nil
+}
+
+func metricCaptureElapsedBounds(
+	before metricSnapshot,
+	after metricSnapshot,
+) (minimumElapsed time.Duration, maximumElapsed time.Duration, err error) {
+	if before.captureStartedAt.IsZero() || before.captureFinishedAt.IsZero() ||
+		after.captureStartedAt.IsZero() || after.captureFinishedAt.IsZero() {
+		return 0, 0, errors.New(
+			"metric capture timestamps are required to validate Scylla process generation",
+		)
+	}
+	if before.captureFinishedAt.Before(before.captureStartedAt) {
+		return 0, 0, errors.New("pre-run metric capture finished before it started")
+	}
+	if after.captureFinishedAt.Before(after.captureStartedAt) {
+		return 0, 0, errors.New("post-run metric capture finished before it started")
+	}
+	if after.captureStartedAt.Before(before.captureFinishedAt) {
+		return 0, 0, errors.New("post-run metric capture started before pre-run capture finished")
+	}
+	return after.captureStartedAt.Sub(before.captureFinishedAt),
+		after.captureFinishedAt.Sub(before.captureStartedAt),
+		nil
+}
+
+func requireSameMetricSeries(name string, before metricSeries, after metricSeries) error {
+	for series := range before {
+		if _, ok := after[series]; !ok {
+			return fmt.Errorf("%s metric series %s disappeared", name, series)
+		}
+	}
+	for series := range after {
+		if _, ok := before[series]; !ok {
+			return fmt.Errorf("%s metric series %s appeared", name, series)
+		}
+	}
+	return nil
 }
 
 func metricFamilySeries(family *dto.MetricFamily, requiredLabels map[string]string) (metricSeries, bool) {

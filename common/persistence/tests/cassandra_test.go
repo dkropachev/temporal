@@ -59,6 +59,10 @@ type (
 		queryStarted     chan struct{}
 		queryCanContinue chan struct{}
 	}
+	countingBatchSession struct {
+		gocql.Session
+		executeBatchCalls atomic.Int64
+	}
 	testQueueParams struct {
 		logger log.Logger
 	}
@@ -73,6 +77,11 @@ type (
 		maxIDToDelete int
 	}
 )
+
+func (s *countingBatchSession) ExecuteBatch(batch *gocql.Batch) error {
+	s.executeBatchCalls.Add(1)
+	return s.Session.ExecuteBatch(batch)
+}
 
 func (f failingIter) Scan(...any) bool {
 	return false
@@ -294,8 +303,9 @@ func TestCassandraHistoryNodeV2MigrationPreservesLegacyReads(t *testing.T) {
 		t.Context(),
 		session,
 		cassandra.HistoryNodeV2BackfillOptions{
-			PageSize:    10,
-			Concurrency: 2,
+			PageSize:        10,
+			Concurrency:     2,
+			TokenRangeCount: 8,
 		},
 	)
 	require.NoError(t, err)
@@ -406,6 +416,13 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 		t.Fatal(t.Context().Err())
 	}
 	appendHistoryNodeForMigrationTest(t, rebuildV2Store, branchInfo, 4)
+	appendHistoryNodeForMigrationTest(t, rebuildV2Store, branchInfo, 40)
+	deleteWhileV2Missing := &persistence.InternalDeleteHistoryNodesRequest{
+		BranchInfo:    branchInfo,
+		NodeID:        40,
+		TransactionID: 40,
+	}
+	require.Error(t, rebuildV2Store.DeleteHistoryNodes(t.Context(), deleteWhileV2Missing))
 	require.NoError(t, rebuildV2Store.DeleteHistoryBranch(
 		t.Context(),
 		&persistence.InternalDeleteHistoryBranchRequest{
@@ -420,10 +437,16 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 	copied, err := cassandra.BackfillHistoryNodeV2(
 		t.Context(),
 		session,
-		cassandra.HistoryNodeBackfillOptions{PageSize: 2, Concurrency: 2},
+		cassandra.HistoryNodeBackfillOptions{
+			PageSize:        2,
+			Concurrency:     2,
+			TokenRangeCount: 8,
+			SourceLayout:    cassandra.HistoryNodeTableLayoutBranchV2,
+		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, int64(5), copied)
+	require.Equal(t, int64(6), copied)
+	require.NoError(t, rebuildV2Store.DeleteHistoryNodes(t.Context(), deleteWhileV2Missing))
 	var staleNodeID int64
 	err = session.Query(
 		`SELECT node_id FROM history_node_v2 `+
@@ -446,6 +469,32 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 		TransactionID: 2,
 	}))
 	appendHistoryNodeForMigrationTest(t, oldV2Store, branchInfo, 6)
+	insertHistoryNodeForMigrationTest(t, session, treeID, branchID, 7)
+
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
+	))
+	prepareCutoverStore := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
+	)
+	appendHistoryNodeForMigrationTest(t, prepareCutoverStore, branchInfo, 8)
+	copied, err = cassandra.BackfillHistoryNodeV2(
+		t.Context(),
+		session,
+		cassandra.HistoryNodeBackfillOptions{
+			PageSize:        2,
+			Concurrency:     2,
+			TokenRangeCount: 8,
+			SourceLayout:    cassandra.HistoryNodeTableLayoutBranchV2,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(7), copied)
 
 	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
 		t.Context(),
@@ -458,14 +507,6 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 		serialization.NewSerializer(),
 		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
 	)
-	appendHistoryNodeForMigrationTest(t, cutoverStore, branchInfo, 7)
-	require.Equal(t, []int64{7, 6, 5, 4, 1}, readHistoryNodeIDsForMigrationTest(
-		t,
-		oldV2Store,
-		treeID,
-		branchID,
-	))
-	appendHistoryNodeForMigrationTest(t, oldV2Store, branchInfo, 8)
 	require.Equal(t, []int64{8, 7, 6, 5, 4, 1}, readHistoryNodeIDsForMigrationTest(
 		t,
 		cutoverStore,
@@ -509,24 +550,20 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 	for nodeID := int64(20); nodeID < 30; nodeID++ {
 		appendHistoryNodeForMigrationTest(t, rebuildV1Store, branchInfo, nodeID)
 	}
-	require.NoError(t, rebuildV1Store.DeleteHistoryNodes(
-		t.Context(),
-		&persistence.InternalDeleteHistoryNodesRequest{
-			BranchInfo:    branchInfo,
-			NodeID:        8,
-			TransactionID: 8,
-		},
-	))
-	require.NoError(t, rebuildV1Store.DeleteHistoryBranch(
-		t.Context(),
-		&persistence.InternalDeleteHistoryBranchRequest{
-			BranchInfo: deletedBranchInfo,
-			BranchRanges: []persistence.InternalDeleteHistoryBranchRange{{
-				BranchId:    deletedBranchID,
-				BeginNodeId: 10,
-			}},
-		},
-	))
+	deleteWhileV1Missing := &persistence.InternalDeleteHistoryNodesRequest{
+		BranchInfo:    branchInfo,
+		NodeID:        8,
+		TransactionID: 8,
+	}
+	require.Error(t, rebuildV1Store.DeleteHistoryNodes(t.Context(), deleteWhileV1Missing))
+	deleteBranchWhileV1Missing := &persistence.InternalDeleteHistoryBranchRequest{
+		BranchInfo: deletedBranchInfo,
+		BranchRanges: []persistence.InternalDeleteHistoryBranchRange{{
+			BranchId:    deletedBranchID,
+			BeginNodeId: 10,
+		}},
+	}
+	require.Error(t, rebuildV1Store.DeleteHistoryBranch(t.Context(), deleteBranchWhileV1Missing))
 	close(recreateV1Session.queryCanContinue)
 	require.NoError(t, <-recreateV1Result)
 	appendHistoryNodeForMigrationTest(t, rebuildV1Store, branchInfo, 9)
@@ -556,10 +593,16 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 	copied, err = cassandra.BackfillHistoryNodeV1(
 		t.Context(),
 		session,
-		cassandra.HistoryNodeBackfillOptions{PageSize: 2, Concurrency: 2},
+		cassandra.HistoryNodeBackfillOptions{
+			PageSize:        2,
+			Concurrency:     2,
+			TokenRangeCount: 8,
+		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, int64(17), copied)
+	require.Equal(t, int64(19), copied)
+	require.NoError(t, rebuildV1Store.DeleteHistoryNodes(t.Context(), deleteWhileV1Missing))
+	require.NoError(t, rebuildV1Store.DeleteHistoryBranch(t.Context(), deleteBranchWhileV1Missing))
 	var tombstonedNodeID int64
 	err = session.Query(
 		`SELECT node_id FROM history_node `+
@@ -592,6 +635,55 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 		config.CassandraHistoryNodeMigrationModeCanonicalDual,
 	)
 	appendHistoryNodeForMigrationTest(t, canonicalStore, branchInfo, 10)
+	branchToken, err := canonicalStore.NewHistoryBranch(
+		"",
+		"",
+		"",
+		treeID,
+		util.Ptr(branchID),
+		nil,
+		0,
+		0,
+		0,
+	)
+	require.NoError(t, err)
+	page, err := canonicalStore.ReadHistoryBranch(
+		t.Context(),
+		&persistence.InternalReadHistoryBranchRequest{
+			BranchToken: branchToken,
+			BranchID:    branchID,
+			MinNodeID:   1,
+			MaxNodeID:   100,
+			PageSize:    1,
+		},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, page.NextPageToken)
+	continuation, err := canonicalStore.ReadHistoryBranch(
+		t.Context(),
+		&persistence.InternalReadHistoryBranchRequest{
+			BranchToken:           branchToken,
+			BranchID:              branchID,
+			MinNodeID:             1,
+			MaxNodeID:             100,
+			PageSize:              1,
+			NextPageToken:         page.NextPageToken,
+			NextPageTokenMetadata: page.NextPageTokenMetadata,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, page.Nodes, 1)
+	require.Len(t, continuation.Nodes, 1)
+	require.NotEqual(t, page.Nodes[0].NodeID, continuation.Nodes[0].NodeID)
+	legacyIter := session.Query(
+		`SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node `+
+			`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ?`,
+		treeID,
+		branchID,
+		int64(1),
+		int64(100),
+	).PageSize(1).PageState(page.NextPageToken).Iter()
+	require.Error(t, legacyIter.Close(), "a canonical page token must fail safely on an older V1 query")
 
 	require.NoError(t, canonicalStore.DeleteHistoryBranch(
 		t.Context(),
@@ -610,12 +702,42 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 		branchID,
 	))
 
+	insertHistoryNodeV2ForMigrationTest(t, session, treeID, branchID, 3)
+	require.NoError(t, cassandra.ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		session,
+		cfg.Keyspace,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+	))
+	v1CutoverStore := cassandra.NewHistoryStore(
+		session,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+	)
+	require.Equal(t, []int64{4, 3, 1}, readHistoryNodeIDsForMigrationTest(
+		t,
+		v1CutoverStore,
+		treeID,
+		branchID,
+	))
+	copied, err = cassandra.BackfillHistoryNodeV1(
+		t.Context(),
+		session,
+		cassandra.HistoryNodeBackfillOptions{
+			PageSize:        2,
+			Concurrency:     2,
+			TokenRangeCount: 8,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), copied)
+
 	rollbackStore := cassandra.NewHistoryStore(
 		session,
 		serialization.NewSerializer(),
-		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
 	)
-	require.Equal(t, []int64{4, 1}, readHistoryNodeIDsForMigrationTest(
+	require.Equal(t, []int64{4, 3, 1}, readHistoryNodeIDsForMigrationTest(
 		t,
 		rollbackStore,
 		treeID,
@@ -629,6 +751,49 @@ func TestCassandraHistoryNodeOnlineMigrationFromOldV2(t *testing.T) {
 	))
 }
 
+func TestCassandraHistoryBranchDeleteUsesBoundedBatches(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewCassandraConfig()
+	logger := log.NewNoopLogger()
+	SetUpCassandraDatabase(t, cfg, logger)
+	t.Cleanup(func() {
+		TearDownCassandraKeyspace(t, cfg)
+	})
+	SetUpCassandraSchema(t, cfg, logger)
+
+	session := newCassandraTestSession(t, cfg, logger)
+	defer session.Close()
+	countingSession := &countingBatchSession{Session: session}
+	store := cassandra.NewHistoryStore(
+		countingSession,
+		serialization.NewSerializer(),
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+	const branchCount = 128
+	ranges := make([]persistence.InternalDeleteHistoryBranchRange, branchCount)
+	for i := range ranges {
+		ranges[i] = persistence.InternalDeleteHistoryBranchRange{
+			BranchId:    uuid.NewString(),
+			BeginNodeId: 1,
+		}
+	}
+
+	err := store.DeleteHistoryBranch(
+		t.Context(),
+		&persistence.InternalDeleteHistoryBranchRequest{
+			BranchInfo: &persistencespb.HistoryBranch{
+				TreeId:   uuid.NewString(),
+				BranchId: uuid.NewString(),
+			},
+			BranchRanges: ranges,
+		},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(branchCount), countingSession.executeBatchCalls.Load())
+}
+
 func insertHistoryNodeForMigrationTest(
 	t *testing.T,
 	session gocql.Session,
@@ -639,6 +804,29 @@ func insertHistoryNodeForMigrationTest(
 	t.Helper()
 	err := session.Query(
 		`INSERT INTO history_node (`+
+			`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) `+
+			`VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		treeID,
+		branchID,
+		nodeID,
+		nodeID-1,
+		nodeID,
+		[]byte("events"),
+		enumspb.ENCODING_TYPE_PROTO3.String(),
+	).Exec()
+	require.NoError(t, err)
+}
+
+func insertHistoryNodeV2ForMigrationTest(
+	t *testing.T,
+	session gocql.Session,
+	treeID string,
+	branchID string,
+	nodeID int64,
+) {
+	t.Helper()
+	err := session.Query(
+		`INSERT INTO history_node_v2 (`+
 			`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) `+
 			`VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		treeID,
