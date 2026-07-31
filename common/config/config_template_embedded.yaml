@@ -5,11 +5,7 @@ log:
 
 {{- $db := default "cassandra" (env "DB") | lower }}
 persistence:
-    {{- if eq $db "cassandra" }}
-    numHistoryShards: {{ default "512" (env "NUM_HISTORY_SHARDS") }}
-    {{- else }}
     numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
-    {{- end }}
     defaultStore: default
     {{- $es := default "false" (env "ENABLE_ES") | lower -}}
     {{- if eq $es "true" }}

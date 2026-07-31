@@ -9,11 +9,7 @@ log:
   {{- fail "Invalid DB value. Supported values are cassandra, mysql8, postgres12, postgres12_pgx" -}}
 {{- end }}
 persistence:
-    {{- if eq $db "cassandra" }}
-    numHistoryShards: {{ default "512" (env "NUM_HISTORY_SHARDS") }}
-    {{- else }}
     numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
-    {{- end }}
 
     defaultStore: default
     visibilityStore: visibility
