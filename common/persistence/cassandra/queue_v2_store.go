@@ -1,7 +1,6 @@
 package cassandra
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -24,7 +23,7 @@ type (
 		logger        log.Logger
 		knownQueuesMu sync.RWMutex
 		knownQueues   map[queueV2Key]struct{}
-		queueLocks    [queueV2LockStripes]sync.Mutex
+		queueLocks    [queueV2LockStripes]queueV2Lock
 	}
 
 	Queue struct {
@@ -35,6 +34,11 @@ type (
 	queueV2Key struct {
 		queueType persistence.QueueV2Type
 		queueName string
+	}
+
+	queueV2Lock struct {
+		initialize sync.Once
+		semaphore  chan struct{}
 	}
 )
 
@@ -102,11 +106,14 @@ func (s *queueV2Store) EnqueueMessage(
 ) (*persistence.InternalEnqueueMessageResponse, error) {
 	queueType := request.QueueType
 	queueName := request.QueueName
-	unlock := s.lockQueue(queueType, queueName)
+	unlock, err := s.lockQueue(ctx, queueType, queueName)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 
 	if !s.isKnownQueue(queueType, queueName) {
-		_, err := s.getQueue(ctx, queueType, queueName)
+		_, err = s.getQueue(ctx, queueType, queueName)
 		if err != nil {
 			return nil, err
 		}
@@ -135,23 +142,15 @@ func (s *queueV2Store) ReadMessages(
 	if request.PageSize <= 0 {
 		return nil, persistence.ErrNonPositiveReadQueueMessagesPageSize
 	}
-	var queueMetadata *persistencespb.Queue
-	if len(request.NextPageToken) == 0 {
-		q, err := s.getQueue(ctx, request.QueueType, request.QueueName)
-		if err != nil {
-			return nil, err
-		}
-		queueMetadata = q.Metadata
-	} else if !s.isKnownQueue(request.QueueType, request.QueueName) {
-		if _, err := s.getQueue(ctx, request.QueueType, request.QueueName); err != nil {
-			return nil, err
-		}
+	q, err := s.getQueue(ctx, request.QueueType, request.QueueName)
+	if err != nil {
+		return nil, err
 	}
 	minMessageID, err := persistence.GetMinMessageIDToReadForQueueV2(
 		request.QueueType,
 		request.QueueName,
 		request.NextPageToken,
-		queueMetadata,
+		q.Metadata,
 	)
 	if err != nil {
 		return nil, err
@@ -269,15 +268,28 @@ func (s *queueV2Store) RangeDeleteMessages(
 	if err != nil {
 		return nil, err
 	}
-	if request.InclusiveMaxMessageMetadata.ID < partition.MinMessageId {
-		return &persistence.InternalRangeDeleteMessagesResponse{}, nil
-	}
 	maxMessageID, ok, err := s.getMaxMessageID(ctx, queueType, queueName)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		// Nothing in the queue to delete.
+		return &persistence.InternalRangeDeleteMessagesResponse{}, nil
+	}
+	// A retry after metadata was committed but physical deletion failed must finish the
+	// idempotent cleanup without moving the queue's logical minimum again.
+	if request.InclusiveMaxMessageMetadata.ID < partition.MinMessageId ||
+		partition.MinMessageId > maxMessageID {
+		err := s.deleteMessageRange(
+			ctx,
+			queueType,
+			queueName,
+			persistence.FirstQueueMessageID,
+			min(request.InclusiveMaxMessageMetadata.ID, maxMessageID-1),
+		)
+		if err != nil {
+			return nil, err
+		}
 		return &persistence.InternalRangeDeleteMessagesResponse{}, nil
 	}
 	deleteRange, ok := persistence.GetDeleteRange(persistence.DeleteRequest{
@@ -290,25 +302,48 @@ func (s *queueV2Store) RangeDeleteMessages(
 	if !ok {
 		return &persistence.InternalRangeDeleteMessagesResponse{}, nil
 	}
-	err = s.session.Query(
-		TemplateRangeDeleteMessagesQuery,
-		queueType,
-		queueName,
-		0, // partition
-		deleteRange.MinMessageID,
-		deleteRange.MaxMessageID,
-	).WithContext(ctx).Exec()
-	if err != nil {
-		return nil, gocql.ConvertError("QueueV2RangeDeleteMessages", err)
-	}
 	partition.MinMessageId = deleteRange.NewMinMessageID
 	err = s.updateQueue(ctx, q, queueType, queueName)
+	if err != nil {
+		return nil, err
+	}
+	err = s.deleteMessageRange(
+		ctx,
+		queueType,
+		queueName,
+		deleteRange.MinMessageID,
+		deleteRange.MaxMessageID,
+	)
 	if err != nil {
 		return nil, err
 	}
 	return &persistence.InternalRangeDeleteMessagesResponse{
 		MessagesDeleted: deleteRange.MessagesToDelete,
 	}, nil
+}
+
+func (s *queueV2Store) deleteMessageRange(
+	ctx context.Context,
+	queueType persistence.QueueV2Type,
+	queueName string,
+	minMessageID int64,
+	maxMessageID int64,
+) error {
+	if maxMessageID < minMessageID {
+		return nil
+	}
+	err := s.session.Query(
+		TemplateRangeDeleteMessagesQuery,
+		queueType,
+		queueName,
+		0, // partition
+		minMessageID,
+		maxMessageID,
+	).WithContext(ctx).Exec()
+	if err != nil {
+		return gocql.ConvertError("QueueV2RangeDeleteMessages", err)
+	}
+	return nil
 }
 
 func (s *queueV2Store) updateQueue(
@@ -423,10 +458,30 @@ func (s *queueV2Store) forgetKnownQueue(queueType persistence.QueueV2Type, queue
 	})
 }
 
-func (s *queueV2Store) lockQueue(queueType persistence.QueueV2Type, queueName string) func() {
-	mutex := &s.queueLocks[queueV2LockIndex(queueType, queueName)]
-	mutex.Lock()
-	return mutex.Unlock
+func (s *queueV2Store) lockQueue(
+	ctx context.Context,
+	queueType persistence.QueueV2Type,
+	queueName string,
+) (func(), error) {
+	lock := &s.queueLocks[queueV2LockIndex(queueType, queueName)]
+	lock.initialize.Do(func() {
+		lock.semaphore = make(chan struct{}, 1)
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case lock.semaphore <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock.semaphore
+			return nil, err
+		}
+		return func() {
+			<-lock.semaphore
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func queueV2LockIndex(queueType persistence.QueueV2Type, queueName string) uint32 {
@@ -540,63 +595,48 @@ func (s *queueV2Store) ListQueues(
 	if request.PageSize <= 0 {
 		return nil, persistence.ErrNonPositiveListQueuesPageSize
 	}
-	var queues []persistence.QueueInfo
-	nextPageToken := request.NextPageToken
-	for {
-		currentPageToken := nextPageToken
-		iter := s.session.Query(
-			templateGetQueueNamesQuery,
-			request.QueueType,
-		).PageSize(request.PageSize - len(queues)).PageState(currentPageToken).WithContext(ctx).Iter()
+	iter := s.session.Query(
+		templateGetQueueNamesQuery,
+		request.QueueType,
+	).PageSize(request.PageSize).PageState(request.NextPageToken).WithContext(ctx).Iter()
 
-		closeIter := func() {
+	var queues []persistence.QueueInfo
+	for {
+		var (
+			queueName        string
+			metadataBytes    []byte
+			metadataEncoding string
+			version          int64
+		)
+		if !iter.Scan(&queueName, &metadataBytes, &metadataEncoding, &version) {
+			break
+		}
+		q, err := getQueueFromMetadata(request.QueueType, queueName, metadataBytes, metadataEncoding, version)
+		if err != nil {
 			_ = iter.Close()
+			return nil, err
 		}
-		for len(queues) < request.PageSize {
-			var (
-				queueName        string
-				metadataBytes    []byte
-				metadataEncoding string
-				version          int64
-			)
-			if !iter.Scan(&queueName, &metadataBytes, &metadataEncoding, &version) {
-				break
-			}
-			q, err := getQueueFromMetadata(request.QueueType, queueName, metadataBytes, metadataEncoding, version)
-			if err != nil {
-				closeIter()
-				return nil, err
-			}
-			partition, err := persistence.GetPartitionForQueueV2(request.QueueType, queueName, q.Metadata)
-			if err != nil {
-				closeIter()
-				return nil, err
-			}
-			messageCount, lastMessageID, err := s.getMessageCountAndLastID(ctx, request.QueueType, queueName, partition)
-			if err != nil {
-				closeIter()
-				return nil, err
-			}
-			queues = append(queues, persistence.QueueInfo{
-				QueueName:     queueName,
-				MessageCount:  messageCount,
-				LastMessageID: lastMessageID,
-			})
+		partition, err := persistence.GetPartitionForQueueV2(request.QueueType, queueName, q.Metadata)
+		if err != nil {
+			_ = iter.Close()
+			return nil, err
 		}
-		if err := iter.Close(); err != nil {
-			return nil, gocql.ConvertError("QueueV2ListQueues", err)
+		messageCount, lastMessageID, err := s.getMessageCountAndLastID(ctx, request.QueueType, queueName, partition)
+		if err != nil {
+			_ = iter.Close()
+			return nil, err
 		}
-		nextPageToken = iter.PageState()
-		if len(queues) == request.PageSize || len(nextPageToken) == 0 {
-			break
-		}
-		if bytes.Equal(nextPageToken, currentPageToken) {
-			nextPageToken = nil
-			break
-		}
+		queues = append(queues, persistence.QueueInfo{
+			QueueName:     queueName,
+			MessageCount:  messageCount,
+			LastMessageID: lastMessageID,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, gocql.ConvertError("QueueV2ListQueues", err)
 	}
 	return &persistence.InternalListQueuesResponse{
 		Queues:        queues,
-		NextPageToken: nextPageToken,
+		NextPageToken: iter.PageState(),
 	}, nil
 }

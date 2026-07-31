@@ -3,8 +3,6 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"slices"
-
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 )
@@ -191,7 +189,10 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 
 	for {
 		query := d.Session.Query(templateListTaskQueueNamesByBuildIdQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
-		iter := query.PageSize(listTaskQueueNamesByBuildIdPageSize).PageState(pageToken).Iter()
+		iter := query.
+			PageSize(listTaskQueueNamesByBuildIdPageSize).
+			PageState(pageToken).
+			Iter()
 		row := make(map[string]any)
 		for iter.MapScan(row) {
 			taskQueueRaw, ok := row["task_queue_name"]
@@ -214,12 +215,11 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 		if err := iter.Close(); err != nil {
 			return nil, gocql.ConvertError("GetTaskQueuesByBuildId", err)
 		}
-		if len(nextPageToken) == 0 || slices.Equal(nextPageToken, pageToken) {
-			break
+		if len(nextPageToken) == 0 {
+			return taskQueues, nil
 		}
 		pageToken = nextPageToken
 	}
-	return taskQueues, nil
 }
 
 func (d *userDataStore) CountTaskQueuesByBuildId(ctx context.Context, request *p.CountTaskQueuesByBuildIdRequest) (int, error) {

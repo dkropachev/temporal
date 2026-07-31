@@ -191,7 +191,7 @@ func (s *NexusEndpointStore) ListNexusEndpoints(
 	ctx context.Context,
 	request *p.ListNexusEndpointsRequest,
 ) (*p.InternalListNexusEndpointsResponse, error) {
-	if request.NextPageToken == nil {
+	if len(request.NextPageToken) == 0 {
 		return s.listFirstPageWithVersion(ctx, request)
 	}
 

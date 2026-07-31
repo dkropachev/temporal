@@ -84,6 +84,47 @@ func TestListNexusEndpointsUsesSameQueryForPageToken(t *testing.T) {
 	require.Equal(t, token, session.queries[0].query.pageState)
 }
 
+func TestListNexusEndpointsTreatsEmptyPageTokenAsFirstPage(t *testing.T) {
+	endpointID := "11111111-1111-1111-1111-111111111111"
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateListEndpointsFirstPageQuery, stmt)
+			require.Empty(t, args)
+			id, err := gocql.ParseUUID(endpointID)
+			require.NoError(t, err)
+			return &recordingQuery{
+				iter: &recordingIter{
+					mapRows: []map[string]any{
+						{
+							"version": int64(7),
+						},
+						{
+							"id":            id,
+							"version":       int64(1),
+							"data":          []byte("endpoint"),
+							"data_encoding": enumspb.ENCODING_TYPE_PROTO3.String(),
+						},
+					},
+				},
+			}
+		},
+	}
+	store := &NexusEndpointStore{session: session}
+
+	resp, err := store.ListNexusEndpoints(t.Context(), &p.ListNexusEndpointsRequest{
+		NextPageToken: []byte{},
+		PageSize:      10,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, int64(7), resp.TableVersion)
+	require.Len(t, resp.Endpoints, 1)
+	require.Equal(t, endpointID, resp.Endpoints[0].ID)
+	require.Len(t, session.queries, 1)
+	require.Empty(t, session.queries[0].query.pageState)
+}
+
 func TestNullableInt64UnmarshalCQL(t *testing.T) {
 	info := gocql.NewNativeType(4, gocql.TypeBigInt)
 	var value nullableInt64
@@ -192,9 +233,7 @@ func TestListQueuesUsesSameQueryForPageToken(t *testing.T) {
 		queryFn: func(stmt string, args ...any) cgocql.Query {
 			require.Equal(t, templateGetQueueNamesQuery, stmt)
 			require.Equal(t, []any{p.QueueTypeHistoryDLQ}, args)
-			return &recordingQuery{
-				iter: &recordingIter{pageState: pageState},
-			}
+			return &recordingQuery{iter: &recordingIter{}}
 		},
 	}
 	store := &queueV2Store{session: session}
@@ -209,68 +248,7 @@ func TestListQueuesUsesSameQueryForPageToken(t *testing.T) {
 	require.Empty(t, resp.Queues)
 	require.Nil(t, resp.NextPageToken)
 	require.Len(t, session.queries, 1)
-}
-
-func TestListQueuesContinuesAcrossEmptyFilteredPage(t *testing.T) {
-	queueBytes, err := (&persistencespb.Queue{
-		Partitions: map[int32]*persistencespb.QueuePartition{
-			0: {
-				MinMessageId: p.FirstQueueMessageID,
-			},
-		},
-	}).Marshal()
-	require.NoError(t, err)
-
-	firstPageState := []byte("first-page")
-	nextPageState := []byte("next-page")
-	session := &recordingSession{
-		t: t,
-		queryFn: func(stmt string, args ...any) cgocql.Query {
-			switch stmt {
-			case templateGetQueueNamesQuery:
-				require.Equal(t, []any{p.QueueTypeHistoryDLQ}, args)
-				return &recordingQuery{
-					iterFn: func(q *recordingQuery) cgocql.Iter {
-						switch string(q.pageState) {
-						case "":
-							return &recordingIter{pageState: firstPageState}
-						case string(firstPageState):
-							return &recordingIter{
-								pageState: nextPageState,
-								scanRows: [][]any{
-									{"queue-0", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
-								},
-							}
-						default:
-							t.Fatalf("unexpected page state: %q", q.pageState)
-							return nil
-						}
-					},
-				}
-			case TemplateGetMaxMessageIDQuery:
-				return &recordingQuery{
-					scanFn: func(dest ...any) error {
-						return gocql.ErrNotFound
-					},
-				}
-			default:
-				t.Fatalf("unexpected query: %s", stmt)
-				return nil
-			}
-		},
-	}
-	store := &queueV2Store{session: session}
-
-	resp, err := store.ListQueues(t.Context(), &p.InternalListQueuesRequest{
-		QueueType: p.QueueTypeHistoryDLQ,
-		PageSize:  1,
-	})
-
-	require.NoError(t, err)
-	require.Len(t, resp.Queues, 1)
-	require.Equal(t, "queue-0", resp.Queues[0].QueueName)
-	require.Equal(t, nextPageState, resp.NextPageToken)
-	require.Len(t, session.queries, 3)
+	require.Equal(t, pageState, session.queries[0].query.pageState)
 }
 
 func TestListQueuesReturnsIteratorPageState(t *testing.T) {
@@ -319,79 +297,6 @@ func TestListQueuesReturnsIteratorPageState(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Queues, 1)
 	require.Equal(t, []byte("next-page"), resp.NextPageToken)
-}
-
-func TestListQueuesFillsLogicalPageAcrossCassandraPages(t *testing.T) {
-	queueBytes, err := (&persistencespb.Queue{
-		Partitions: map[int32]*persistencespb.QueuePartition{
-			0: {
-				MinMessageId: p.FirstQueueMessageID,
-			},
-		},
-	}).Marshal()
-	require.NoError(t, err)
-
-	firstPageState := []byte("first-page")
-	nextPageState := []byte("next-page")
-	session := &recordingSession{
-		t: t,
-		queryFn: func(stmt string, args ...any) cgocql.Query {
-			switch stmt {
-			case templateGetQueueNamesQuery:
-				require.Equal(t, []any{p.QueueTypeHistoryDLQ}, args)
-				return &recordingQuery{
-					iterFn: func(q *recordingQuery) cgocql.Iter {
-						switch string(q.pageState) {
-						case "":
-							require.Equal(t, 3, q.pageSize)
-							return &recordingIter{
-								pageState: firstPageState,
-								scanRows: [][]any{
-									{"queue-0", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
-								},
-							}
-						case string(firstPageState):
-							require.Equal(t, 2, q.pageSize)
-							return &recordingIter{
-								pageState: nextPageState,
-								scanRows: [][]any{
-									{"queue-1", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
-									{"queue-2", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
-								},
-							}
-						default:
-							t.Fatalf("unexpected page state: %q", q.pageState)
-							return nil
-						}
-					},
-				}
-			case TemplateGetMaxMessageIDQuery:
-				return &recordingQuery{
-					scanFn: func(dest ...any) error {
-						return gocql.ErrNotFound
-					},
-				}
-			default:
-				t.Fatalf("unexpected query: %s", stmt)
-				return nil
-			}
-		},
-	}
-	store := &queueV2Store{session: session}
-
-	resp, err := store.ListQueues(t.Context(), &p.InternalListQueuesRequest{
-		QueueType: p.QueueTypeHistoryDLQ,
-		PageSize:  3,
-	})
-
-	require.NoError(t, err)
-	require.Len(t, resp.Queues, 3)
-	require.Equal(t, []byte("next-page"), resp.NextPageToken)
-	require.Equal(t, []string{"queue-0", "queue-1", "queue-2"}, []string{
-		resp.Queues[0].QueueName,
-		resp.Queues[1].QueueName,
-		resp.Queues[2].QueueName,
-	})
 }
 
 func TestListQueuesQueryKeepsUpgradeCompatibleQueueSchema(t *testing.T) {
@@ -501,6 +406,20 @@ func TestHistoryNodeMigrationModeRoutesQueries(t *testing.T) {
 			mutationQueries: []string{v2templateUpsertHistoryNode, v2templateUpsertHistoryNodeV2},
 		},
 		{
+			mode:            config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+			forwardRead:     v2templateReadHistoryNode,
+			reverseRead:     v2templateReadHistoryNodeReverse,
+			metadataRead:    v2templateReadHistoryNodeMetadata,
+			mutationQueries: []string{v2templateUpsertHistoryNode, v2templateUpsertHistoryNodeV2},
+		},
+		{
+			mode:            config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
+			forwardRead:     v2templateReadHistoryNode,
+			reverseRead:     v2templateReadHistoryNodeReverse,
+			metadataRead:    v2templateReadHistoryNodeMetadata,
+			mutationQueries: []string{v2templateUpsertHistoryNodeV2, v2templateUpsertHistoryNode},
+		},
+		{
 			mode:            config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
 			forwardRead:     v2templateReadHistoryNode,
 			reverseRead:     v2templateReadHistoryNodeReverseOldV2,
@@ -516,6 +435,13 @@ func TestHistoryNodeMigrationModeRoutesQueries(t *testing.T) {
 			mutationQueries: []string{v2templateUpsertHistoryNode, v2templateUpsertHistoryNodeV2},
 		},
 		{
+			mode:            config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
+			forwardRead:     v2templateReadHistoryNode,
+			reverseRead:     v2templateReadHistoryNodeReverseOldV2,
+			metadataRead:    v2templateReadHistoryNodeMetadata,
+			mutationQueries: []string{v2templateUpsertHistoryNodeV2, v2templateUpsertHistoryNode},
+		},
+		{
 			mode:            config.CassandraHistoryNodeMigrationModeV1RebuildDual,
 			forwardRead:     v2templateReadHistoryNodeV2,
 			reverseRead:     v2templateReadHistoryNodeReverseV2,
@@ -524,11 +450,18 @@ func TestHistoryNodeMigrationModeRoutesQueries(t *testing.T) {
 			optionalMirror:  historyNodeTableName,
 		},
 		{
-			mode:            config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+			mode:            config.CassandraHistoryNodeMigrationModeV1CutoverDual,
 			forwardRead:     v2templateReadHistoryNodeV2,
 			reverseRead:     v2templateReadHistoryNodeReverseV2,
 			metadataRead:    v2templateReadHistoryNodeMetadataV2,
 			mutationQueries: []string{v2templateUpsertHistoryNode, v2templateUpsertHistoryNodeV2},
+		},
+		{
+			mode:            config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+			forwardRead:     v2templateReadHistoryNodeV2,
+			reverseRead:     v2templateReadHistoryNodeReverseV2,
+			metadataRead:    v2templateReadHistoryNodeMetadataV2,
+			mutationQueries: []string{v2templateUpsertHistoryNodeV2, v2templateUpsertHistoryNode},
 		},
 		{
 			mode:            config.CassandraHistoryNodeMigrationModeV2Only,
@@ -542,7 +475,7 @@ func TestHistoryNodeMigrationModeRoutesQueries(t *testing.T) {
 			forwardRead:     v2templateReadHistoryNodeV2,
 			reverseRead:     v2templateReadHistoryNodeReverseV2,
 			metadataRead:    v2templateReadHistoryNodeMetadataV2,
-			mutationQueries: []string{v2templateUpsertHistoryNode, v2templateUpsertHistoryNodeV2},
+			mutationQueries: []string{v2templateUpsertHistoryNodeV2, v2templateUpsertHistoryNode},
 		},
 	}
 
@@ -594,11 +527,13 @@ func TestAppendHistoryNodesWritesMirrorOutsideBatch(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []string{
-		v2templateUpsertHistoryNode,
 		v2templateUpsertHistoryNodeV2,
+		v2templateUpsertHistoryNode,
 	}, recordedStatements(session.queries))
 	require.Equal(t, events, session.queries[0].args[5])
 	require.Equal(t, events, session.queries[1].args[5])
+	require.NotZero(t, session.queries[0].query.timestamp)
+	require.Equal(t, session.queries[0].query.timestamp, session.queries[1].query.timestamp)
 }
 
 func TestAppendHistoryNodesDualWriteFailureHandling(t *testing.T) {
@@ -694,7 +629,7 @@ func TestAppendHistoryNodesRetryRepairsRequiredMirror(t *testing.T) {
 		queryFn: func(stmt string, _ ...any) cgocql.Query {
 			return &recordingQuery{
 				execFn: func() error {
-					if stmt == v2templateUpsertHistoryNodeV2 {
+					if stmt == v2templateUpsertHistoryNode {
 						mirrorAttempts++
 						if mirrorAttempts == 1 {
 							return errors.New("mirror failed")
@@ -714,17 +649,17 @@ func TestAppendHistoryNodesRetryRepairsRequiredMirror(t *testing.T) {
 	request := testHistoryNodeAppendRequest([]byte("events"))
 
 	require.Error(t, store.AppendHistoryNodes(t.Context(), request))
-	require.True(t, persisted[v2templateUpsertHistoryNode])
-	require.False(t, persisted[v2templateUpsertHistoryNodeV2])
+	require.True(t, persisted[v2templateUpsertHistoryNodeV2])
+	require.False(t, persisted[v2templateUpsertHistoryNode])
 
 	require.NoError(t, store.AppendHistoryNodes(t.Context(), request))
-	require.True(t, persisted[v2templateUpsertHistoryNode])
 	require.True(t, persisted[v2templateUpsertHistoryNodeV2])
+	require.True(t, persisted[v2templateUpsertHistoryNode])
 	require.Equal(t, []string{
-		v2templateUpsertHistoryNode,
 		v2templateUpsertHistoryNodeV2,
 		v2templateUpsertHistoryNode,
 		v2templateUpsertHistoryNodeV2,
+		v2templateUpsertHistoryNode,
 	}, recordedStatements(session.queries))
 }
 
@@ -832,6 +767,39 @@ func TestGetHistoryNodeTableLayout(t *testing.T) {
 	}
 }
 
+func TestGetHistoryNodeTableGenerations(t *testing.T) {
+	historyNodeID := [16]byte{1}
+	historyNodeV2ID := [16]byte{2}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateGetHistoryNodeTableID, stmt)
+			require.Len(t, args, 2)
+			table := args[1].(string)
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					id := historyNodeID
+					if table == historyNodeV2TableName {
+						id = historyNodeV2ID
+					}
+					*dest[0].(*[16]byte) = id
+					return nil
+				},
+			}
+		},
+	}
+
+	generations, err := getHistoryNodeTableGenerations(t.Context(), session, "temporal")
+
+	require.NoError(t, err)
+	require.Equal(t, historyNodeID, generations.historyNode)
+	require.Equal(t, historyNodeV2ID, generations.historyNodeV2)
+	require.Equal(t, []string{
+		templateGetHistoryNodeTableID,
+		templateGetHistoryNodeTableID,
+	}, recordedStatements(session.queries))
+}
+
 func TestValidateHistoryNodeMigrationModeSchema(t *testing.T) {
 	newSession := func(
 		historyNodeLayout HistoryNodeTableLayout,
@@ -862,6 +830,18 @@ func TestValidateHistoryNodeMigrationModeSchema(t *testing.T) {
 	))
 	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
 		t.Context(),
+		newSession(HistoryNodeTableLayoutLegacyV1, HistoryNodeTableLayoutBranchV2),
+		"temporal",
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+	))
+	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		newSession(HistoryNodeTableLayoutLegacyV1, HistoryNodeTableLayoutBranchV2),
+		"temporal",
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
+	))
+	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
 		newSession(HistoryNodeTableLayoutLegacyV1, HistoryNodeTableLayoutMissing),
 		"temporal",
 		config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
@@ -871,6 +851,12 @@ func TestValidateHistoryNodeMigrationModeSchema(t *testing.T) {
 		newSession(HistoryNodeTableLayoutBranchV2, HistoryNodeTableLayoutBranchV2),
 		"temporal",
 		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+	))
+	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		newSession(HistoryNodeTableLayoutBranchV2, HistoryNodeTableLayoutBranchV2),
+		"temporal",
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
 	))
 	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
 		t.Context(),
@@ -896,6 +882,12 @@ func TestValidateHistoryNodeMigrationModeSchema(t *testing.T) {
 		"temporal",
 		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
 	))
+	require.NoError(t, ValidateHistoryNodeMigrationModeSchema(
+		t.Context(),
+		newSession(HistoryNodeTableLayoutLegacyV1, HistoryNodeTableLayoutBranchV2),
+		"temporal",
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+	))
 	require.Error(t, ValidateHistoryNodeMigrationModeSchema(
 		t.Context(),
 		newSession(HistoryNodeTableLayoutBranchV2, HistoryNodeTableLayoutBranchV2),
@@ -916,6 +908,52 @@ func TestRecreateHistoryNodeV1RequiresRebuildConfirmation(t *testing.T) {
 	err := RecreateHistoryNodeV1(t.Context(), session, "temporal", false)
 
 	require.ErrorContains(t, err, "every Temporal writer is in v1-rebuild mode")
+}
+
+func TestRecreateHistoryNodeV1ClearsExistingLegacyTable(t *testing.T) {
+	awaitCalls := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			switch stmt {
+			case templateGetHistoryNodeSchemaColumns:
+				require.Equal(t, "temporal", args[0])
+				table := args[1].(string)
+				layout := HistoryNodeTableLayoutLegacyV1
+				if table == historyNodeV2TableName {
+					layout = HistoryNodeTableLayoutBranchV2
+				}
+				return &recordingQuery{
+					iter: &recordingIter{
+						scanRows: historyNodeSchemaRows(layout),
+					},
+				}
+			case fmt.Sprintf(templateDropHistoryNodeTable, quoteCQLIdentifier("temporal")),
+				fmt.Sprintf(templateCreateHistoryNodeV1, quoteCQLIdentifier("temporal")):
+				require.Empty(t, args)
+				return &recordingQuery{}
+			default:
+				t.Fatalf("unexpected query: %s", stmt)
+				return nil
+			}
+		},
+		awaitSchemaAgreementFn: func(context.Context) error {
+			awaitCalls++
+			return nil
+		},
+	}
+
+	err := RecreateHistoryNodeV1(t.Context(), session, "temporal", true)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, awaitCalls)
+	require.Equal(t, []string{
+		templateGetHistoryNodeSchemaColumns,
+		templateGetHistoryNodeSchemaColumns,
+		fmt.Sprintf(templateDropHistoryNodeTable, quoteCQLIdentifier("temporal")),
+		fmt.Sprintf(templateCreateHistoryNodeV1, quoteCQLIdentifier("temporal")),
+		templateGetHistoryNodeSchemaColumns,
+	}, recordedStatements(session.queries))
 }
 
 func TestRecreateHistoryNodeV2RequiresRebuildConfirmation(t *testing.T) {
@@ -961,6 +999,22 @@ func historyNodeSchemaRows(layout HistoryNodeTableLayout) [][]any {
 func TestQueueMetadataSchemaKeepsUpgradeCompatiblePrimaryKey(t *testing.T) {
 	requireQueueMetadataSchemaKeepsUpgradeCompatiblePrimaryKey(t, "../../../schema/cassandra/temporal/schema.cql")
 	requireQueueMetadataSchemaKeepsUpgradeCompatiblePrimaryKey(t, "../../../schema/cassandra/temporal/versioned/v1.9/queues.cql")
+}
+
+func TestFreshSchemaRetainsDeprecatedV114Tables(t *testing.T) {
+	statements, err := p.LoadAndSplitQuery([]string{"../../../schema/cassandra/temporal/schema.cql"})
+	require.NoError(t, err)
+
+	for _, table := range []string{"queue_message_id_range", "queue_message_id_ranges"} {
+		require.Conditionf(t, func() bool {
+			for _, stmt := range statements {
+				if strings.HasPrefix(stmt, "CREATE TABLE "+table) {
+					return true
+				}
+			}
+			return false
+		}, "fresh schema is missing deprecated upgrade table %s", table)
+	}
 }
 
 func requireHistoryNodeSchemaPrimaryKey(t *testing.T, schema string, table string, primaryKey string) {
@@ -1124,65 +1178,6 @@ func TestGetTaskQueuesByBuildIDUsesNextPageToken(t *testing.T) {
 	require.Equal(t, pageToken, session.queries[1].query.pageState)
 	require.Equal(t, listTaskQueueNamesByBuildIdPageSize, session.queries[0].query.pageSize)
 	require.Equal(t, listTaskQueueNamesByBuildIdPageSize, session.queries[1].query.pageSize)
-}
-
-func TestGetTaskQueuesByBuildIDDropsRepeatedEmptyPageToken(t *testing.T) {
-	pageToken := []byte("same-page")
-	session := &recordingSession{
-		t: t,
-		queryFn: func(stmt string, args ...any) cgocql.Query {
-			require.Equal(t, templateListTaskQueueNamesByBuildIdQuery, stmt)
-			require.Equal(t, []any{"namespace-id", "build-id"}, args)
-			return &recordingQuery{
-				iter: &recordingIter{
-					pageState: pageToken,
-				},
-			}
-		},
-	}
-	store := userDataStore{Session: session}
-
-	taskQueues, err := store.GetTaskQueuesByBuildId(t.Context(), &p.GetTaskQueuesByBuildIdRequest{
-		NamespaceID: "namespace-id",
-		BuildID:     "build-id",
-	})
-
-	require.NoError(t, err)
-	require.Empty(t, taskQueues)
-	require.Len(t, session.queries, 2)
-	require.Empty(t, session.queries[0].query.pageState)
-	require.Equal(t, pageToken, session.queries[1].query.pageState)
-}
-
-func TestGetTaskQueuesByBuildIDStopsOnRepeatedPageTokenWithRows(t *testing.T) {
-	pageToken := []byte("same-page")
-	queryCalls := 0
-	session := &recordingSession{
-		t: t,
-		queryFn: func(stmt string, args ...any) cgocql.Query {
-			queryCalls++
-			require.Equal(t, templateListTaskQueueNamesByBuildIdQuery, stmt)
-			require.Equal(t, []any{"namespace-id", "build-id"}, args)
-			return &recordingQuery{
-				iter: &recordingIter{
-					mapRows: []map[string]any{
-						{"task_queue_name": fmt.Sprintf("task-queue-%d", queryCalls)},
-					},
-					pageState: pageToken,
-				},
-			}
-		},
-	}
-	store := userDataStore{Session: session}
-
-	taskQueues, err := store.GetTaskQueuesByBuildId(t.Context(), &p.GetTaskQueuesByBuildIdRequest{
-		NamespaceID: "namespace-id",
-		BuildID:     "build-id",
-	})
-
-	require.NoError(t, err)
-	require.Equal(t, []string{"task-queue-1", "task-queue-2"}, taskQueues)
-	require.Len(t, session.queries, 2)
 }
 
 func TestListTaskQueueUserDataEntriesClosesIteratorOnRowError(t *testing.T) {
@@ -1969,7 +1964,7 @@ func TestBackfillHistoryNodeV2CopiesRows(t *testing.T) {
 		queryFn: func(stmt string, args ...any) cgocql.Query {
 			switch stmt {
 			case templateScanHistoryNodeForV2Backfill:
-				require.Empty(t, args)
+				require.Equal(t, []any{int64(math.MinInt64), int64(math.MaxInt64)}, args)
 				return &recordingQuery{
 					iter: &recordingIter{
 						scanRows: [][]any{{
@@ -2004,8 +1999,10 @@ func TestBackfillHistoryNodeV2CopiesRows(t *testing.T) {
 	}
 
 	copied, err := BackfillHistoryNodeV2(t.Context(), session, HistoryNodeV2BackfillOptions{
-		PageSize:    25,
-		Concurrency: 1,
+		PageSize:        25,
+		Concurrency:     1,
+		TokenRangeCount: 1,
+		Partitioner:     HistoryNodeBackfillMurmur3Partitioner,
 	})
 
 	require.NoError(t, err)
@@ -2028,7 +2025,7 @@ func TestBackfillHistoryNodeV1CopiesRows(t *testing.T) {
 		queryFn: func(stmt string, args ...any) cgocql.Query {
 			switch stmt {
 			case templateScanHistoryNodeV2ForV1Backfill:
-				require.Empty(t, args)
+				require.Equal(t, []any{int64(math.MinInt64), int64(math.MaxInt64)}, args)
 				return &recordingQuery{
 					iter: &recordingIter{
 						scanRows: [][]any{{
@@ -2063,8 +2060,10 @@ func TestBackfillHistoryNodeV1CopiesRows(t *testing.T) {
 	}
 
 	copied, err := BackfillHistoryNodeV1(t.Context(), session, HistoryNodeBackfillOptions{
-		PageSize:    25,
-		Concurrency: 1,
+		PageSize:        25,
+		Concurrency:     1,
+		TokenRangeCount: 1,
+		Partitioner:     HistoryNodeBackfillMurmur3Partitioner,
 	})
 
 	require.NoError(t, err)
@@ -2095,6 +2094,88 @@ func TestBackfillHistoryNodeV2ValidatesOptions(t *testing.T) {
 		PageSize: 1,
 	})
 	require.ErrorContains(t, err, "concurrency")
+
+	_, err = BackfillHistoryNodeV2(t.Context(), session, HistoryNodeV2BackfillOptions{
+		PageSize:        1,
+		Concurrency:     1,
+		TokenRangeCount: -1,
+	})
+	require.ErrorContains(t, err, "token range count")
+}
+
+func TestBackfillHistoryNodeV2RejectsNonMurmur3Partitioner(t *testing.T) {
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateGetHistoryNodeBackfillPartitioner, stmt)
+			require.Empty(t, args)
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*string) = "org.apache.cassandra.dht.RandomPartitioner"
+					return nil
+				},
+			}
+		},
+	}
+
+	copied, err := BackfillHistoryNodeV2(t.Context(), session, HistoryNodeV2BackfillOptions{
+		PageSize:        1,
+		Concurrency:     1,
+		TokenRangeCount: 1,
+	})
+
+	require.Zero(t, copied)
+	require.ErrorContains(t, err, HistoryNodeBackfillMurmur3Partitioner)
+	require.ErrorContains(t, err, "RandomPartitioner")
+	require.Len(t, session.queries, 1)
+}
+
+func TestHistoryNodeBackfillTokenRangesCoverRing(t *testing.T) {
+	tokenRanges, err := HistoryNodeBackfillTokenRanges(3)
+	require.NoError(t, err)
+	require.Len(t, tokenRanges, 3)
+	require.Equal(t, int64(math.MinInt64), tokenRanges[0].StartToken)
+	require.Equal(t, int64(math.MaxInt64), tokenRanges[2].EndToken)
+
+	for index, tokenRange := range tokenRanges {
+		require.Equal(t, index, tokenRange.Index)
+		require.LessOrEqual(t, tokenRange.StartToken, tokenRange.EndToken)
+		if index > 0 {
+			require.Equal(t, tokenRanges[index-1].EndToken+1, tokenRange.StartToken)
+		}
+	}
+}
+
+func TestBackfillHistoryNodeV2UsesCompositeSourceToken(t *testing.T) {
+	tokenRange := HistoryNodeBackfillTokenRange{
+		Index:      7,
+		StartToken: -100,
+		EndToken:   100,
+	}
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			require.Equal(t, templateScanBranchHistoryNodeForV2Backfill, stmt)
+			require.Equal(t, []any{tokenRange.StartToken, tokenRange.EndToken}, args)
+			return &recordingQuery{iter: &recordingIter{}}
+		},
+	}
+
+	copied, err := BackfillHistoryNodeV2Range(
+		t.Context(),
+		session,
+		HistoryNodeBackfillOptions{
+			PageSize:     16,
+			Concurrency:  1,
+			SourceLayout: HistoryNodeTableLayoutBranchV2,
+			Partitioner:  HistoryNodeBackfillMurmur3Partitioner,
+		},
+		tokenRange,
+	)
+
+	require.NoError(t, err)
+	require.Zero(t, copied)
+	require.Len(t, session.queries, 1)
 }
 
 func TestBackfillHistoryNodeV2PropagatesWriteFailure(t *testing.T) {
@@ -2136,8 +2217,10 @@ func TestBackfillHistoryNodeV2PropagatesWriteFailure(t *testing.T) {
 	}
 
 	copied, err := BackfillHistoryNodeV2(t.Context(), session, HistoryNodeV2BackfillOptions{
-		PageSize:    25,
-		Concurrency: 1,
+		PageSize:        25,
+		Concurrency:     1,
+		TokenRangeCount: 1,
+		Partitioner:     HistoryNodeBackfillMurmur3Partitioner,
 	})
 
 	require.Zero(t, copied)
@@ -2152,7 +2235,7 @@ func TestBackfillHistoryNodeV2PropagatesScanFailure(t *testing.T) {
 		t: t,
 		queryFn: func(stmt string, args ...any) cgocql.Query {
 			require.Equal(t, templateScanHistoryNodeForV2Backfill, stmt)
-			require.Empty(t, args)
+			require.Equal(t, []any{int64(math.MinInt64), int64(math.MaxInt64)}, args)
 			return &recordingQuery{
 				iter: &recordingIter{
 					closeErr: scanErr,
@@ -2162,8 +2245,10 @@ func TestBackfillHistoryNodeV2PropagatesScanFailure(t *testing.T) {
 	}
 
 	copied, err := BackfillHistoryNodeV2(t.Context(), session, HistoryNodeV2BackfillOptions{
-		PageSize:    25,
-		Concurrency: 1,
+		PageSize:        25,
+		Concurrency:     1,
+		TokenRangeCount: 1,
+		Partitioner:     HistoryNodeBackfillMurmur3Partitioner,
 	})
 
 	require.Zero(t, copied)
@@ -2256,7 +2341,7 @@ func TestReadHistoryBranchUsesReturnedRowCountAndPageTokenAfterScan(t *testing.T
 	require.Equal(t, pageToken, response.NextPageToken)
 	require.Equal(
 		t,
-		encodeHistoryNodePageTokenMetadata(historyNodeReadLayoutLegacyV1),
+		store.encodeHistoryNodePageTokenMetadata(historyNodeReadLayoutLegacyV1),
 		response.NextPageTokenMetadata,
 	)
 	require.Len(t, response.Nodes, 1)
@@ -2509,6 +2594,44 @@ func TestQueueEnqueueMessageIDConflictReturnsError(t *testing.T) {
 	require.ErrorIs(t, err, ErrEnqueueMessageConflict)
 }
 
+func TestQueueV2EnqueueStopsWaitingForLockWhenContextCanceled(t *testing.T) {
+	const queueName = "test-queue"
+	queryCalls := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(string, ...any) cgocql.Query {
+			queryCalls++
+			return &recordingQuery{}
+		},
+	}
+	store := &queueV2Store{session: session}
+	unlock, err := store.lockQueue(t.Context(), p.QueueTypeHistoryNormal, queueName)
+	require.NoError(t, err)
+	defer unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := store.EnqueueMessage(ctx, &p.InternalEnqueueMessageRequest{
+			QueueType: p.QueueTypeHistoryNormal,
+			QueueName: queueName,
+		})
+		result <- err
+	}()
+	<-started
+	cancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not stop waiting for the queue lock")
+	}
+	require.Zero(t, queryCalls)
+}
+
 func TestQueueV2EnqueueCachesKnownQueueAndReadsMaxForEveryInsert(t *testing.T) {
 	maxReads := 0
 	session := &recordingSession{t: t}
@@ -2673,14 +2796,30 @@ func TestQueueV2ReadMessagesRefreshesQueueMetadata(t *testing.T) {
 	}, recordedStatements(session.queries))
 }
 
-func TestQueueV2ReadMessagesKnownQueueContinuationDoesNotReadQueueMetadata(t *testing.T) {
+func TestQueueV2ReadMessagesContinuationHonorsUpdatedMinimum(t *testing.T) {
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 10,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
 	session := &recordingSession{t: t}
 	session.queryFn = func(stmt string, args ...any) cgocql.Query {
 		switch stmt {
 		case TemplateGetQueueQuery:
-			t.Fatal("continuation token should make queue metadata unnecessary")
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*[]byte) = queueBytes
+					*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+					*dest[2].(*int64) = 1
+					return nil
+				},
+			}
 		case TemplateGetMessagesQuery:
-			require.Equal(t, int64(8), args[3])
+			require.Equal(t, int64(10), args[3])
 			return &recordingQuery{iter: &recordingIter{}}
 		default:
 			t.Fatalf("unexpected query: %s", stmt)
@@ -2690,10 +2829,10 @@ func TestQueueV2ReadMessagesKnownQueueContinuationDoesNotReadQueueMetadata(t *te
 	store := NewQueueV2Store(session, log.NewNoopLogger()).(*queueV2Store)
 	store.markKnownQueue(p.QueueTypeHistoryNormal, "test-queue")
 	nextPageToken := p.GetNextPageTokenForReadMessages([]p.QueueV2Message{{
-		MetaData: p.MessageMetadata{ID: 7},
+		MetaData: p.MessageMetadata{ID: 2},
 	}})
 
-	_, err := store.ReadMessages(t.Context(), &p.InternalReadMessagesRequest{
+	_, err = store.ReadMessages(t.Context(), &p.InternalReadMessagesRequest{
 		QueueType:     p.QueueTypeHistoryNormal,
 		QueueName:     "test-queue",
 		PageSize:      100,
@@ -2701,7 +2840,10 @@ func TestQueueV2ReadMessagesKnownQueueContinuationDoesNotReadQueueMetadata(t *te
 	})
 
 	require.NoError(t, err)
-	require.Equal(t, []string{TemplateGetMessagesQuery}, recordedStatements(session.queries))
+	require.Equal(t, []string{
+		TemplateGetQueueQuery,
+		TemplateGetMessagesQuery,
+	}, recordedStatements(session.queries))
 }
 
 func TestQueueV2ReadMessagesColdContinuationValidatesQueue(t *testing.T) {
@@ -2926,8 +3068,8 @@ func TestQueueV2RangeDeleteMakesUpdatedMetadataVisibleToReads(t *testing.T) {
 	require.Equal(t, []string{
 		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
-		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
+		TemplateRangeDeleteMessagesQuery,
 		TemplateGetQueueQuery,
 		TemplateGetMessagesQuery,
 	}, recordedStatements(session.queries))
@@ -2999,12 +3141,12 @@ func TestQueueV2RangeDeleteRefreshesQueueMetadataAfterCreate(t *testing.T) {
 		TemplateCreateQueueQuery,
 		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
-		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
+		TemplateRangeDeleteMessagesQuery,
 	}, recordedStatements(session.queries))
 }
 
-func TestQueueV2RangeDeleteBelowMinSkipsMaxMessageIDRead(t *testing.T) {
+func TestQueueV2RangeDeleteBelowMinRepairsPhysicalRange(t *testing.T) {
 	const queueName = "test-queue"
 	queueBytes, err := (&persistencespb.Queue{
 		Partitions: map[int32]*persistencespb.QueuePartition{
@@ -3030,6 +3172,16 @@ func TestQueueV2RangeDeleteBelowMinSkipsMaxMessageIDRead(t *testing.T) {
 					return nil
 				},
 			}
+		case TemplateGetMaxMessageIDQuery:
+			return &recordingQuery{
+				scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 10
+					return nil
+				},
+			}
+		case TemplateRangeDeleteMessagesQuery:
+			require.Equal(t, []any{p.QueueTypeHistoryNormal, queueName, 0, int64(0), int64(9)}, args)
+			return &recordingQuery{}
 		default:
 			t.Fatalf("unexpected query: %s", stmt)
 		}
@@ -3046,7 +3198,108 @@ func TestQueueV2RangeDeleteBelowMinSkipsMaxMessageIDRead(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Zero(t, resp.MessagesDeleted)
-	require.Equal(t, []string{TemplateGetQueueQuery}, recordedStatements(session.queries))
+	require.Equal(t, []string{
+		TemplateGetQueueQuery,
+		TemplateGetMaxMessageIDQuery,
+		TemplateRangeDeleteMessagesQuery,
+	}, recordedStatements(session.queries))
+}
+
+func TestQueueV2RangeDeleteRetryFinishesCleanupAfterDeleteFailure(t *testing.T) {
+	const queueName = "test-queue"
+	initialQueueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 0,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+	updatedQueueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {
+				MinMessageId: 2,
+			},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
+	getQueueCalls := 0
+	deleteCalls := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, args ...any) cgocql.Query {
+			switch stmt {
+			case TemplateGetQueueQuery:
+				getQueueCalls++
+				return &recordingQuery{
+					scanFn: func(dest ...any) error {
+						if getQueueCalls == 1 {
+							*dest[0].(*[]byte) = initialQueueBytes
+							*dest[2].(*int64) = 0
+						} else {
+							*dest[0].(*[]byte) = updatedQueueBytes
+							*dest[2].(*int64) = 1
+						}
+						*dest[1].(*string) = enumspb.ENCODING_TYPE_PROTO3.String()
+						return nil
+					},
+				}
+			case TemplateGetMaxMessageIDQuery:
+				return &recordingQuery{
+					scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 3
+						return nil
+					},
+				}
+			case TemplateUpdateQueueMetadataQuery:
+				return &recordingQuery{
+					mapScanCASFn: func(map[string]any) (bool, error) {
+						return true, nil
+					},
+				}
+			case TemplateRangeDeleteMessagesQuery:
+				require.Equal(t, []any{p.QueueTypeHistoryNormal, queueName, 0, int64(0), int64(1)}, args)
+				deleteCalls++
+				return &recordingQuery{
+					execFn: func() error {
+						if deleteCalls == 1 {
+							return errors.New("delete failed")
+						}
+						return nil
+					},
+				}
+			default:
+				t.Fatalf("unexpected query: %s", stmt)
+			}
+			return nil
+		},
+	}
+	store := NewQueueV2Store(session, log.NewNoopLogger())
+	request := &p.InternalRangeDeleteMessagesRequest{
+		QueueType: p.QueueTypeHistoryNormal,
+		QueueName: queueName,
+		InclusiveMaxMessageMetadata: p.MessageMetadata{
+			ID: 1,
+		},
+	}
+
+	resp, err := store.RangeDeleteMessages(t.Context(), request)
+	require.ErrorContains(t, err, "delete failed")
+	require.Nil(t, resp)
+
+	resp, err = store.RangeDeleteMessages(t.Context(), request)
+	require.NoError(t, err)
+	require.Zero(t, resp.MessagesDeleted)
+	require.Equal(t, []string{
+		TemplateGetQueueQuery,
+		TemplateGetMaxMessageIDQuery,
+		TemplateUpdateQueueMetadataQuery,
+		TemplateRangeDeleteMessagesQuery,
+		TemplateGetQueueQuery,
+		TemplateGetMaxMessageIDQuery,
+		TemplateRangeDeleteMessagesQuery,
+	}, recordedStatements(session.queries))
 }
 
 func TestQueueV2UpdateConflictInvalidatesCachedQueue(t *testing.T) {
@@ -3137,12 +3390,11 @@ func TestQueueV2UpdateConflictInvalidatesCachedQueue(t *testing.T) {
 	require.Equal(t, []string{
 		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
-		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
 		TemplateGetQueueQuery,
 		TemplateGetMaxMessageIDQuery,
-		TemplateRangeDeleteMessagesQuery,
 		TemplateUpdateQueueMetadataQuery,
+		TemplateRangeDeleteMessagesQuery,
 	}, recordedStatements(session.queries))
 }
 
@@ -3180,10 +3432,11 @@ func testHistoryNodeAppendRequest(events []byte) *p.InternalAppendHistoryNodesRe
 }
 
 type recordingSession struct {
-	t       testing.TB
-	queryFn func(stmt string, args ...any) cgocql.Query
-	mu      sync.Mutex
-	queries []recordedQuery
+	t                      testing.TB
+	queryFn                func(stmt string, args ...any) cgocql.Query
+	awaitSchemaAgreementFn func(context.Context) error
+	mu                     sync.Mutex
+	queries                []recordedQuery
 }
 
 func (s *recordingSession) Query(stmt string, args ...any) cgocql.Query {
@@ -3211,7 +3464,10 @@ func (s *recordingSession) MapExecuteBatchCAS(*cgocql.Batch, map[string]any) (bo
 	return false, nil, nil
 }
 
-func (s *recordingSession) AwaitSchemaAgreement(context.Context) error {
+func (s *recordingSession) AwaitSchemaAgreement(ctx context.Context) error {
+	if s.awaitSchemaAgreementFn != nil {
+		return s.awaitSchemaAgreementFn(ctx)
+	}
 	s.t.Fatal("unexpected AwaitSchemaAgreement")
 	return nil
 }
@@ -3224,6 +3480,7 @@ type recordingQuery struct {
 	pageSize     int
 	pageState    []byte
 	idempotent   bool
+	timestamp    int64
 	execFn       func() error
 	scanFn       func(dest ...any) error
 	mapScanFn    func(map[string]any) error
@@ -3280,7 +3537,8 @@ func (q *recordingQuery) WithContext(context.Context) cgocql.Query {
 	return q
 }
 
-func (q *recordingQuery) WithTimestamp(int64) cgocql.Query {
+func (q *recordingQuery) WithTimestamp(timestamp int64) cgocql.Query {
+	q.timestamp = timestamp
 	return q
 }
 
