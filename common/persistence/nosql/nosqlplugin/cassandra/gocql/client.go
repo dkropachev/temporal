@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -132,6 +133,13 @@ func ConfigureCassandraCluster(cfg config.Cassandra, cluster *gocql.ClusterConfi
 	cluster.MaxPreparedStmts = defaultMaxPreparedStmts
 	if cfg.MaxPreparedStmts > 0 {
 		cluster.MaxPreparedStmts = cfg.MaxPreparedStmts
+	}
+	if cfg.MaxExcessShardConnectionsRate != nil {
+		rate := float64(*cfg.MaxExcessShardConnectionsRate)
+		if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 {
+			return errors.New("maxExcessShardConnectionsRate must be a finite non-negative number")
+		}
+		cluster.MaxExcessShardConnectionsRate = *cfg.MaxExcessShardConnectionsRate
 	}
 
 	cluster.ConnectTimeout = 10 * time.Second * debug.TimeoutMultiplier

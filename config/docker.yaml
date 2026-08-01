@@ -4,16 +4,15 @@ log:
     stdout: true
     level: {{ default "info" (env "LOG_LEVEL") }}
 
+{{- $db := env "DB" -}}
+{{- if not (eq $db "cassandra" "mysql8" "postgres12" "postgres12_pgx") -}}
+  {{- fail "Invalid DB value. Supported values are cassandra, mysql8, postgres12, postgres12_pgx" -}}
+{{- end }}
 persistence:
     numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
 
     defaultStore: default
     visibilityStore: visibility
-
-    {{- $db := env "DB" -}}
-    {{- if not (eq $db "cassandra" "mysql8" "postgres12" "postgres12_pgx") -}}
-      {{- fail "Invalid DB value. Supported values are cassandra, mysql8, postgres12, postgres12_pgx" -}}
-    {{- end }}
 
     datastores:
         default:
@@ -29,8 +28,11 @@ persistence:
                   {{- end }}
                 {{- end }}
                 port: {{ default "9042" (env "CASSANDRA_PORT") }}
-                maxConns: {{ default "20" (env "CASSANDRA_MAX_CONNS") }}
+                maxConns: {{ default "12" (env "CASSANDRA_MAX_CONNS") }}
                 maxPreparedStmts: {{ default "6000" (env "CASSANDRA_MAX_PREPARED_STMTS") }}
+                maxExcessShardConnectionsRate: {{ default "2" (env "CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE") }}
+                disableInitialHostLookup: {{ default "false" (env "CASSANDRA_DISABLE_INITIAL_HOST_LOOKUP") }}
+                historyNodeMigrationMode: {{ default "legacy-v1-dual" (env "CASSANDRA_HISTORY_NODE_MIGRATION_MODE") }}
                 tls:
                     enabled: {{ default "false" (env "CASSANDRA_TLS_ENABLED") }}
                     caFile: {{ env "CASSANDRA_CA" }}

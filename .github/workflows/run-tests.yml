@@ -24,7 +24,7 @@ env:
   DOCKER_COMPOSE_FILE: ./develop/github/docker-compose.yml
   TEMPORAL_VERSION_CHECK_DISABLED: 1
   MAX_TEST_ATTEMPTS: 3
-  SHARD_COUNT: 3 # NOTE: must match shard count in optimize-test-sharding.yml
+  SHARD_COUNT: ${{ github.repository_owner == 'temporalio' && 3 || 5 }} # Upstream must match optimize-test-sharding.yml.
 
 jobs:
   test-setup:
@@ -119,6 +119,10 @@ jobs:
               persistence_driver: cassandra
               containers: [cassandra, elasticsearch]
               required: true
+            scylla_es:
+              persistence_type: nosql
+              persistence_driver: cassandra
+              containers: [scylla, elasticsearch]
             cass_es8:
               persistence_type: nosql
               persistence_driver: cassandra
@@ -371,6 +375,128 @@ jobs:
           include-hidden-files: true
           retention-days: 28
 
+  temporalperf-smoke:
+    name: Temporal performance suite smoke test
+    needs: [pre-build, test-setup]
+    runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ env.COMMIT }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: false # do our own caching
+
+      - name: Restore dependencies
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-${{ runner.os }}${{ runner.arch }}-${{ hashFiles('go.mod') }}-deps-${{ hashFiles('go.sum') }}
+
+      - name: Restore build outputs
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/go-build
+          key: go-${{ runner.os }}${{ runner.arch }}-build-${{ env.COMMIT }}
+
+      - name: Build Temporal server and performance suite
+        env:
+          BIN_DIR: ${{ runner.temp }}/temporalperf-bin
+        run: |
+          mkdir -p "$BIN_DIR"
+          go build -o "$BIN_DIR/temporal-server" ./cmd/server
+          go build -o "$BIN_DIR/temporalperf" ./cmd/tools/temporalperf
+
+      - name: Run managed-server smoke test
+        timeout-minutes: 5
+        env:
+          BIN_DIR: ${{ runner.temp }}/temporalperf-bin
+          RESULTS_DIR: ${{ runner.temp }}/temporalperf-results
+        run: |
+          "$BIN_DIR/temporalperf" \
+            -config-file ./config/development-sqlite.yaml \
+            -server-binary "$BIN_DIR/temporal-server" \
+            -namespace temporalperf-ci-smoke \
+            -profiles tiny \
+            -payload-bytes 0 \
+            -task-queues 1 \
+            -workers-per-task-queue 1 \
+            -concurrency 2 \
+            -warmup 20ms \
+            -measurement 20ms \
+            -trials 2 \
+            -initial-rps 1.0004 \
+            -growth-factor 1.00009 \
+            -max-rps 1.0005 \
+            -success-ratio 0.01 \
+            -batch-workflows 1 \
+            -sample-timeout 20s \
+            -timeout 3m \
+            -output-dir "$RESULTS_DIR"
+
+      - name: Validate smoke-test artifacts
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/temporalperf-results
+        run: |
+          jq -e '
+            def abs: if . < 0 then -. else . end;
+            . as $suite |
+            ($suite.version == 2) and
+            ($suite.finishedAt != "0001-01-01T00:00:00Z") and
+            (($suite.cases | length) == 1) and
+            (($suite.cases[0].runs | length) == 9) and
+            (($suite.cases[0].targets | length) == 3) and
+            all($suite.cases[0].runs[];
+              (.result.completed == .result.workflows) and (.result.failed == 0)
+            ) and
+            (([
+              $suite.cases[0].runs[] |
+              select(.stage == "calibration") |
+              .resultFile
+            ] | unique | length) == 2) and
+            all($suite.cases[0].targets[]; . as $target |
+              ([
+                $suite.cases[0].runs[] |
+                select(
+                  (.stage == "steady") and
+                  (.targetRatio == $target.targetRatio)
+                ) |
+                .result
+              ]) as $samples |
+              (($samples | length) == 2) and
+              (((
+                $target.throughputMedian -
+                (($samples[0].workflowsPerSec + $samples[1].workflowsPerSec) / 2)
+              ) | abs) < 0.000001) and
+              ($target.latencyP50Median == ((
+                $samples[0].workflowLatencyP50 + $samples[1].workflowLatencyP50
+              ) / 2 | floor)) and
+              ($target.latencyP95Median == ((
+                $samples[0].workflowLatencyP95 + $samples[1].workflowLatencyP95
+              ) / 2 | floor)) and
+              ($target.latencyP99Median == ((
+                $samples[0].workflowLatencyP99 + $samples[1].workflowLatencyP99
+              ) / 2 | floor))
+            )
+          ' "$RESULTS_DIR/suite.json"
+
+          while IFS= read -r artifact; do
+            test -s "$artifact"
+          done < <(jq -r '
+            .cases[].runs[] | .resultFile, .metadataFile
+          ' "$RESULTS_DIR/suite.json")
+
+      - name: Upload smoke-test artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: temporalperf-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/temporalperf-results
+          retention-days: 7
+
   integration-test:
     name: Integration test
     needs: [pre-build, test-setup]
@@ -550,6 +676,7 @@ jobs:
           TEST_TOTAL_SHARDS: ${{ matrix.total_shards }}
           TEST_SHARD_INDEX: ${{ matrix.total_shards && matrix.shard_index }} # guard with total_shards to avoid falsy eval of shard_index=0
           TEST_ARGS: "${{ matrix.test_args }}"
+          TEST_PARALLEL_FLAGS: ${{ github.repository_owner != 'temporalio' && '-parallel=2' || '' }}
           TEMPORAL_TEST_LOG_FILE: ${{ github.workspace }}/.testoutput/debug.log
           TEMPORAL_TEST_LOG_LEVEL: info
 
@@ -679,6 +806,7 @@ jobs:
     needs:
       - misc-checks
       - unit-test
+      - temporalperf-smoke
       - integration-test
       - functional-test
     runs-on: ubuntu-latest
