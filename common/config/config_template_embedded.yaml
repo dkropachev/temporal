@@ -3,6 +3,7 @@ log:
     stdout: true
     level: {{ default "info" (env "LOG_LEVEL") }}
 
+{{- $db := default "cassandra" (env "DB") | lower }}
 persistence:
     numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
     defaultStore: default
@@ -13,7 +14,6 @@ persistence:
     visibilityStore: visibility
     {{- end }}
     datastores:
-        {{- $db := default "cassandra" (env "DB") | lower -}}
         {{- if eq $db "cassandra" }}
         default:
             cassandra:
@@ -27,8 +27,11 @@ persistence:
                   {{- end }}
                 {{- end }}
                 port: {{ default "9042" (env "CASSANDRA_PORT") }}
-                maxConns: {{ default "20" (env "CASSANDRA_MAX_CONNS") }}
+                maxConns: {{ default "12" (env "CASSANDRA_MAX_CONNS") }}
                 maxPreparedStmts: {{ default "6000" (env "CASSANDRA_MAX_PREPARED_STMTS") }}
+                maxExcessShardConnectionsRate: {{ default "2" (env "CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE") }}
+                disableInitialHostLookup: {{ default "false" (env "CASSANDRA_DISABLE_INITIAL_HOST_LOOKUP") }}
+                historyNodeMigrationMode: {{ default "legacy-v1-dual" (env "CASSANDRA_HISTORY_NODE_MIGRATION_MODE") }}
                 tls:
                     enabled: {{ default "false" (env "CASSANDRA_TLS_ENABLED") }}
                     caFile: {{ default "" (env "CASSANDRA_CA") }}

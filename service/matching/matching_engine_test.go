@@ -1098,16 +1098,23 @@ func (s *matchingEngineSuite) TestSyncMatchActivities() {
 
 	// Overriding the dynamic config so that the rate-limiter has a refresh rate of 0. By default, the rate-limiter has a refresh rate of 1 minute which is too long for this test.
 	s.matchingEngine.config.RateLimiterRefreshInterval = 0
-	s.matchingEngine.config.AdminNamespaceToPartitionDispatchRate = dynamicconfig.GetFloatPropertyFnFilteredByNamespace(25000)
-	s.matchingEngine.config.AdminNamespaceTaskqueueToPartitionDispatchRate = dynamicconfig.GetFloatPropertyFnFilteredByTaskQueue(25000)
-
+	tlType := enumspb.TASK_QUEUE_TYPE_ACTIVITY
 	namespaceID := uuid.NewString()
 	tl := "makeToast"
+	numReadPartitions := float64(s.matchingEngine.config.NumTaskqueueReadPartitions(
+		matchingTestNamespace,
+		tl,
+		tlType,
+	))
+	perPartitionDispatchRPS := defaultTaskDispatchRPS / numReadPartitions
+	s.matchingEngine.config.AdminNamespaceToPartitionDispatchRate = dynamicconfig.GetFloatPropertyFnFilteredByNamespace(perPartitionDispatchRPS)
+	s.matchingEngine.config.AdminNamespaceTaskqueueToPartitionDispatchRate = dynamicconfig.GetFloatPropertyFnFilteredByTaskQueue(perPartitionDispatchRPS)
+
 	dbq := newUnversionedRootQueueKey(namespaceID, tl, enumspb.TASK_QUEUE_TYPE_ACTIVITY)
 	mgr := s.newPartitionManager(dbq.partition, s.matchingEngine.config)
 
 	// Directly override admin rate limits to simulate dynamic config at rateLimitManager.
-	mgr.GetRateLimitManager().SetAdminRateForTesting(25000.0)
+	mgr.GetRateLimitManager().SetAdminRateForTesting(perPartitionDispatchRPS)
 
 	s.matchingEngine.updateTaskQueue(dbq.partition, mgr)
 	mgr.Start()
@@ -1237,7 +1244,6 @@ func (s *matchingEngineSuite) TestSyncMatchActivities() {
 	s.LessOrEqual(expectedRange, s.taskManager.getQueueDataByKey(dbq).rangeID)
 
 	// check the poller information
-	tlType := enumspb.TASK_QUEUE_TYPE_ACTIVITY
 	descResp, err := s.matchingEngine.DescribeTaskQueue(context.Background(), &matchingservice.DescribeTaskQueueRequest{
 		NamespaceId: namespaceID,
 		DescRequest: &workflowservice.DescribeTaskQueueRequest{
@@ -1252,10 +1258,18 @@ func (s *matchingEngineSuite) TestSyncMatchActivities() {
 	s.NotEmpty(descResp.DescResponse.Pollers[0].GetLastAccessTime())
 	s.Equal(defaultTaskDispatchRPS, descResp.DescResponse.Pollers[0].GetRatePerSecond())
 	s.NotNil(descResp.DescResponse.GetTaskQueueStatus())
-	numPartitions := float64(s.matchingEngine.config.NumTaskqueueWritePartitions("", "", tlType))
 	//nolint:staticcheck // checking deprecated field
-	s.GreaterOrEqual(descResp.DescResponse.GetTaskQueueStatus().GetRatePerSecond()*numPartitions,
+	s.GreaterOrEqual(descResp.DescResponse.GetTaskQueueStatus().GetRatePerSecond()*numReadPartitions,
 		(defaultTaskDispatchRPS - 1))
+	s.InDelta(
+		defaultTaskDispatchRPS,
+		descResp.DescResponse.GetEffectiveRateLimit().GetRequestsPerSecond(),
+		1,
+	)
+	s.Equal(
+		enumspb.RATE_LIMIT_SOURCE_SYSTEM,
+		descResp.DescResponse.GetEffectiveRateLimit().GetRateLimitSource(),
+	)
 }
 
 func (s *matchingEngineSuite) TestRateLimiterAcrossVersionedQueues() {

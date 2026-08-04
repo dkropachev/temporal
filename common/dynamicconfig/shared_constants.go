@@ -8,7 +8,7 @@ import (
 
 const GlobalDefaultNumTaskQueuePartitions = 4
 
-var defaultNumTaskQueuePartitions = []TypedConstrainedValue[int]{
+var defaultNumTaskQueueReadPartitions = []TypedConstrainedValue[int]{
 	// The per-ns worker task queue in all namespaces should only have one partition, since
 	// we'll only run one worker per task queue.
 	{
@@ -50,6 +50,8 @@ var defaultNumTaskQueuePartitions = []TypedConstrainedValue[int]{
 		Value: GlobalDefaultNumTaskQueuePartitions,
 	},
 }
+
+var defaultNumTaskQueueWritePartitions = defaultNumTaskQueueReadPartitions
 
 var DefaultPerShardNamespaceRPSMax = GetIntPropertyFnFilteredByNamespace(0)
 

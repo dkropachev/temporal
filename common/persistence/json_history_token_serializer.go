@@ -9,6 +9,8 @@ type (
 		LastEventID int64
 		// the pagination token passing to persistence
 		StoreToken []byte
+		// Datastore-specific validation metadata for StoreToken.
+		StoreTokenMetadata []byte `json:",omitempty"`
 		// recording which branchRange it is reading
 		CurrentRangeIndex int
 		FinalRangeIndex   int
