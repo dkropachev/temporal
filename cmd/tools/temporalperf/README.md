@@ -42,7 +42,9 @@ Reset and cleanup commands receive these environment variables:
 - `TEMPORALPERF_TRIAL`
 - `TEMPORALPERF_ARTIFACT_DIR`
 
-The Temporal config is passed directly to the real server, so its Cassandra/Scylla, MySQL, PostgreSQL, visibility, TLS, consistency, and connection settings are used without a benchmark-specific copy. The optional reset command owns only database-specific lifecycle in managed mode. It must leave equivalent initialized schemas for every sample and return only when the database is stable. It must not start Temporal. Omitting reset and cleanup intentionally reuses an initialized database, so results include database growth and sample-order effects.
+The Temporal config is passed directly to the selected server binary. The default `temporalperf-server` preserves the configured workflow/history datastore but replaces visibility with an in-process no-op store, so Cassandra/Scylla, MySQL, PostgreSQL, TLS, consistency, and connection settings are used without adding visibility-backend latency. Visibility writes and deletes are acknowledged; visibility reads and administrative calls fail closed. Pass the regular `temporal-server` explicitly when visibility performance is part of the test.
+
+The optional reset command owns only database-specific lifecycle in managed mode. It must leave equivalent initialized schemas for every sample and return only when the database is stable. It must not start Temporal. Omitting reset and cleanup intentionally reuses an initialized database, so results include database growth and sample-order effects.
 
 Without `-config-file`, the suite retains external-server mode. In that mode the reset command must also start Temporal and wait for frontend health, as before. This supports remote and multi-node deployments.
 
@@ -60,10 +62,10 @@ Each warmup or measured sample is bounded by `-sample-timeout`. Paced samples st
 
 ## Example
 
-Build the real server and benchmark command:
+Build the workflow/history-only server and benchmark command:
 
 ```bash
-make temporal-server
+go build -o ./temporalperf-server ./cmd/tools/temporalperf/visibilityserver
 go build -o /tmp/temporalperf ./cmd/tools/temporalperf
 ```
 
@@ -72,7 +74,6 @@ Run against schemas already initialized by the standard Temporal schema tools:
 ```bash
 /tmp/temporalperf \
   -config-file ./config/development-cass-es.yaml \
-  -server-binary ./temporal-server \
   -namespace temporal-perf \
   -warmup 30s \
   -measurement 1m \
@@ -80,6 +81,8 @@ Run against schemas already initialized by the standard Temporal schema tools:
   -batch-workflows 10000 \
   -output-dir /tmp/temporalperf-scylla
 ```
+
+The repository smoke test uses `temporalperf-server` and verifies every managed server log reports visibility writes with zero reads and zero administrative calls.
 
 Unless `-address` is set explicitly, managed mode derives the local frontend address from the config's `services.frontend.rpc` settings. For reproducible clean-store comparisons, supply backend-specific `-reset-command` and `-cleanup-command` hooks. Server output for each sample is saved in that sample's `server.log`.
 

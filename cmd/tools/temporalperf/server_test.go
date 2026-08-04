@@ -26,6 +26,12 @@ func TestPrepareConfigLoadsTemporalServerConfigAndDerivesAddress(t *testing.T) {
 	require.Equal(t, "127.0.0.1:7233", cfg.address)
 }
 
+func TestManagedServerDefaultsToNoopVisibilityServer(t *testing.T) {
+	cfg, err := parseFlags(nil)
+	require.NoError(t, err)
+	require.Equal(t, "./temporalperf-server", cfg.serverBinary)
+}
+
 func TestPrepareConfigPreservesExplicitAddress(t *testing.T) {
 	configFile, err := filepath.Abs("../../../config/development-sqlite.yaml")
 	require.NoError(t, err)

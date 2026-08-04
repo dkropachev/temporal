@@ -402,12 +402,12 @@ jobs:
           path: ~/.cache/go-build
           key: go-${{ runner.os }}${{ runner.arch }}-build-${{ env.COMMIT }}
 
-      - name: Build Temporal server and performance suite
+      - name: Build Temporal performance server and suite
         env:
           BIN_DIR: ${{ runner.temp }}/temporalperf-bin
         run: |
           mkdir -p "$BIN_DIR"
-          go build -o "$BIN_DIR/temporal-server" ./cmd/server
+          go build -o "$BIN_DIR/temporalperf-server" ./cmd/tools/temporalperf/visibilityserver
           go build -o "$BIN_DIR/temporalperf" ./cmd/tools/temporalperf
 
       - name: Run managed-server smoke test
@@ -418,7 +418,7 @@ jobs:
         run: |
           "$BIN_DIR/temporalperf" \
             -config-file ./config/development-sqlite.yaml \
-            -server-binary "$BIN_DIR/temporal-server" \
+            -server-binary "$BIN_DIR/temporalperf-server" \
             -namespace temporalperf-ci-smoke \
             -profiles tiny \
             -payload-bytes 0 \
@@ -488,6 +488,14 @@ jobs:
           done < <(jq -r '
             .cases[].runs[] | .resultFile, .metadataFile
           ' "$RESULTS_DIR/suite.json")
+
+          mapfile -t server_logs < <(find "$RESULTS_DIR" -name server.log -type f | sort)
+          test "${#server_logs[@]}" -eq 9
+          for server_log in "${server_logs[@]}"; do
+            test "$(grep -Ec '^BENCHMARK_NOOP_VISIBILITY ' "$server_log")" -eq 1
+            grep -Eq '^BENCHMARK_NOOP_VISIBILITY writes=[1-9][0-9]* reads=0 validations=[0-9]+ admin=0 stores=[1-9][0-9]*$' \
+              "$server_log"
+          done
 
       - name: Upload smoke-test artifacts
         if: ${{ !cancelled() }}
