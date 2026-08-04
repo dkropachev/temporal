@@ -24,6 +24,15 @@ func (e fakeRequestError) Code() int       { return e.code }
 func (e fakeRequestError) Message() string { return e.message }
 func (e fakeRequestError) Error() string   { return e.message }
 
+type fakeGetterRequestError struct {
+	code    int
+	message string
+}
+
+func (e fakeGetterRequestError) GetCode() int       { return e.code }
+func (e fakeGetterRequestError) GetMessage() string { return e.message }
+func (e fakeGetterRequestError) Error() string      { return e.message }
+
 func TestConvertError(t *testing.T) {
 	const op = "TestOp"
 
@@ -140,6 +149,69 @@ func TestConvertError(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc.checkFunc(t, ConvertError(op, tc.input))
+		})
+	}
+}
+
+func TestIsUnconfiguredTableError(t *testing.T) {
+	testCases := []struct {
+		name     string
+		err      error
+		table    string
+		expected bool
+	}{
+		{
+			name:     "unqualified",
+			err:      fakeRequestError{code: gocql.ErrCodeInvalid, message: "unconfigured table history_node"},
+			table:    "history_node",
+			expected: true,
+		},
+		{
+			name:     "qualified",
+			err:      fakeRequestError{code: gocql.ErrCodeInvalid, message: `unconfigured table "temporal"."history_node_v2"`},
+			table:    "history_node_v2",
+			expected: true,
+		},
+		{
+			name:     "does not exist",
+			err:      fakeRequestError{code: gocql.ErrCodeInvalid, message: "table history_node_v2 does not exist"},
+			table:    "history_node_v2",
+			expected: true,
+		},
+		{
+			name: "wrapped",
+			err: fmt.Errorf(
+				"execute mirror: %w",
+				fakeGetterRequestError{code: gocql.ErrCodeConfig, message: "unconfigured table history_node"},
+			),
+			table:    "history_node",
+			expected: true,
+		},
+		{
+			name:  "different table",
+			err:   fakeRequestError{code: gocql.ErrCodeInvalid, message: "unconfigured table history_node_v2"},
+			table: "history_node",
+		},
+		{
+			name:  "different invalid request",
+			err:   fakeRequestError{code: gocql.ErrCodeInvalid, message: "invalid query"},
+			table: "history_node",
+		},
+		{
+			name:  "different error code",
+			err:   fakeRequestError{code: gocql.ErrCodeOverloaded, message: "unconfigured table history_node"},
+			table: "history_node",
+		},
+		{
+			name:  "plain error",
+			err:   errors.New("unconfigured table history_node"),
+			table: "history_node",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expected, IsUnconfiguredTableError(tc.err, tc.table))
 		})
 	}
 }

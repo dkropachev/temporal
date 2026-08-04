@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -139,43 +140,33 @@ func (d *matchingTaskStoreV1) GetTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetTasksResponse{}
-	task := make(map[string]any)
-	for iter.MapScan(task) {
-		_, ok := task["task_id"]
-		if !ok { // no tasks, but static column record returned
-			continue
+	response := &p.InternalGetTasksResponse{
+		Tasks: make([]*commonpb.DataBlob, 0, preallocatedResultCapacity(request.PageSize)),
+	}
+	closeIterator := func() error {
+		if err := iter.Close(); err != nil {
+			return gocql.ConvertError("GetTasks", err)
+		}
+		return nil
+	}
+	var taskID nullableInt64
+	var taskVal []byte
+	var encodingVal string
+	for iter.Scan(&taskID, &taskVal, &encodingVal) {
+		if taskID.valid {
+			response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
 		}
 
-		rawTask, ok := task["task"]
-		if !ok {
-			return nil, newFieldNotFoundError("task", task)
-		}
-		taskVal, ok := rawTask.([]byte)
-		if !ok {
-			var byteSliceType []byte
-			return nil, newPersistedTypeMismatchError("task", byteSliceType, rawTask, task)
-		}
-
-		rawEncoding, ok := task["task_encoding"]
-		if !ok {
-			return nil, newFieldNotFoundError("task_encoding", task)
-		}
-		encodingVal, ok := rawEncoding.(string)
-		if !ok {
-			var byteSliceType []byte
-			return nil, newPersistedTypeMismatchError("task_encoding", byteSliceType, rawEncoding, task)
-		}
-		response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
-
-		task = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
+		taskID = nullableInt64{}
+		taskVal = nil
+		encodingVal = ""
 	}
 	if len(iter.PageState()) > 0 {
 		response.NextPageToken = iter.PageState()
 	}
 
-	if err := iter.Close(); err != nil {
-		return nil, gocql.ConvertError("GetTasks", err)
+	if err := closeIterator(); err != nil {
+		return nil, err
 	}
 	return response, nil
 }

@@ -15,4 +15,12 @@ To stop dependencies:
 make stop-dependencies
 ```
 
+The default dependency set runs Cassandra. To run ScyllaDB in its place:
+
+```bash
+make start-dependencies-scylla
+```
+
+Stop that dependency set with `make stop-dependencies-scylla`.
+
 See [CONTRIBUTING.md](../../CONTRIBUTING.md) for details.

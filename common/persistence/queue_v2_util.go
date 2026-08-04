@@ -37,17 +37,17 @@ func GetMinMessageIDToReadForQueueV2(
 	nextPageToken []byte,
 	queue *persistencespb.Queue,
 ) (int64, error) {
+	partition, err := GetPartitionForQueueV2(queueType, queueName, queue)
+	if err != nil {
+		return 0, err
+	}
 	if len(nextPageToken) == 0 {
-		partition, err := GetPartitionForQueueV2(queueType, queueName, queue)
-		if err != nil {
-			return 0, err
-		}
 		return partition.MinMessageId, nil
 	}
 	var token persistencespb.ReadQueueMessagesNextPageToken
 
 	// Skip the first byte. See the comment on pageTokenPrefixByte for more details.
-	err := token.Unmarshal(nextPageToken[1:])
+	err = token.Unmarshal(nextPageToken[1:])
 	if err != nil {
 		return 0, fmt.Errorf(
 			"%w: %q: %v",
@@ -56,7 +56,7 @@ func GetMinMessageIDToReadForQueueV2(
 			err,
 		)
 	}
-	return token.LastReadMessageId + 1, nil
+	return max(token.LastReadMessageId+1, partition.MinMessageId), nil
 }
 
 func GetNextPageTokenForListQueues(queueNumber int64) []byte {
