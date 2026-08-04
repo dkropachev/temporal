@@ -23,7 +23,7 @@ const suiteVersion = 2
 
 const (
 	defaultTemporalAddress = "127.0.0.1:7233"
-	defaultServerBinary    = "./temporal-server"
+	defaultServerBinary    = "./temporalperf-server"
 )
 
 type (
