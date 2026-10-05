@@ -85,12 +85,22 @@ func (s *HandlerTestSuite) TestHistoryNodeMigrationCommands() {
 	s.Len(commands["backfill-history-node-v2"].Flags, 4)
 	s.Contains(commands, "backfill-history-node-v1")
 	s.Len(commands["backfill-history-node-v1"].Flags, 4)
+	s.Contains(commands, "validate-history-node-v2")
+	s.Len(commands["validate-history-node-v2"].Flags, 2)
 	s.Equal(16, defaultHistoryNodeBackfillPageSize)
 	s.Equal(4096, defaultHistoryNodeBackfillTokenRanges)
 	s.Contains(commands, "recreate-history-node-v2")
 	s.Len(commands["recreate-history-node-v2"].Flags, 1)
 	s.Contains(commands, "recreate-history-node-v1")
 	s.Len(commands["recreate-history-node-v1"].Flags, 1)
+	s.Contains(commands, "backfill-history-tree-v2")
+	s.Len(commands["backfill-history-tree-v2"].Flags, 4)
+	s.Contains(commands, "backfill-history-tree-v1")
+	s.Len(commands["backfill-history-tree-v1"].Flags, 4)
+	s.Contains(commands, "validate-history-tree-v2")
+	s.Len(commands["validate-history-tree-v2"].Flags, 1)
+	s.Contains(commands, "recreate-history-tree-v2")
+	s.Len(commands["recreate-history-tree-v2"].Flags, 1)
 }
 
 func (s *HandlerTestSuite) TestHistoryNodeBackfillRequiresCheckpoint() {

@@ -102,7 +102,9 @@ func NewExecutionStore(
 		serializer,
 		logger,
 		mode,
+		normalizeHistoryTreeMigrationMode(""),
 		historyNodeTableGenerations{},
+		executionLayout{mode: config.CassandraExecutionMigrationModeLegacy, buckets: 1},
 	)
 }
 
@@ -111,17 +113,20 @@ func newExecutionStore(
 	serializer serialization.Serializer,
 	logger log.Logger,
 	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
 	historyNodeGenerations historyNodeTableGenerations,
+	layout executionLayout,
 ) *ExecutionStore {
 	return &ExecutionStore{
-		HistoryStore: newHistoryStore(
+		HistoryStore: newHistoryStoreWithMigrationModes(
 			session,
 			serializer,
 			historyNodeMigrationMode,
+			historyTreeMigrationMode,
 			historyNodeGenerations,
 		),
-		MutableStateStore:     NewMutableStateStore(session, serializer, logger),
-		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer),
+		MutableStateStore:     newMutableStateStore(session, serializer, logger, layout),
+		MutableStateTaskStore: newMutableStateTaskStore(session, serializer, layout, logger),
 	}
 }
 

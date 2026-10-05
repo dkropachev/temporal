@@ -90,6 +90,48 @@ func newHistoryNodeBackfillCheckpointIdentity(
 	}, nil
 }
 
+func newHistoryTreeBackfillCheckpointIdentity(
+	ctx context.Context,
+	session gocql.Session,
+	keyspace string,
+	direction string,
+	sourceTable string,
+	sourceLayout persistencecassandra.HistoryTreeTableLayout,
+	targetTable string,
+	tokenRangeCount int,
+) (historyNodeBackfillCheckpointIdentity, error) {
+	sourceTableID, err := readHistoryNodeBackfillTableID(ctx, session, keyspace, sourceTable)
+	if err != nil {
+		return historyNodeBackfillCheckpointIdentity{}, err
+	}
+	targetTableID, err := readHistoryNodeBackfillTableID(ctx, session, keyspace, targetTable)
+	if err != nil {
+		return historyNodeBackfillCheckpointIdentity{}, err
+	}
+	partitioner, err := persistencecassandra.GetHistoryNodeBackfillPartitioner(ctx, session)
+	if err != nil {
+		return historyNodeBackfillCheckpointIdentity{}, err
+	}
+	if partitioner != persistencecassandra.HistoryNodeBackfillMurmur3Partitioner {
+		return historyNodeBackfillCheckpointIdentity{}, fmt.Errorf(
+			"history tree backfill requires Cassandra partitioner %q, got %q",
+			persistencecassandra.HistoryNodeBackfillMurmur3Partitioner,
+			partitioner,
+		)
+	}
+	return historyNodeBackfillCheckpointIdentity{
+		Direction:       direction,
+		Keyspace:        keyspace,
+		SourceTable:     sourceTable,
+		SourceTableID:   sourceTableID,
+		SourceLayout:    sourceLayout.String(),
+		TargetTable:     targetTable,
+		TargetTableID:   targetTableID,
+		Partitioner:     partitioner,
+		TokenRangeCount: tokenRangeCount,
+	}, nil
+}
+
 func readHistoryNodeBackfillTableID(
 	ctx context.Context,
 	session gocql.Session,

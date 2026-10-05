@@ -19,6 +19,7 @@
 *.cov
 *.html
 /test.log
+/common/persistence/tests/test_[0-9]*
 
 # Executables produced by temporal repo
 /temporal-*

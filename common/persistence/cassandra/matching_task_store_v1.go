@@ -45,9 +45,19 @@ type matchingTaskStoreV1 struct {
 func newMatchingTaskStoreV1(
 	session gocql.Session,
 ) *matchingTaskStoreV1 {
+	return newMatchingTaskStoreV1WithUserData(
+		session,
+		newUserDataStore(session, nil, TaskQueueUserDataMigrationModeSourceOnly, DefaultTaskQueueUserDataBucketCount),
+	)
+}
+
+func newMatchingTaskStoreV1WithUserData(
+	session gocql.Session,
+	userData userDataStore,
+) *matchingTaskStoreV1 {
 	return &matchingTaskStoreV1{
 		Session:        session,
-		userDataStore:  userDataStore{Session: session},
+		userDataStore:  userData,
 		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion1},
 	}
 }
@@ -57,6 +67,14 @@ func (d *matchingTaskStoreV1) CreateTasks(
 	ctx context.Context,
 	request *p.InternalCreateTasksRequest,
 ) (*p.CreateTasksResponse, error) {
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
+	}
 	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	namespaceID := request.NamespaceID
 	taskQueue := request.TaskQueue
@@ -91,18 +109,7 @@ func (d *matchingTaskStoreV1) CreateTasks(
 		}
 	}
 
-	// The following query is used to ensure that range_id didn't change
-	batch.Query(switchTasksTable(templateUpdateTaskQueueQuery, matchingTaskVersion1),
-		request.RangeID,
-		request.TaskQueueInfo.Data,
-		request.TaskQueueInfo.EncodingType.String(),
-		namespaceID,
-		taskQueue,
-		taskQueueType,
-		rowTypeTaskQueue,
-		taskQueueTaskID,
-		request.RangeID,
-	)
+	d.addCreateTasksGuard(batch, request)
 
 	previous := make(map[string]any)
 	applied, _, err := d.Session.MapExecuteBatchCAS(batch, previous)
@@ -127,6 +134,14 @@ func (d *matchingTaskStoreV1) GetTasks(
 ) (*p.InternalGetTasksResponse, error) {
 	if request.InclusiveMinPass != 0 {
 		return nil, serviceerror.NewInternal("invalid GetTasks request on queue: InclusiveMinPass is not supported")
+	}
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
 	}
 
 	// Reading taskqueue tasks need to be quorum level consistent, otherwise we could lose tasks
@@ -168,6 +183,14 @@ func (d *matchingTaskStoreV1) GetTasks(
 	if err := closeIterator(); err != nil {
 		return nil, err
 	}
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -182,15 +205,42 @@ func (d *matchingTaskStoreV1) CompleteTasksLessThan(
 		return 0, serviceerror.NewInternal("invalid CompleteTasksLessThan request on queue")
 	}
 
-	query := d.Session.Query(
-		templateCompleteTasksLessThanQuery,
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueueName,
+		request.TaskType,
+	); err != nil {
+		return 0, err
+	}
+	args := []any{
 		request.NamespaceID,
 		request.TaskQueueName,
 		request.TaskType,
 		rowTypeTaskInSubqueue(request.Subqueue),
 		request.ExclusiveMaxTaskID,
-	).WithContext(ctx)
-	err := query.Exec()
+	}
+	var err error
+	if d.migrationAuthority == 0 {
+		err = d.Session.Query(templateCompleteTasksLessThanQuery, args...).WithContext(ctx).Exec()
+	} else {
+		batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+		batch.Query(templateCompleteTasksLessThanQuery, args...)
+		d.addMigrationAuthorityGuard(
+			batch,
+			request.NamespaceID,
+			request.TaskQueueName,
+			request.TaskType,
+		)
+		applied, iter, batchErr := d.Session.MapExecuteBatchCAS(batch, make(map[string]any))
+		if iter != nil {
+			defer func() { _ = iter.Close() }()
+		}
+		err = batchErr
+		if err == nil && !applied {
+			return 0, &p.ConditionFailedError{Msg: "Cassandra matching task source authority changed during completion"}
+		}
+	}
 	if err != nil {
 		return 0, gocql.ConvertError("CompleteTasksLessThan", err)
 	}

@@ -5,10 +5,16 @@ optimization complete.
 
 ## Current 3 Node x 4 Shard Target
 
-- Consider 512 logical history shards for new Cassandra/Scylla deployments. History shards map one-to-one to
-  `executions` partitions and are independent of the 12 physical Scylla shards in the target cluster.
-- The history shard count is fixed when a Temporal cluster is created. Defaults remain at 4 so upgrades cannot
-  silently change it; set `NUM_HISTORY_SHARDS=512` explicitly before creating a cluster that should use 512.
+- Use `fork/scylla-gocql-v1.31.2` at `cc9d6f11398185e5268205e1b4e01cbd80a7ae74` (PR #2) as the baseline for
+  future schema and persistence comparisons. It has the same Scylla gocql v1.18.3 driver and prepared-statement cache
+  configuration as this branch, but retains the upstream v1.31.2 schema. Backport the identical benchmark/no-op
+  visibility harness to both revisions; do not use stock-driver v1.31.2 as the schema baseline.
+- Keep the default 4 logical history shards for this memory-constrained target unless the deployment's complete
+  workload validates a higher count. History shards map one-to-one to `executions` partitions and are independent of
+  the 12 physical Scylla shards in the target cluster.
+- The history shard count is fixed when a Temporal cluster is created. The small-payload screening below favored 512,
+  but a later 1 MiB fixed-N workload overloaded this 3 node x 4 shard target. Do not select 512 from that screening
+  alone; validate large payloads, burst concurrency, restart behavior, and server memory before cluster creation.
 - Keep the backend-neutral matching default at 4 read/write partitions. Measured Scylla deployments with many cold
   task queues can set both values to 1 through constrained dynamic config; retain reads on old partitions until they
   are drained.
@@ -57,17 +63,15 @@ Install the Temporal Cassandra schema with NetworkTopologyStrategy RF=3:
   branches for a tree share one Cassandra/Scylla partition.
 - History reads and mutations are controlled by `historyNodeMigrationMode`. Startup validates that the configured mode
   matches the actual Cassandra primary keys before creating the execution store.
-- `queues` keeps its upgrade-compatible `(queue_type, queue_name)` key shape in this PR. QueueV2 list-by-type scans
-  still use `ALLOW FILTERING`; changing that requires a separate migration.
-- Queue and QueueV2 message IDs continue to use max-ID reads followed by `IF NOT EXISTS` inserts. The range allocator
-  experiment was removed because independent writers could commit reserved ranges out of order, causing a reader to
-  advance past messages that committed later. Crashes also left gaps that made QueueV2 list and delete counts inexact.
-- Schema `v1.14` remains unchanged so clusters that already applied this branch's range-table migration can advance to
-  `v1.15`. Those tables are unused but remain in both the fresh schema and upgraded keyspaces so the same reported
-  schema version converges on the same table set.
-- The legacy `queue` table still partitions messages by `queue_type`. Bucketing it by message-ID range would reduce
-  partition growth, but it also requires range-aware reads and a persisted delete cursor; otherwise
-  `DeleteMessagesBefore` becomes an unbounded fanout over bucket partitions as ack levels advance.
+- Schema `v1.16` adds the bucketed target layouts and their migration authority records. The additive migration and
+  cutover procedure is documented in [Cassandra bucketed-layout migration](cassandra-bucketed-layout-migration.md).
+- `queues_v2` partitions QueueV2 metadata over 64 deterministic buckets. Its target-only `ListQueues` path merges the
+  fixed bucket fanout and does not query `queues` or use `ALLOW FILTERING`.
+- `queue_messages_v3` partitions each QueueV2 stream by 4,096-message spans by default. A directory row and
+  partition-local tail rows preserve contiguous IDs, FIFO pagination, exact counts, and fenced cutover semantics.
+- `legacy_queue_v2_messages` partitions legacy and DLQ messages by 4,096-message buckets by default.
+  `legacy_queue_v2_state` persists the active bucket and bounded cleanup cursor, while
+  `legacy_queue_v2_delete_ranges` makes interrupted range deletion resumable.
 
 Layout-aware history pagination keeps each Cassandra continuation on the table that issued it while that physical
 layout remains valid. Raw tokens issued by older binaries are accepted in the pre-cutover source modes, but they do
@@ -246,11 +250,12 @@ Server workload harness:
 
 ```bash
 go run ./cmd/tools/temporalperf \
-  -config-file ./config/development-cass-es.yaml \
-  -server-binary ./temporal-server \
+  -config-file ./config/target-only-benchmark.yaml \
+  -server-binary ./temporalperf-server \
+  -require-cassandra-target-only \
   -namespace temporal-perf \
-  -profiles tiny,medium,big \
-  -payload-bytes 128,4096,65536,1048576 \
+  -profiles tiny,big \
+  -payload-bytes 182,1048576 \
   -task-queues 16 \
   -workers-per-task-queue 8 \
   -concurrency 640 \
@@ -267,7 +272,10 @@ profiling, and database cleanup belong in the reset and cleanup commands so the 
 every persistence backend. The hooks must not start Temporal in managed-server mode. Run the same matrix before and
 after persistence changes and compare the generated `suite.json` files together with externally collected Temporal and
 database metrics. Omitting the hooks above reuses an initialized database; supply database-specific schema reset and
-cleanup commands for clean-store comparisons.
+cleanup commands for clean-store comparisons. The candidate config must have all Cassandra layouts in their final
+target-only modes and all layout metadata at `target-only`; the strict flag records this requirement in `suite.json`
+and rejects dual/source modes. Run the same-driver, stock-schema baseline with the identical harness and matrix but
+without the strict flag, which that baseline does not implement.
 
 Many-worker task queue read/write scaling matrix:
 
@@ -372,6 +380,9 @@ go tool pprof -top /tmp/temporal.heap.pprof
 ```
 
 ## Post-Safety Persistence Result
+
+> This section predates the schema `v1.16` bucketed layouts and is retained as historical evidence only. It is not a
+> benchmark result for the current target-only implementation.
 
 The final online-migration, legacy queue, and history design was rerun against exact base on a local Scylla `2026.1.7`
 cluster with three nodes, four shards per node, and 4 GiB per node. Persistence test keyspaces use RF=1. Each operation
@@ -538,13 +549,10 @@ Interpretation:
   one of 256 bounded lock stripes; cross-process conflicts are resolved by the conditional insert and retry.
 - QueueV2 metadata CAS conflicts invalidate the local existence entry. Metadata itself is not reused by reads or
   deletes.
-- The list path still uses the upgrade-compatible `queues` primary key and `ALLOW FILTERING`; replacing that with
-  bucketed queue metadata requires a separate schema migration.
-- The legacy queue store retains its max-ID read and conditional insert. The prior enqueue-latency result came from the
-  unsafe range allocator and does not apply to the final branch.
-- The legacy queue message table remains a residual large-partition risk for very long-lived namespace replication
-  queues. A full bucketed redesign should add a persisted minimum live bucket/delete cursor, then teach reads and DLQ
-  range deletes to walk bucket partitions without scanning from bucket zero on every cleanup.
+- These measurements predate schema `v1.16`. The current target-only QueueV2 list path reads the 64 `queues_v2`
+  metadata buckets without `ALLOW FILTERING`, and `queue_messages_v3` bounds message partitions by configured span.
+- These measurements also predate `legacy_queue_v2`. The current target-only legacy queue path uses bucketed message
+  partitions plus persisted active-bucket and cleanup state; the unsafe range allocator remains removed.
 - The connection/config changes are otherwise neutral in this microbenchmark.
 - `history_node_v2` reduces partition growth and isolates branches. The final implementation also dual-writes the
   legacy table for rollback safety, so both read distribution and extra write cost must be included in new benchmarks.
@@ -609,10 +617,10 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   throughput changed from `187.54` to `180.38 workflows/sec`, and signal workflow throughput changed from `291.81` to
   `284.80 workflows/sec`. The small microbenchmark gain does not offset the workflow-level regression or the weaker
   cross-table branch creation failure behavior.
-- Increasing Cassandra `maxConns` from `12` to `24` was tested and rejected on the same server workload. Activity
-  throughput dropped to `173.08 workflows/sec`, and signal throughput dropped to `239.11 workflows/sec`, compared with
-  `187.54` and `291.81 workflows/sec` at `maxConns: 12`. Matching connections to the 12 Scylla shards remains the
-  better default for this target.
+- A `maxConns: 12` versus `maxConns: 24` run produced `187.54` versus `173.08 workflows/sec` for activity and `291.81`
+  versus `239.11 workflows/sec` for signal. This is not connection-count evidence: Scylla gocql opens one connection
+  per physical shard and ignores `NumConns`. Treat the difference as run variance, and use Scylla-specific connection
+  controls for future comparisons.
 - Many task queues with multiple workers do not scale well when every task queue gets 12 matching read/write partitions.
   A 16-task-queue, 2-worker-per-task-queue activity workload improved from `113.01 workflows/sec` with 12 partitions to
   `154.25 workflows/sec` with 1 partition, and the signal workload improved from `217.18 workflows/sec` /
@@ -700,9 +708,9 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   neutral at roughly `0.8 us/op` and 19 allocations because workflow-state protobuf decoding dominates the harness.
   The combined live build reached `188.21 workflows/sec` at 1 queue and 4 workers and `180.75 workflows/sec` at
   16 queues and 8 workers, completing all 12,800 workflows with zero failures.
-- New Cassandra/Scylla clusters can opt into 512 logical history shards instead of tying the count to the target
-  cluster's 12 physical Scylla shards. The upgrade-safe default remains 4 because this value is immutable after
-  cluster creation. Each history shard is one `executions` partition, and the conditional mutable-state batch
+- Small-payload screening investigated 512 logical history shards instead of tying the count to the target cluster's
+  12 physical Scylla shards. The upgrade-safe default remains 4 because this value is immutable after cluster
+  creation. Each history shard is one `executions` partition, and the conditional mutable-state batch
   intentionally keeps its shard, workflow, and generated task rows in that partition. More logical shards distribute
   those atomic batches without weakening their fencing or splitting them across partitions.
 
@@ -726,6 +734,20 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   no dropped mutations, and no current Scylla storage errors. The measured server RSS geometric mean increased from
   `894,136 KiB` to `1,154,652 KiB` (`+29.14%`); operators choosing a lower count for memory-constrained new clusters
   trade away partition distribution and future history-service scale-out headroom.
+
+  That screening did not cover maximum-size payloads. A later managed-server run on the same physical cluster shape,
+  limited to roughly 1 GiB per Scylla shard, submitted 500 workflows at concurrency 128 with a 1 MiB workflow and
+  activity payload. At 512 history shards, the one-activity profile completed 2/500 and the 20-activity profile
+  completed 0/500 after their sample timeouts; Scylla reported Paxos and write timeouts. A 512-shard confirmation that
+  explicitly waited for history gRPC health also completed 0/500, while a matched 4-history-shard control completed
+  the 20-activity batch 500/500. A readiness-gated upstream v1.31.2 512-shard control under
+  the same smoke protocol likewise failed the batch, completing 331/500 in 15 minutes. The 512 result therefore
+  remains useful small-payload screening evidence, but it is not a safe general recommendation for this constrained
+  target.
+
+  A publishable matched rerun of schema `v1.16` must use the same Scylla driver, four history shards, final target-only
+  modes, no source tables, and the complete tiny/big by 182-byte/1-MiB matrix on both sides. Earlier partial and
+  pre-target-only runs are diagnostic evidence only; do not use them to claim a final schema performance result.
 - Cassandra `ListConcreteExecutions` now preallocates its result slice from the requested page size. A focused 100-state
   page benchmark improved from `455.4-487.2 ns/op`, `2168 B/op`, and 8 allocations to `144.9-157.9 ns/op`, `896 B/op`,
   and 1 allocation. This reduces Go allocation and GC pressure during shard-level `executions` table scans without
@@ -752,8 +774,7 @@ the shard/workflow/task atomicity guarantees described in the LWT audit above.
   measured `27.78-27.97 ns/op` with zero allocations. This removes per-enqueue clone overhead while bounding cache and
   lock memory.
 - QueueV2 list pagination remains covered by unit tests for invalid page tokens and repeated empty Cassandra page
-  tokens. A bucketed QueueV2 metadata schema was investigated but not kept in this PR because it needs a separate
-  migration for existing `queues` rows.
+  tokens. Schema `v1.16` now migrates existing `queues` rows into the bucketed `queues_v2` target.
 - QueueV2 `ListQueues` now closes the metadata-list iterator before returning row-level metadata/count errors, avoiding
   driver-side scan resource leaks while walking queue metadata rows.
 - The rejected legacy queue range-allocator experiment measured enqueue at `1,078,713`, `1,086,525`, and
@@ -793,7 +814,8 @@ Collect Scylla metrics:
 - coordinator foreground read/write latency
 - LWT/paxos latency and contention counters
 - large partition warnings
-- hot partition/table metrics for `executions`, `history_node`, `tasks_v2`, `queue_messages`
+- hot partition/table metrics for `executions_v2`, `history_node_v2`, `history_tree_v2`, `tasks_v3`,
+  `tasks_v3_fair`, `queue_messages_v3`, and `legacy_queue_v2_messages`
 
 Workloads:
 

@@ -3,6 +3,7 @@ package cassandra
 import (
 	"time"
 
+	cgocql "github.com/gocql/gocql"
 	"go.temporal.io/server/common/convert"
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
@@ -15,10 +16,34 @@ func NewMatchingTaskStore(
 	logger log.Logger,
 	enableFairness bool,
 ) p.TaskStore {
+	userData := newUserDataStore(
+		session,
+		logger,
+		TaskQueueUserDataMigrationModeSourceOnly,
+		DefaultTaskQueueUserDataBucketCount,
+	)
 	if enableFairness {
-		return newMatchingTaskStoreV2(session)
+		return newMatchingTaskStoreV2WithUserData(session, userData)
 	}
-	return newMatchingTaskStoreV1(session)
+	return newMatchingTaskStoreV1WithUserData(session, userData)
+}
+
+func NewMatchingTaskStoreWithUserDataMigration(
+	session gocql.Session,
+	logger log.Logger,
+	enableFairness bool,
+	migrationMode TaskQueueUserDataMigrationMode,
+	bucketCount int,
+	generation ...cgocql.UUID,
+) (p.TaskStore, error) {
+	if err := ValidateTaskQueueUserDataMigrationMode(migrationMode); err != nil {
+		return nil, err
+	}
+	userData := newUserDataStore(session, logger, migrationMode, bucketCount, generation...)
+	if enableFairness {
+		return newMatchingTaskStoreV2WithUserData(session, userData), nil
+	}
+	return newMatchingTaskStoreV1WithUserData(session, userData), nil
 }
 
 const (

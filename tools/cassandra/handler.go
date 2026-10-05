@@ -306,6 +306,232 @@ func backfillHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
 	return nil
 }
 
+func validateHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := persistencecassandra.ValidateHistoryNodeV2BackfillSchema(
+		context.Background(),
+		client.session,
+		client.keyspace,
+	); err != nil {
+		return err
+	}
+	result, err := persistencecassandra.ValidateHistoryNodeV2(
+		context.Background(),
+		client.session,
+		ctx.Int(historyNodeBackfillPageSizeFlag),
+		ctx.Int(historyNodeBackfillConcurrencyFlag),
+	)
+	if err != nil {
+		return err
+	}
+	if !result.Matches() {
+		return fmt.Errorf("history node layouts differ: %+v", result)
+	}
+	logger.Info(fmt.Sprintf("Validated %d history node rows.", result.LegacyRows))
+	return nil
+}
+
+func backfillHistoryTreeV2(ctx *cli.Context, logger log.Logger) error {
+	return backfillHistoryTree(ctx, logger, true)
+}
+
+func backfillHistoryTreeV1(ctx *cli.Context, logger log.Logger) error {
+	return backfillHistoryTree(ctx, logger, false)
+}
+
+func reconcileHistoryTreeV2(ctx *cli.Context, logger log.Logger) error {
+	return reconcileHistoryTree(ctx, logger, true)
+}
+
+func reconcileHistoryTreeV1(ctx *cli.Context, logger log.Logger) error {
+	return reconcileHistoryTree(ctx, logger, false)
+}
+
+func reconcileHistoryTree(ctx *cli.Context, logger log.Logger, forward bool) error {
+	checkpointPath := strings.TrimSpace(ctx.String(historyNodeBackfillCheckpointFileFlag))
+	if checkpointPath == "" {
+		return fmt.Errorf("missing %s argument", flag(historyNodeBackfillCheckpointFileFlag))
+	}
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	direction := "history-tree-v2-reconcile"
+	sourceTable := "history_tree"
+	targetTable := "history_tree_v2"
+	sourceLayout := persistencecassandra.HistoryTreeTableLayoutLegacyV1
+	reconcileRange := persistencecassandra.ReconcileHistoryTreeV2Range
+	if !forward {
+		direction = "history-tree-v1-reconcile"
+		reconcileRange = persistencecassandra.ReconcileHistoryTreeV1Range
+	}
+	if err := persistencecassandra.ValidateHistoryTreeReconcileSchema(
+		context.Background(),
+		client.session,
+		client.keyspace,
+	); err != nil {
+		return err
+	}
+	tokenRangeCount := ctx.Int(historyNodeBackfillTokenRangesFlag)
+	identity, err := newHistoryTreeBackfillCheckpointIdentity(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		direction,
+		sourceTable,
+		sourceLayout,
+		targetTable,
+		tokenRangeCount,
+	)
+	if err != nil {
+		return err
+	}
+	options := persistencecassandra.HistoryTreeBackfillOptions{
+		PageSize:        ctx.Int(historyNodeBackfillPageSizeFlag),
+		Concurrency:     ctx.Int(historyNodeBackfillConcurrencyFlag),
+		TokenRangeCount: tokenRangeCount,
+		Partitioner:     identity.Partitioner,
+	}
+	mutations, err := runHistoryNodeBackfill(
+		context.Background(),
+		checkpointPath,
+		identity,
+		func(validateCtx context.Context) error {
+			return validateHistoryNodeBackfillCheckpointIdentity(validateCtx, client.session, identity)
+		},
+		func(
+			rangeCtx context.Context,
+			tokenRange persistencecassandra.HistoryNodeBackfillTokenRange,
+		) (int64, error) {
+			return reconcileRange(rangeCtx, client.session, options, tokenRange)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Applied %d exact history tree reconciliation mutations.", mutations))
+	return nil
+}
+
+func backfillHistoryTree(ctx *cli.Context, logger log.Logger, forward bool) error {
+	checkpointPath := strings.TrimSpace(ctx.String(historyNodeBackfillCheckpointFileFlag))
+	if checkpointPath == "" {
+		return fmt.Errorf("missing %s argument", flag(historyNodeBackfillCheckpointFileFlag))
+	}
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	direction := "history-tree-v2"
+	sourceTable := "history_tree"
+	targetTable := "history_tree_v2"
+	sourceLayout := persistencecassandra.HistoryTreeTableLayoutLegacyV1
+	validateSchema := persistencecassandra.ValidateHistoryTreeV2BackfillSchema
+	backfillRange := persistencecassandra.BackfillHistoryTreeV2Range
+	if !forward {
+		direction = "history-tree-v1"
+		sourceTable = "history_tree_v2"
+		targetTable = "history_tree"
+		sourceLayout = persistencecassandra.HistoryTreeTableLayoutBucketV2
+		validateSchema = persistencecassandra.ValidateHistoryTreeV1BackfillSchema
+		backfillRange = persistencecassandra.BackfillHistoryTreeV1Range
+	}
+	if err := validateSchema(context.Background(), client.session, client.keyspace); err != nil {
+		return err
+	}
+	tokenRangeCount := ctx.Int(historyNodeBackfillTokenRangesFlag)
+	identity, err := newHistoryTreeBackfillCheckpointIdentity(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		direction,
+		sourceTable,
+		sourceLayout,
+		targetTable,
+		tokenRangeCount,
+	)
+	if err != nil {
+		return err
+	}
+	options := persistencecassandra.HistoryTreeBackfillOptions{
+		PageSize:        ctx.Int(historyNodeBackfillPageSizeFlag),
+		Concurrency:     ctx.Int(historyNodeBackfillConcurrencyFlag),
+		TokenRangeCount: tokenRangeCount,
+		Partitioner:     identity.Partitioner,
+	}
+	copied, err := runHistoryNodeBackfill(
+		context.Background(),
+		checkpointPath,
+		identity,
+		func(validateCtx context.Context) error {
+			return validateHistoryNodeBackfillCheckpointIdentity(validateCtx, client.session, identity)
+		},
+		func(
+			rangeCtx context.Context,
+			tokenRange persistencecassandra.HistoryNodeBackfillTokenRange,
+		) (int64, error) {
+			return backfillRange(rangeCtx, client.session, options, tokenRange)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Backfilled %d %s rows.", copied, targetTable))
+	return nil
+}
+
+func validateHistoryTreeV2(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := persistencecassandra.ValidateHistoryTreeV2BackfillSchema(
+		context.Background(),
+		client.session,
+		client.keyspace,
+	); err != nil {
+		return err
+	}
+	result, err := persistencecassandra.ValidateHistoryTreeV2(
+		context.Background(),
+		client.session,
+		ctx.Int(historyNodeBackfillPageSizeFlag),
+	)
+	if err != nil {
+		return err
+	}
+	if !result.Matches() {
+		return fmt.Errorf("history tree layouts differ: %+v", result)
+	}
+	logger.Info(fmt.Sprintf("Validated %d history tree rows.", result.LegacyRows))
+	return nil
+}
+
 func recreateHistoryNodeV1(ctx *cli.Context, logger log.Logger) error {
 	config, err := newCQLClientConfig(ctx)
 	if err != nil {
@@ -357,6 +583,29 @@ func recreateHistoryNodeV2(ctx *cli.Context, logger log.Logger) error {
 		return err
 	}
 	logger.Info("history_node_v2 has been cleared and recreated.")
+	return nil
+}
+
+func recreateHistoryTreeV2(ctx *cli.Context, logger log.Logger) error {
+	config, err := newCQLClientConfig(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := newCQLClient(config, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	err = persistencecassandra.RecreateHistoryTreeV2(
+		context.Background(),
+		client.session,
+		client.keyspace,
+		ctx.Bool(confirmHistoryNodeSourceRebuildFlag),
+	)
+	if err != nil {
+		return err
+	}
+	logger.Info("history_tree_v2 has been cleared and recreated.")
 	return nil
 }
 

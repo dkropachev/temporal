@@ -53,6 +53,8 @@ type historyNodeKeyColumn struct {
 type historyNodeTableGenerations struct {
 	historyNode   [16]byte
 	historyNodeV2 [16]byte
+	historyTree   [16]byte
+	historyTreeV2 [16]byte
 }
 
 type historyNodeModeLayouts struct {
@@ -82,6 +84,19 @@ func normalizeHistoryNodeMigrationMode(
 		return config.CassandraHistoryNodeMigrationModeLegacyV1Dual
 	}
 	return mode
+}
+
+func historyNodeUsesCanonicalTarget(mode config.CassandraHistoryNodeMigrationMode) bool {
+	switch normalizeHistoryNodeMigrationMode(mode) {
+	case config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeV2Only,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual:
+		return true
+	default:
+		return false
+	}
 }
 
 // ValidateHistoryNodeMigrationMode checks whether a configured migration mode is supported.
@@ -220,9 +235,19 @@ func getHistoryNodeTableGenerations(
 	if err != nil {
 		return historyNodeTableGenerations{}, err
 	}
+	historyTree, err := get(historyTreeTableName)
+	if err != nil {
+		return historyNodeTableGenerations{}, err
+	}
+	historyTreeV2, err := get(historyTreeV2TableName)
+	if err != nil {
+		return historyNodeTableGenerations{}, err
+	}
 	return historyNodeTableGenerations{
 		historyNode:   historyNode,
 		historyNodeV2: historyNodeV2,
+		historyTree:   historyTree,
+		historyTreeV2: historyTreeV2,
 	}, nil
 }
 

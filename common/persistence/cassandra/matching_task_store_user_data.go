@@ -3,7 +3,9 @@ package cassandra
 import (
 	"context"
 	"fmt"
+	"sync"
 
+	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 )
@@ -39,10 +41,15 @@ const (
 )
 
 type userDataStore struct {
-	Session gocql.Session
+	Session              gocql.Session
+	logger               log.Logger
+	migrationMode        TaskQueueUserDataMigrationMode
+	bucketCount          int
+	authorityIdentity    *taskQueueUserDataAuthorityIdentityCache
+	targetAuthorityCache *sync.Map
 }
 
-func (d *userDataStore) GetTaskQueueUserData(
+func (d *userDataStore) getTaskQueueUserDataV1(
 	ctx context.Context,
 	request *p.GetTaskQueueUserDataRequest,
 ) (*p.InternalGetTaskQueueUserDataResponse, error) {
@@ -63,9 +70,24 @@ func (d *userDataStore) GetTaskQueueUserData(
 	}, nil
 }
 
-func (d *userDataStore) UpdateTaskQueueUserData(
+func (d *userDataStore) updateTaskQueueUserDataV1(
 	ctx context.Context,
 	request *p.InternalUpdateTaskQueueUserDataRequest,
+) error {
+	return d.updateTaskQueueUserDataV1Guarded(
+		ctx,
+		request,
+		taskQueueUserDataAuthorityRecord{},
+		taskQueueUserDataAuthorityUnspecified,
+	)
+}
+
+//nolint:revive // The guarded update atomically handles version, build-ID, and authority conditions.
+func (d *userDataStore) updateTaskQueueUserDataV1Guarded(
+	ctx context.Context,
+	request *p.InternalUpdateTaskQueueUserDataRequest,
+	identity taskQueueUserDataAuthorityRecord,
+	authority taskQueueUserDataAuthority,
 ) error {
 	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 
@@ -94,6 +116,7 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 			batch.Query(templateDeleteBuildIdTaskQueueMappingQuery, request.NamespaceID, buildId, taskQueue)
 		}
 	}
+	addTaskQueueUserDataSourceAuthorityGuard(batch, request.NamespaceID, identity, authority)
 
 	previous := make(map[string]any)
 	applied, iter, err := d.Session.MapExecuteBatchCAS(batch, previous)
@@ -107,8 +130,21 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 	}
 
 	if !applied {
+		if authorityErr := d.validateTaskQueueUserDataSourceGuard(
+			ctx,
+			request.NamespaceID,
+			identity,
+			authority,
+		); authorityErr != nil {
+			if iter != nil {
+				_ = iter.Close()
+			}
+			return authorityErr
+		}
 		defer func() {
-			_ = iter.Close()
+			if iter != nil {
+				_ = iter.Close()
+			}
 		}()
 		// No error, but not applied. That means we had a conflict.
 		// Iterate through results to identify first conflicting row.
@@ -139,7 +175,7 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 	return nil
 }
 
-func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, request *p.ListTaskQueueUserDataEntriesRequest) (*p.InternalListTaskQueueUserDataEntriesResponse, error) {
+func (d *userDataStore) listTaskQueueUserDataEntriesV1(ctx context.Context, request *p.ListTaskQueueUserDataEntriesRequest) (*p.InternalListTaskQueueUserDataEntriesResponse, error) {
 	query := d.Session.Query(templateListTaskQueueUserDataQuery, request.NamespaceID).WithContext(ctx)
 	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
@@ -184,7 +220,7 @@ func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, reques
 	return response, nil
 }
 
-func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.GetTaskQueuesByBuildIdRequest) ([]string, error) {
+func (d *userDataStore) getTaskQueuesByBuildIDV1(ctx context.Context, request *p.GetTaskQueuesByBuildIdRequest) ([]string, error) {
 	var taskQueues []string
 	var pageToken []byte
 
@@ -223,7 +259,7 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 	}
 }
 
-func (d *userDataStore) CountTaskQueuesByBuildId(ctx context.Context, request *p.CountTaskQueuesByBuildIdRequest) (int, error) {
+func (d *userDataStore) countTaskQueuesByBuildIDV1(ctx context.Context, request *p.CountTaskQueuesByBuildIdRequest) (int, error) {
 	if request.Limit > 0 {
 		query := d.Session.Query(templateLimitedCountTaskQueueByBuildIDQuery, request.NamespaceID, request.BuildID, request.Limit).WithContext(ctx)
 		iter := query.PageSize(request.Limit).Iter()

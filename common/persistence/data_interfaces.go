@@ -637,6 +637,11 @@ type (
 		PageSize           int
 		UseLimit           bool // If true, use LIMIT in the query
 		NextPageToken      []byte
+		// TaskIDRangeSize lets bucketed stores narrow classic reads to the ownership ranges
+		// that could contain the requested task IDs. TaskIDMaxBatchSize bounds how far a batch
+		// can cross a range boundary. Zero means unknown for either value.
+		TaskIDRangeSize    int64
+		TaskIDMaxBatchSize int
 	}
 
 	// GetTasksResponse is the response to GetTasksRequests

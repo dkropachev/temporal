@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/persistence/cassandra"
 	"go.temporal.io/server/common/persistence/serialization"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -25,7 +26,7 @@ import (
 func BenchmarkCassandraHistoryNodeAppendRead(b *testing.B) {
 	benchmarkCassandraHistoryNodeAppendRead(
 		b,
-		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+		config.CassandraHistoryNodeMigrationModeV2Only,
 	)
 }
 
@@ -40,7 +41,10 @@ func benchmarkCassandraHistoryNodeAppendRead(
 	b *testing.B,
 	mode config.CassandraHistoryNodeMigrationMode,
 ) {
-	testData, tearDown := setUpCassandraTestWithHistoryNodeMigrationMode(b, mode)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.HistoryNodeMigrationMode = mode
+		cfg.HistoryTreeMigrationMode = config.CassandraHistoryTreeMigrationModeTargetOnly
+	})
 	defer tearDown()
 
 	store, err := testData.Factory.NewExecutionStore()
@@ -97,7 +101,10 @@ func benchmarkCassandraHistoryNodeAppendRead(
 }
 
 func BenchmarkCassandraHistoryNodeMultiBranchRead(b *testing.B) {
-	testData, tearDown := setUpCassandraTestWithHistoryNodeV2Reads(b)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.HistoryNodeMigrationMode = config.CassandraHistoryNodeMigrationModeV2Only
+		cfg.HistoryTreeMigrationMode = config.CassandraHistoryTreeMigrationModeTargetOnly
+	})
 	defer tearDown()
 
 	store, err := testData.Factory.NewExecutionStore()
@@ -137,7 +144,10 @@ func BenchmarkCassandraHistoryNodeMultiBranchRead(b *testing.B) {
 }
 
 func BenchmarkCassandraQueueV2EnqueueRead(b *testing.B) {
-	testData, tearDown := setUpCassandraTest(b)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.QueueV2MigrationMode = config.CassandraQueueV2MigrationModeTargetOnly
+		cfg.QueueV2MessageBucketSpan = cassandra.DefaultQueueV2MessageBucketSpan
+	})
 	defer tearDown()
 
 	queue, err := testData.Factory.NewQueueV2()
@@ -215,7 +225,10 @@ func BenchmarkCassandraQueueV2EnqueueRead(b *testing.B) {
 }
 
 func BenchmarkCassandraQueueEnqueueRead(b *testing.B) {
-	testData, tearDown := setUpCassandraTest(b)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.LegacyQueueMigrationMode = config.CassandraLegacyQueueMigrationModeTargetOnly
+		cfg.LegacyQueueMessageBucketSize = cassandra.DefaultLegacyQueueV2MessageBucketSize
+	})
 	defer tearDown()
 
 	queue, err := testData.Factory.NewQueue(p.NamespaceReplicationQueueType)
@@ -249,7 +262,12 @@ func BenchmarkCassandraQueueEnqueueRead(b *testing.B) {
 }
 
 func BenchmarkCassandraMatchingTaskQueue(b *testing.B) {
-	testData, tearDown := setUpCassandraTest(b)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.MatchingTaskMigrationMode = config.CassandraMatchingTaskMigrationModeTargetOnly
+		cfg.MatchingTaskStorageBucketCount = cassandra.DefaultMatchingTaskStorageBucketCount
+		cfg.TaskQueueUserDataMigrationMode = config.CassandraTaskQueueUserDataMigrationModeTargetOnly
+		cfg.TaskQueueUserDataBucketCount = cassandra.DefaultTaskQueueUserDataBucketCount
+	})
 	defer tearDown()
 
 	legacyStore, err := testData.Factory.NewTaskStore()
@@ -279,7 +297,12 @@ func BenchmarkCassandraMatchingTaskQueue(b *testing.B) {
 }
 
 func BenchmarkCassandraTaskQueueUserDataBuildIDCount(b *testing.B) {
-	testData, tearDown := setUpCassandraTest(b)
+	testData, tearDown := setUpCassandraTestWithConfig(b, func(cfg *config.Cassandra) {
+		cfg.MatchingTaskMigrationMode = config.CassandraMatchingTaskMigrationModeTargetOnly
+		cfg.MatchingTaskStorageBucketCount = cassandra.DefaultMatchingTaskStorageBucketCount
+		cfg.TaskQueueUserDataMigrationMode = config.CassandraTaskQueueUserDataMigrationModeTargetOnly
+		cfg.TaskQueueUserDataBucketCount = cassandra.DefaultTaskQueueUserDataBucketCount
+	})
 	defer tearDown()
 
 	store, err := testData.Factory.NewTaskStore()
@@ -584,10 +607,14 @@ func benchmarkGetTasksRequest(
 		InclusiveMinTaskID: 1,
 		ExclusiveMaxTaskID: math.MaxInt64,
 		PageSize:           pageSize,
+		TaskIDRangeSize:    cassandra.DefaultMatchingTaskRangeSize,
+		TaskIDMaxBatchSize: 16,
 	}
 	if fair {
 		request.InclusiveMinPass = 1
 		request.UseLimit = true
+	} else {
+		request.ExclusiveMaxTaskID = cassandra.DefaultMatchingTaskRangeSize + 1
 	}
 	return request
 }

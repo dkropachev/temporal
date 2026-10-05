@@ -33,6 +33,17 @@ persistence:
                 maxExcessShardConnectionsRate: {{ default "2" (env "CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE") }}
                 disableInitialHostLookup: {{ default "false" (env "CASSANDRA_DISABLE_INITIAL_HOST_LOOKUP") }}
                 historyNodeMigrationMode: {{ default "legacy-v1-dual" (env "CASSANDRA_HISTORY_NODE_MIGRATION_MODE") }}
+                historyTreeMigrationMode: {{ default "source-only" (env "CASSANDRA_HISTORY_TREE_MIGRATION_MODE") }}
+                executionMigrationMode: {{ default "legacy" (env "CASSANDRA_EXECUTION_MIGRATION_MODE") }}
+                executionStorageBuckets: {{ default "16" (env "CASSANDRA_EXECUTION_STORAGE_BUCKETS") }}
+                queueV2MigrationMode: {{ default "source-only" (env "CASSANDRA_QUEUE_V2_MIGRATION_MODE") }}
+                queueV2MessageBucketSpan: {{ default "4096" (env "CASSANDRA_QUEUE_V2_MESSAGE_BUCKET_SPAN") }}
+                legacyQueueMigrationMode: {{ default "source-only" (env "CASSANDRA_LEGACY_QUEUE_MIGRATION_MODE") }}
+                legacyQueueMessageBucketSize: {{ default "4096" (env "CASSANDRA_LEGACY_QUEUE_MESSAGE_BUCKET_SIZE") }}
+                matchingTaskMigrationMode: {{ default "source-only" (env "CASSANDRA_MATCHING_TASK_MIGRATION_MODE") }}
+                matchingTaskStorageBucketCount: {{ default "16" (env "CASSANDRA_MATCHING_TASK_STORAGE_BUCKET_COUNT") }}
+                taskQueueUserDataMigrationMode: {{ default "source-only" (env "CASSANDRA_TASK_QUEUE_USER_DATA_MIGRATION_MODE") }}
+                taskQueueUserDataBucketCount: {{ default "64" (env "CASSANDRA_TASK_QUEUE_USER_DATA_BUCKET_COUNT") }}
                 tls:
                     enabled: {{ default "false" (env "CASSANDRA_TLS_ENABLED") }}
                     caFile: {{ env "CASSANDRA_CA" }}

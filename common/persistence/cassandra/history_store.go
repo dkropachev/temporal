@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"sort"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -16,6 +17,7 @@ import (
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/primitives"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -75,6 +77,18 @@ const (
 	v2templateDeleteBranch = `DELETE FROM history_tree WHERE tree_id = ? AND branch_id = ? `
 
 	v2templateScanAllTreeBranches = `SELECT tree_id, branch_id, branch, branch_encoding FROM history_tree `
+
+	v2templateInsertTreeV2 = `INSERT INTO history_tree_v2 (` +
+		`tree_id, branch_bucket, branch_id, branch, branch_encoding) ` +
+		`VALUES (?, ?, ?, ?, ?) `
+
+	v2templateReadAllBranchesV2 = `SELECT branch_id, branch, branch_encoding FROM history_tree_v2 ` +
+		`WHERE tree_id = ? AND branch_bucket = ? `
+
+	v2templateDeleteBranchV2 = `DELETE FROM history_tree_v2 ` +
+		`WHERE tree_id = ? AND branch_bucket = ? AND branch_id = ? `
+
+	v2templateScanAllTreeBranchesV2 = `SELECT tree_id, branch_bucket, branch_id, branch, branch_encoding FROM history_tree_v2 `
 )
 
 type (
@@ -82,6 +96,7 @@ type (
 		Session gocql.Session
 		p.HistoryBranchUtil
 		historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode
+		historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode
 		historyNodeGenerations   historyNodeTableGenerations
 	}
 
@@ -109,10 +124,44 @@ func NewHistoryStore(
 	if len(historyNodeMigrationMode) > 0 {
 		mode = normalizeHistoryNodeMigrationMode(historyNodeMigrationMode[0])
 	}
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		mode,
+		config.CassandraHistoryTreeMigrationModeSourceOnly,
+		historyNodeTableGenerations{},
+	)
+}
+
+// NewHistoryStoreWithMigrationModes creates a history store with independently selectable node and tree layouts.
+func NewHistoryStoreWithMigrationModes(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
+) *HistoryStore {
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		normalizeHistoryNodeMigrationMode(historyNodeMigrationMode),
+		normalizeHistoryTreeMigrationMode(historyTreeMigrationMode),
+		historyNodeTableGenerations{},
+	)
+}
+
+func newHistoryStoreWithMigrationModes(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
+	generations historyNodeTableGenerations,
+) *HistoryStore {
 	return &HistoryStore{
 		Session:                  session,
 		HistoryBranchUtil:        p.NewHistoryBranchUtil(serializer),
-		historyNodeMigrationMode: mode,
+		historyNodeMigrationMode: historyNodeMigrationMode,
+		historyTreeMigrationMode: historyTreeMigrationMode,
+		historyNodeGenerations:   generations,
 	}
 }
 
@@ -122,9 +171,13 @@ func newHistoryStore(
 	mode config.CassandraHistoryNodeMigrationMode,
 	generations historyNodeTableGenerations,
 ) *HistoryStore {
-	store := NewHistoryStore(session, serializer, mode)
-	store.historyNodeGenerations = generations
-	return store
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		mode,
+		config.CassandraHistoryTreeMigrationModeSourceOnly,
+		generations,
+	)
 }
 
 func (h *HistoryStore) historyNodeMutationPlan(
@@ -545,22 +598,64 @@ func (h *HistoryStore) executeHistoryNodeUpserts(
 	branchInfo := request.BranchInfo
 	node := request.Node
 	timestamp := time.Now().UnixMicro()
+	var treePlan historyTreeMutationPlan
+	treeMutation := historyTreeMutation{timestamp: timestamp}
 
 	if request.IsNewBranch {
-		treeInfoDataBlob := request.TreeInfo
-		primaryBatch := h.Session.NewBatch(gocql.LoggedBatch).
-			WithContext(ctx).
-			WithTimestamp(timestamp)
-		primaryBatch.Query(
-			v2templateInsertTree,
+		var err error
+		treePlan, err = h.historyTreeMutationPlan(v2templateInsertTree, v2templateInsertTreeV2)
+		if err != nil {
+			return err
+		}
+		treeMutation, err = h.prepareHistoryTreeMutation(
+			ctx,
 			branchInfo.TreeId,
 			branchInfo.BranchId,
-			treeInfoDataBlob.Data,
-			treeInfoDataBlob.EncodingType.String(),
 		)
-		h.addHistoryNodeUpsert(primaryBatch, plan.primaryQuery, branchInfo, node)
-		if err := h.Session.ExecuteBatch(primaryBatch); err != nil {
+		if err != nil {
 			return err
+		}
+		timestamp = treeMutation.timestamp
+		treeInfoDataBlob := request.TreeInfo
+		if treeMutation.authority != historyTreeMigrationAuthorityUnspecified {
+			if err := h.executeHistoryTreeUpsertWithMutation(
+				ctx,
+				treePlan.primaryQuery,
+				branchInfo.TreeId,
+				branchInfo.BranchId,
+				treeInfoDataBlob.Data,
+				treeInfoDataBlob.EncodingType.String(),
+				treeMutation,
+			); err != nil {
+				return err
+			}
+			if err := h.executeHistoryNodeUpsert(
+				ctx,
+				plan.primaryQuery,
+				branchInfo,
+				node,
+				timestamp,
+			); err != nil {
+				return err
+			}
+		} else {
+			primaryBatch := h.Session.NewBatch(gocql.LoggedBatch).
+				WithContext(ctx).
+				WithTimestamp(timestamp)
+			if err := h.addHistoryTreeUpsert(
+				primaryBatch,
+				treePlan.primaryQuery,
+				branchInfo.TreeId,
+				branchInfo.BranchId,
+				treeInfoDataBlob.Data,
+				treeInfoDataBlob.EncodingType.String(),
+			); err != nil {
+				return err
+			}
+			h.addHistoryNodeUpsert(primaryBatch, plan.primaryQuery, branchInfo, node)
+			if err := h.Session.ExecuteBatch(primaryBatch); err != nil {
+				return err
+			}
 		}
 	} else if err := h.executeHistoryNodeUpsert(
 		ctx,
@@ -572,24 +667,115 @@ func (h *HistoryStore) executeHistoryNodeUpserts(
 		return err
 	}
 
-	if plan.mirrorQuery == "" {
-		return nil
-	}
-
 	// Keep the large event blob out of a cross-table batch. Workflow mutations
 	// append history before mutable state, so a required mirror failure prevents
 	// the state commit and retries can complete these idempotent inserts.
-	if err := h.executeHistoryNodeUpsert(
-		ctx,
-		plan.mirrorQuery,
-		branchInfo,
-		node,
-		timestamp,
-	); err != nil &&
-		!gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
-		return err
+	if plan.mirrorQuery != "" {
+		if err := h.executeHistoryNodeUpsert(
+			ctx,
+			plan.mirrorQuery,
+			branchInfo,
+			node,
+			timestamp,
+		); err != nil &&
+			!gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
+			return err
+		}
+	}
+	if request.IsNewBranch && treePlan.mirrorQuery != "" {
+		treeInfoDataBlob := request.TreeInfo
+		if err := h.executeHistoryTreeUpsertWithMutation(
+			ctx,
+			treePlan.mirrorQuery,
+			branchInfo.TreeId,
+			branchInfo.BranchId,
+			treeInfoDataBlob.Data,
+			treeInfoDataBlob.EncodingType.String(),
+			treeMutation,
+		); err != nil &&
+			!gocql.IsUnconfiguredTableError(err, treePlan.optionalMirrorTable) {
+			return err
+		}
 	}
 	return nil
+}
+
+func (h *HistoryStore) addHistoryTreeUpsert(
+	batch *gocql.Batch,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+) error {
+	if query == v2templateInsertTreeV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		batch.Query(query, treeID, bucket, branchID, data, encoding)
+		return nil
+	}
+	batch.Query(query, treeID, branchID, data, encoding)
+	return nil
+}
+
+func (h *HistoryStore) executeHistoryTreeUpsert(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+	timestamp int64,
+) error {
+	return h.executeHistoryTreeUpsertWithMutation(
+		ctx,
+		query,
+		treeID,
+		branchID,
+		data,
+		encoding,
+		historyTreeMutation{timestamp: timestamp},
+	)
+}
+
+func (h *HistoryStore) executeHistoryTreeUpsertWithMutation(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+	mutation historyTreeMutation,
+) error {
+	if query == v2templateInsertTreeV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		return h.Session.Query(query, treeID, bucket, branchID, data, encoding).
+			WithContext(ctx).
+			WithTimestamp(mutation.timestamp).
+			Exec()
+	}
+	if mutation.authority != historyTreeMigrationAuthorityUnspecified {
+		return h.executeGuardedHistoryTreeSourceMutation(
+			ctx,
+			mutation,
+			treeID,
+			"WriteHistoryTreeSource",
+			query,
+			treeID,
+			branchID,
+			data,
+			encoding,
+		)
+	}
+	return h.Session.Query(query, treeID, branchID, data, encoding).
+		WithContext(ctx).
+		WithTimestamp(mutation.timestamp).
+		Exec()
 }
 
 func (h *HistoryStore) executeHistoryNodeUpsert(
@@ -831,10 +1017,37 @@ func (h *HistoryStore) ForkHistoryBranch(
 	if err != nil {
 		return serviceerror.NewInternalf("ForkHistoryBranch - Gocql NewBranchID UUID cast failed. Error: %v", err)
 	}
-	query := h.Session.Query(v2templateInsertTree, cqlTreeID, cqlNewBranchID, datablob.Data, datablob.EncodingType.String()).WithContext(ctx)
-	err = query.Exec()
+	plan, err := h.historyTreeMutationPlan(v2templateInsertTree, v2templateInsertTreeV2)
 	if err != nil {
+		return err
+	}
+	mutation, err := h.prepareHistoryTreeMutation(ctx, cqlTreeID, cqlNewBranchID)
+	if err != nil {
+		return err
+	}
+	if err := h.executeHistoryTreeUpsertWithMutation(
+		ctx,
+		plan.primaryQuery,
+		cqlTreeID,
+		cqlNewBranchID,
+		datablob.Data,
+		datablob.EncodingType.String(),
+		mutation,
+	); err != nil {
 		return gocql.ConvertError("ForkHistoryBranch", err)
+	}
+	if plan.mirrorQuery != "" {
+		if err := h.executeHistoryTreeUpsertWithMutation(
+			ctx,
+			plan.mirrorQuery,
+			cqlTreeID,
+			cqlNewBranchID,
+			datablob.Data,
+			datablob.EncodingType.String(),
+			mutation,
+		); err != nil && !gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
+			return gocql.ConvertError("ForkHistoryBranch", err)
+		}
 	}
 
 	return nil
@@ -885,25 +1098,105 @@ func (h *HistoryStore) DeleteHistoryBranch(
 		}
 	}
 
-	err = h.Session.Query(
-		v2templateDeleteBranch,
+	treePlan, err := h.historyTreeMutationPlan(v2templateDeleteBranch, v2templateDeleteBranchV2)
+	if err != nil {
+		return err
+	}
+	mutation, err := h.prepareHistoryTreeMutation(
+		ctx,
 		request.BranchInfo.TreeId,
 		request.BranchInfo.BranchId,
-	).WithContext(ctx).Exec()
+	)
 	if err != nil {
+		return err
+	}
+	if err := h.executeHistoryTreeDeleteWithMutation(
+		ctx,
+		treePlan.primaryQuery,
+		request.BranchInfo.TreeId,
+		request.BranchInfo.BranchId,
+		mutation,
+	); err != nil {
 		return gocql.ConvertError("DeleteHistoryBranch", err)
 	}
+	if treePlan.mirrorQuery != "" {
+		if err := h.executeHistoryTreeDeleteWithMutation(
+			ctx,
+			treePlan.mirrorQuery,
+			request.BranchInfo.TreeId,
+			request.BranchInfo.BranchId,
+			mutation,
+		); err != nil && !gocql.IsUnconfiguredTableError(err, treePlan.optionalMirrorTable) {
+			return gocql.ConvertError("DeleteHistoryBranch", err)
+		}
+	}
 	return nil
+}
+
+func (h *HistoryStore) executeHistoryTreeDelete(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+) error {
+	return h.executeHistoryTreeDeleteWithMutation(
+		ctx,
+		query,
+		treeID,
+		branchID,
+		historyTreeMutation{timestamp: time.Now().UTC().UnixMicro()},
+	)
+}
+
+func (h *HistoryStore) executeHistoryTreeDeleteWithMutation(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	mutation historyTreeMutation,
+) error {
+	if query == v2templateDeleteBranchV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		return h.Session.Query(query, treeID, bucket, branchID).
+			WithContext(ctx).
+			WithTimestamp(mutation.timestamp).
+			Exec()
+	}
+	if mutation.authority != historyTreeMigrationAuthorityUnspecified {
+		return h.executeGuardedHistoryTreeSourceMutation(
+			ctx,
+			mutation,
+			treeID,
+			"DeleteHistoryTreeSource",
+			query,
+			treeID,
+			branchID,
+		)
+	}
+	return h.Session.Query(query, treeID, branchID).
+		WithContext(ctx).
+		WithTimestamp(mutation.timestamp).
+		Exec()
 }
 
 func (h *HistoryStore) GetAllHistoryTreeBranches(
 	ctx context.Context,
 	request *p.GetAllHistoryTreeBranchesRequest,
 ) (*p.InternalGetAllHistoryTreeBranchesResponse, error) {
+	layout, pageState, err := h.decodeHistoryTreePageState(request.NextPageToken)
+	if err != nil {
+		return nil, err
+	}
+	queryString := v2templateScanAllTreeBranches
+	if layout == historyTreeReadLayoutBucketV2 {
+		queryString = v2templateScanAllTreeBranchesV2
+	}
+	query := h.Session.Query(queryString).WithContext(ctx)
 
-	query := h.Session.Query(v2templateScanAllTreeBranches).WithContext(ctx)
-
-	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
+	iter := query.PageSize(request.PageSize).PageState(pageState).Iter()
 
 	branches := make([]p.InternalHistoryBranchDetail, 0, preallocatedResultCapacity(request.PageSize))
 	treeUUID := ""
@@ -911,7 +1204,24 @@ func (h *HistoryStore) GetAllHistoryTreeBranches(
 	var data []byte
 	var encoding string
 
-	for iter.Scan(&treeUUID, &branchUUID, &data, &encoding) {
+	for {
+		var scanned bool
+		if layout == historyTreeReadLayoutBucketV2 {
+			var branchBucket int
+			scanned = iter.Scan(&treeUUID, &branchBucket, &branchUUID, &data, &encoding)
+		} else {
+			scanned = iter.Scan(&treeUUID, &branchUUID, &data, &encoding)
+		}
+		if !scanned {
+			break
+		}
+		if layout == historyTreeReadLayoutLegacyV1 && branchUUID == historyTreeAuthorityBranchID {
+			treeUUID = ""
+			branchUUID = ""
+			data = nil
+			encoding = ""
+			continue
+		}
 		branch := p.InternalHistoryBranchDetail{
 			TreeID:   treeUUID,
 			BranchID: branchUUID,
@@ -928,7 +1238,7 @@ func (h *HistoryStore) GetAllHistoryTreeBranches(
 
 	var pagingToken []byte
 	if len(iter.PageState()) > 0 {
-		pagingToken = iter.PageState()
+		pagingToken = h.encodeHistoryTreePageState(iter.PageState(), layout)
 	}
 	if err := iter.Close(); err != nil {
 		return nil, gocql.ConvertError("GetAllHistoryTreeBranches", err)
@@ -957,39 +1267,78 @@ func (h *HistoryStore) GetHistoryTreeContainingBranch(
 	if err != nil {
 		return nil, serviceerror.NewInternalf("ReadHistoryBranch. Gocql TreeId UUID cast failed. Error: %v", err)
 	}
-	query := h.Session.Query(v2templateReadAllBranches, treeID).WithContext(ctx)
-
 	pageSize := 100
-	var pagingToken []byte
-	treeInfos := make([]*commonpb.DataBlob, 0, pageSize)
+	type branchData struct {
+		branchID string
+		data     *commonpb.DataBlob
+	}
+	branches := make([]branchData, 0, pageSize)
+	layout, err := h.historyTreeReadLayout()
+	if err != nil {
+		return nil, err
+	}
+	bucketLimit := 1
+	if layout == historyTreeReadLayoutBucketV2 {
+		bucketLimit = historyTreeV2BucketCount
+	}
+	bucketBranches := make([][]branchData, bucketLimit)
+	group, groupCtx := errgroup.WithContext(ctx)
+	for bucket := range bucketLimit {
+		group.Go(func() error {
+			queryString := v2templateReadAllBranches
+			queryArgs := []any{treeID}
+			if layout == historyTreeReadLayoutBucketV2 {
+				queryString = v2templateReadAllBranchesV2
+				queryArgs = append(queryArgs, bucket)
+			}
+			query := h.Session.Query(queryString, queryArgs...).WithContext(groupCtx)
+			var pagingToken []byte
+			for {
+				iter := query.
+					PageSize(pageSize).
+					PageState(pagingToken).
+					Iter()
 
-	var iter gocql.Iter
-	for {
-		iter = query.
-			PageSize(pageSize).
-			PageState(pagingToken).
-			Iter()
-
-		branchUUID := ""
-		var data []byte
-		var encoding string
-		for iter.Scan(&branchUUID, &data, &encoding) {
-			treeInfos = append(treeInfos, p.NewDataBlob(data, encoding))
-
-			branchUUID = ""
-			data = []byte{}
-			encoding = ""
-		}
-
-		nextPagingToken := iter.PageState()
-		if err := iter.Close(); err != nil {
-			return nil, gocql.ConvertError("GetHistoryTree", err)
-		}
-
-		if len(nextPagingToken) == 0 {
-			break
-		}
-		pagingToken = nextPagingToken
+				branchUUID := ""
+				var data []byte
+				var encoding string
+				for iter.Scan(&branchUUID, &data, &encoding) {
+					if layout == historyTreeReadLayoutLegacyV1 && branchUUID == historyTreeAuthorityBranchID {
+						branchUUID = ""
+						data = nil
+						encoding = ""
+						continue
+					}
+					bucketBranches[bucket] = append(bucketBranches[bucket], branchData{
+						branchID: branchUUID,
+						data:     p.NewDataBlob(data, encoding),
+					})
+					branchUUID = ""
+					data = nil
+					encoding = ""
+				}
+				nextPagingToken := iter.PageState()
+				if err := iter.Close(); err != nil {
+					return gocql.ConvertError("GetHistoryTree", err)
+				}
+				if len(nextPagingToken) == 0 {
+					break
+				}
+				pagingToken = nextPagingToken
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	for bucket := range bucketLimit {
+		branches = append(branches, bucketBranches[bucket]...)
+	}
+	sort.Slice(branches, func(i, j int) bool { return branches[i].branchID < branches[j].branchID })
+	treeInfos := make([]*commonpb.DataBlob, len(branches))
+	for index := range branches {
+		treeInfos[index] = branches[index].data
 	}
 
 	return &p.InternalGetHistoryTreeContainingBranchResponse{TreeInfos: treeInfos}, nil

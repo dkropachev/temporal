@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,7 +12,9 @@ import (
 	"go.temporal.io/api/serviceerror"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
@@ -370,6 +373,7 @@ type (
 		Session    gocql.Session
 		serializer serialization.Serializer
 		logger     log.Logger
+		layout     executionLayout
 	}
 
 	workflowExecutionRow struct {
@@ -405,10 +409,25 @@ type (
 )
 
 func NewMutableStateStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *MutableStateStore {
+	return newMutableStateStore(
+		session,
+		serializer,
+		logger,
+		executionLayout{mode: config.CassandraExecutionMigrationModeLegacy, buckets: 1},
+	)
+}
+
+func newMutableStateStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	layout executionLayout,
+) *MutableStateStore {
 	return &MutableStateStore{
 		Session:    session,
 		serializer: serializer,
 		logger:     logger,
+		layout:     layout,
 	}
 }
 
@@ -416,14 +435,37 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 	ctx context.Context,
 	request *p.InternalCreateWorkflowExecutionRequest,
 ) (*p.InternalCreateWorkflowExecutionResponse, error) {
-	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.CreateWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		response, err := primary.CreateWorkflowExecution(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.handleMirrorError("CreateWorkflowExecution", func() error {
+			_, err := mirror.CreateWorkflowExecution(ctx, request)
+			return err
+		}()); err != nil {
+			return nil, err
+		}
+		return response, nil
+	}
+	batch := newExecutionBatch(d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx), d.layout)
 
-	shardID := request.ShardID
 	newWorkflow := request.NewWorkflowSnapshot
 	lastWriteVersion := newWorkflow.LastWriteVersion
 	namespaceID := newWorkflow.NamespaceID
 	workflowID := newWorkflow.WorkflowID
 	runID := newWorkflow.RunID
+	shardID, err := d.layout.workflowPartition(request.ShardID, namespaceID, workflowID)
+	if err != nil {
+		return nil, err
+	}
 
 	var requestCurrentRunID string
 	currentRecordRunID := d.getCurrentRecordRunID(request.ArchetypeID)
@@ -476,7 +518,7 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 	}
 
 	if err := applyWorkflowSnapshotBatchAsNew(batch,
-		request.ShardID,
+		shardID,
 		&newWorkflow,
 	); err != nil {
 		return nil, err
@@ -484,7 +526,7 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 
 	batch.Query(templateUpdateLeaseQuery,
 		request.RangeID,
-		request.ShardID,
+		shardID,
 		rowTypeShard,
 		rowTypeShardNamespaceID,
 		rowTypeShardWorkflowID,
@@ -493,9 +535,10 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 		rowTypeShardTaskID,
 		request.RangeID,
 	)
+	batch.addShardAuthorityGuard(shardID)
 
 	conflictRecord := newConflictRecord()
-	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch, conflictRecord)
+	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch.Batch, conflictRecord)
 	if err != nil {
 		return nil, gocql.ConvertError("CreateWorkflowExecution", err)
 	}
@@ -508,7 +551,7 @@ func (d *MutableStateStore) CreateWorkflowExecution(
 			conflictRecord,
 			conflictIter,
 			currentRecordRunID,
-			shardID,
+			request.ShardID,
 			request.RangeID,
 			requestCurrentRunID,
 			[]executionCASCondition{{
@@ -528,8 +571,19 @@ func (d *MutableStateStore) GetWorkflowExecution(
 	ctx context.Context,
 	request *p.GetWorkflowExecutionRequest,
 ) (*p.InternalGetWorkflowExecutionResponse, error) {
-	query := d.Session.Query(templateGetWorkflowExecutionQuery,
-		request.ShardID,
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.GetWorkflowExecution(ctx, request)
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, request.NamespaceID, request.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	query := d.Session.Query(d.layout.query(templateGetWorkflowExecutionQuery),
+		shardID,
 		rowTypeExecution,
 		request.NamespaceID,
 		request.WorkflowID,
@@ -630,7 +684,20 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 	ctx context.Context,
 	request *p.InternalUpdateWorkflowExecutionRequest,
 ) error {
-	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.UpdateWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.UpdateWorkflowExecution(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("UpdateWorkflowExecution", mirror.UpdateWorkflowExecution(ctx, request))
+	}
+	batch := newExecutionBatch(d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx), d.layout)
 
 	updateWorkflow := request.UpdateWorkflowMutation
 	newWorkflow := request.NewWorkflowSnapshot
@@ -638,7 +705,19 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 	namespaceID := updateWorkflow.NamespaceID
 	workflowID := updateWorkflow.WorkflowID
 	runID := updateWorkflow.RunID
-	shardID := request.ShardID
+	shardID, err := d.layout.workflowPartition(request.ShardID, namespaceID, workflowID)
+	if err != nil {
+		return err
+	}
+	if newWorkflow != nil {
+		newShardID, partitionErr := d.layout.workflowPartition(request.ShardID, newWorkflow.NamespaceID, newWorkflow.WorkflowID)
+		if partitionErr != nil {
+			return partitionErr
+		}
+		if newShardID != shardID {
+			return serviceerror.NewInternal("UpdateWorkflowExecution: current and new workflow must use the same execution storage partition")
+		}
+	}
 
 	currentRecordRunID := d.getCurrentRecordRunID(request.ArchetypeID)
 
@@ -701,7 +780,7 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 				executionStateDatablob.EncodingType.String(),
 				lastWriteVersion,
 				updateWorkflow.ExecutionState.State,
-				request.ShardID,
+				shardID,
 				rowTypeExecution,
 				namespaceID,
 				workflowID,
@@ -721,7 +800,7 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 	}
 	if newWorkflow != nil {
 		if err := applyWorkflowSnapshotBatchAsNew(batch,
-			request.ShardID,
+			shardID,
 			newWorkflow,
 		); err != nil {
 			return err
@@ -731,7 +810,7 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 	// Verifies that the RangeID has not changed
 	batch.Query(templateUpdateLeaseQuery,
 		request.RangeID,
-		request.ShardID,
+		shardID,
 		rowTypeShard,
 		rowTypeShardNamespaceID,
 		rowTypeShardWorkflowID,
@@ -740,9 +819,10 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 		rowTypeShardTaskID,
 		request.RangeID,
 	)
+	batch.addShardAuthorityGuard(shardID)
 
 	conflictRecord := newConflictRecord()
-	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch, conflictRecord)
+	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch.Batch, conflictRecord)
 	if err != nil {
 		return gocql.ConvertError("UpdateWorkflowExecution", err)
 	}
@@ -774,16 +854,50 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 	ctx context.Context,
 	request *p.InternalConflictResolveWorkflowExecutionRequest,
 ) error {
-	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.ConflictResolveWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.ConflictResolveWorkflowExecution(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("ConflictResolveWorkflowExecution", mirror.ConflictResolveWorkflowExecution(ctx, request))
+	}
+	batch := newExecutionBatch(d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx), d.layout)
 
 	currentWorkflow := request.CurrentWorkflowMutation
 	resetWorkflow := request.ResetWorkflowSnapshot
 	newWorkflow := request.NewWorkflowSnapshot
 
-	shardID := request.ShardID
-
 	namespaceID := resetWorkflow.NamespaceID
 	workflowID := resetWorkflow.WorkflowID
+	shardID, err := d.layout.workflowPartition(request.ShardID, namespaceID, workflowID)
+	if err != nil {
+		return err
+	}
+	for _, workflow := range []struct {
+		name        string
+		namespaceID string
+		workflowID  string
+	}{
+		{name: "current", namespaceID: workflowMutationNamespaceID(currentWorkflow), workflowID: workflowMutationWorkflowID(currentWorkflow)},
+		{name: "new", namespaceID: workflowSnapshotNamespaceID(newWorkflow), workflowID: workflowSnapshotWorkflowID(newWorkflow)},
+	} {
+		if workflow.namespaceID == "" && workflow.workflowID == "" {
+			continue
+		}
+		workflowShardID, partitionErr := d.layout.workflowPartition(request.ShardID, workflow.namespaceID, workflow.workflowID)
+		if partitionErr != nil {
+			return partitionErr
+		}
+		if workflowShardID != shardID {
+			return serviceerror.NewInternalf("ConflictResolveWorkflowExecution: %s workflow must use the reset workflow execution storage partition", workflow.name)
+		}
+	}
 
 	var currentRunID string
 
@@ -798,7 +912,7 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 	case p.ConflictResolveWorkflowModeBypassCurrent:
 		if err := d.assertNotCurrentExecution(
 			ctx,
-			shardID,
+			request.ShardID,
 			namespaceID,
 			workflowID,
 			request.ArchetypeID,
@@ -863,7 +977,7 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 	// Verifies that the RangeID has not changed
 	batch.Query(templateUpdateLeaseQuery,
 		request.RangeID,
-		request.ShardID,
+		shardID,
 		rowTypeShard,
 		rowTypeShardNamespaceID,
 		rowTypeShardWorkflowID,
@@ -872,9 +986,10 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 		rowTypeShardTaskID,
 		request.RangeID,
 	)
+	batch.addShardAuthorityGuard(shardID)
 
 	conflictRecord := newConflictRecord()
-	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch, conflictRecord)
+	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch.Batch, conflictRecord)
 	if err != nil {
 		return gocql.ConvertError("ConflictResolveWorkflowExecution", err)
 	}
@@ -952,26 +1067,68 @@ func (d *MutableStateStore) DeleteWorkflowExecution(
 	ctx context.Context,
 	request *p.DeleteWorkflowExecutionRequest,
 ) error {
-	query := d.Session.Query(templateDeleteWorkflowExecutionMutableStateQuery,
-		request.ShardID,
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.DeleteWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.DeleteWorkflowExecution(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("DeleteWorkflowExecution", mirror.DeleteWorkflowExecution(ctx, request))
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, request.NamespaceID, request.WorkflowID)
+	if err != nil {
+		return err
+	}
+	args := []any{
+		shardID,
 		rowTypeExecution,
 		request.NamespaceID,
 		request.WorkflowID,
 		request.RunID,
 		defaultVisibilityTimestamp,
 		rowTypeExecutionTaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("DeleteWorkflowExecution", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx,
+		d.Session,
+		d.layout,
+		request.ShardID,
+		shardID,
+		"DeleteWorkflowExecution",
+		templateDeleteWorkflowExecutionMutableStateQuery,
+		args,
+		false,
+	)
 }
 
 func (d *MutableStateStore) DeleteCurrentWorkflowExecution(
 	ctx context.Context,
 	request *p.DeleteCurrentWorkflowExecutionRequest,
 ) error {
-	query := d.Session.Query(templateDeleteWorkflowExecutionCurrentRowQuery,
-		request.ShardID,
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.DeleteCurrentWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.DeleteCurrentWorkflowExecution(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("DeleteCurrentWorkflowExecution", mirror.DeleteCurrentWorkflowExecution(ctx, request))
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, request.NamespaceID, request.WorkflowID)
+	if err != nil {
+		return err
+	}
+	args := []any{
+		shardID,
 		rowTypeExecution,
 		request.NamespaceID,
 		request.WorkflowID,
@@ -979,18 +1136,37 @@ func (d *MutableStateStore) DeleteCurrentWorkflowExecution(
 		defaultVisibilityTimestamp,
 		rowTypeExecutionTaskID,
 		request.RunID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("DeleteWorkflowCurrentRow", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx,
+		d.Session,
+		d.layout,
+		request.ShardID,
+		shardID,
+		"DeleteWorkflowCurrentRow",
+		templateDeleteWorkflowExecutionCurrentRowQuery,
+		args,
+		true,
+	)
 }
 
 func (d *MutableStateStore) GetCurrentExecution(
 	ctx context.Context,
 	request *p.GetCurrentExecutionRequest,
 ) (*p.InternalGetCurrentExecutionResponse, error) {
-	query := d.Session.Query(templateGetCurrentExecutionQuery,
-		request.ShardID,
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.GetCurrentExecution(ctx, request)
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, request.NamespaceID, request.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	query := d.Session.Query(d.layout.query(templateGetCurrentExecutionQuery),
+		shardID,
 		rowTypeExecution,
 		request.NamespaceID,
 		request.WorkflowID,
@@ -1026,10 +1202,26 @@ func (d *MutableStateStore) SetWorkflowExecution(
 	ctx context.Context,
 	request *p.InternalSetWorkflowExecutionRequest,
 ) error {
-	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.SetWorkflowExecution(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.SetWorkflowExecution(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("SetWorkflowExecution", mirror.SetWorkflowExecution(ctx, request))
+	}
+	batch := newExecutionBatch(d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx), d.layout)
 
-	shardID := request.ShardID
 	setSnapshot := request.SetWorkflowSnapshot
+	shardID, err := d.layout.workflowPartition(request.ShardID, setSnapshot.NamespaceID, setSnapshot.WorkflowID)
+	if err != nil {
+		return err
+	}
 
 	if err := applyWorkflowSnapshotBatchAsReset(batch, shardID, &setSnapshot); err != nil {
 		return err
@@ -1038,7 +1230,7 @@ func (d *MutableStateStore) SetWorkflowExecution(
 	// Verifies that the RangeID has not changed
 	batch.Query(templateUpdateLeaseQuery,
 		request.RangeID,
-		request.ShardID,
+		shardID,
 		rowTypeShard,
 		rowTypeShardNamespaceID,
 		rowTypeShardWorkflowID,
@@ -1047,9 +1239,10 @@ func (d *MutableStateStore) SetWorkflowExecution(
 		rowTypeShardTaskID,
 		request.RangeID,
 	)
+	batch.addShardAuthorityGuard(shardID)
 
 	conflictRecord := newConflictRecord()
-	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch, conflictRecord)
+	applied, conflictIter, err := d.Session.MapExecuteBatchCAS(batch.Batch, conflictRecord)
 	if err != nil {
 		return gocql.ConvertError("SetWorkflowExecution", err)
 	}
@@ -1082,8 +1275,18 @@ func (d *MutableStateStore) ListConcreteExecutions(
 	ctx context.Context,
 	request *p.ListConcreteExecutionsRequest,
 ) (*p.InternalListConcreteExecutionsResponse, error) {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.ListConcreteExecutions(ctx, request)
+	}
+	if d.layout.isTarget() {
+		return d.listConcreteExecutionsTarget(ctx, request)
+	}
 	query := d.Session.Query(
-		templateListWorkflowExecutionQuery,
+		d.layout.query(templateListWorkflowExecutionQuery),
 		request.ShardID,
 		rowTypeExecution,
 	).WithContext(ctx)
@@ -1125,6 +1328,127 @@ func (d *MutableStateStore) ListConcreteExecutions(
 		return nil, err
 	}
 	return response, nil
+}
+
+type executionListPageToken struct {
+	Version   int    `json:"version"`
+	Bucket    int32  `json:"bucket"`
+	PageState []byte `json:"pageState,omitempty"`
+}
+
+func (d *MutableStateStore) listConcreteExecutionsTarget(
+	ctx context.Context,
+	request *p.ListConcreteExecutionsRequest,
+) (*p.InternalListConcreteExecutionsResponse, error) {
+	if request.PageSize <= 0 {
+		return nil, serviceerror.NewInvalidArgument("ListConcreteExecutions page size must be positive")
+	}
+	token := executionListPageToken{Version: 1}
+	if len(request.PageToken) > 0 {
+		if err := json.Unmarshal(request.PageToken, &token); err != nil || token.Version != 1 {
+			return nil, serviceerror.NewInvalidArgument("invalid executions_v2 page token")
+		}
+	}
+	if token.Bucket < 0 || token.Bucket >= d.layout.buckets {
+		return nil, serviceerror.NewInvalidArgument("executions_v2 page token bucket is out of range")
+	}
+
+	response := &p.InternalListConcreteExecutionsResponse{
+		States: make([]*p.InternalWorkflowMutableState, 0, preallocatedResultCapacity(request.PageSize)),
+	}
+	for bucket := token.Bucket; bucket < d.layout.buckets && len(response.States) < request.PageSize; bucket++ {
+		partition, err := d.layout.partition(request.ShardID, bucket)
+		if err != nil {
+			return nil, err
+		}
+		pageState := []byte(nil)
+		if bucket == token.Bucket {
+			pageState = token.PageState
+		}
+		iter := d.Session.Query(
+			d.layout.query(templateListWorkflowExecutionQuery),
+			partition,
+			rowTypeExecution,
+		).WithContext(ctx).PageSize(request.PageSize - len(response.States)).PageState(pageState).Iter()
+
+		var execution []byte
+		var executionEncoding string
+		var executionState []byte
+		var executionStateEncoding string
+		var nextEventID int64
+		for iter.Scan(nil, &execution, &executionEncoding, &executionState, &executionStateEncoding, &nextEventID) {
+			if len(execution) > 0 {
+				response.States = append(response.States, &p.InternalWorkflowMutableState{
+					ExecutionInfo:  p.NewDataBlob(execution, executionEncoding),
+					ExecutionState: p.NewDataBlob(executionState, executionStateEncoding),
+					NextEventID:    nextEventID,
+				})
+			}
+			execution = nil
+			executionEncoding = ""
+			executionState = nil
+			executionStateEncoding = ""
+			nextEventID = 0
+		}
+		nextPageState := iter.PageState()
+		if err := iter.Close(); err != nil {
+			return nil, gocql.ConvertError("ListConcreteExecutions", err)
+		}
+		if len(nextPageState) > 0 {
+			response.NextPageToken, err = json.Marshal(executionListPageToken{
+				Version:   1,
+				Bucket:    bucket,
+				PageState: nextPageState,
+			})
+			return response, err
+		}
+		if len(response.States) >= request.PageSize && bucket+1 < d.layout.buckets {
+			response.NextPageToken, err = json.Marshal(executionListPageToken{Version: 1, Bucket: bucket + 1})
+			return response, err
+		}
+	}
+	return response, nil
+}
+
+func (d *MutableStateStore) migrationStores() (primaryStore *MutableStateStore, mirrorStore *MutableStateStore, hasMirror bool) {
+	mirrorLayout, ok := d.layout.mirrorLayout()
+	if !ok {
+		return nil, nil, false
+	}
+	primary := *d
+	primary.layout = d.layout.authoritativeLayout()
+	mirror := *d
+	mirror.layout = mirrorLayout
+	return &primary, &mirror, true
+}
+
+func (d *MutableStateStore) forExecutionShard(
+	ctx context.Context,
+	shardID int32,
+) (*MutableStateStore, error) {
+	layout, err := resolveTargetDualExecutionLayout(ctx, d.Session, d.layout, shardID)
+	if err != nil {
+		return nil, err
+	}
+	if layout == d.layout {
+		return d, nil
+	}
+	resolved := *d
+	resolved.layout = layout
+	return &resolved, nil
+}
+
+func (d *MutableStateStore) handleMirrorError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if d.layout.mirrorRequired() {
+		return fmt.Errorf("mirror %s: %w", operation, err)
+	}
+	if d.logger != nil {
+		d.logger.Warn("Cassandra executions source-rebuild mirror failed", tag.Operation(operation), tag.Error(err))
+	}
+	return nil
 }
 
 func (d *MutableStateStore) getCurrentRecordRunID(

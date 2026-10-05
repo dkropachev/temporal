@@ -343,6 +343,79 @@ func TestListQueuesDoesNotAutoFetchPastRequestedPage(t *testing.T) {
 	require.Equal(t, 1, iter.scanIdx)
 }
 
+func TestListQueuesContinuesAcrossShortFilteredPages(t *testing.T) {
+	queueBytes, err := (&persistencespb.Queue{
+		Partitions: map[int32]*persistencespb.QueuePartition{
+			0: {MinMessageId: p.FirstQueueMessageID},
+		},
+	}).Marshal()
+	require.NoError(t, err)
+
+	pageToken := []byte("filtered-page")
+	nextPageToken := []byte("next-page")
+	pages := []*recordingIter{
+		{
+			pageState: pageToken,
+			scanRows: [][]any{
+				{"queue-0", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
+			},
+		},
+		{
+			pageState: nextPageToken,
+			scanRows: [][]any{
+				{"queue-1", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
+				{"queue-2", queueBytes, enumspb.ENCODING_TYPE_PROTO3.String(), int64(0)},
+			},
+		},
+	}
+	page := 0
+	session := &recordingSession{
+		t: t,
+		queryFn: func(stmt string, _ ...any) cgocql.Query {
+			switch stmt {
+			case templateGetQueueNamesQuery:
+				require.Less(t, page, len(pages))
+				iter := pages[page]
+				page++
+				return &recordingQuery{iter: iter}
+			case TemplateGetMaxMessageIDQuery:
+				return &recordingQuery{scanFn: func(...any) error { return gocql.ErrNotFound }}
+			default:
+				t.Fatalf("unexpected query: %s", stmt)
+				return nil
+			}
+		},
+	}
+	store := &queueV2Store{session: session}
+
+	resp, err := store.ListQueues(t.Context(), &p.InternalListQueuesRequest{
+		QueueType: p.QueueTypeHistoryDLQ,
+		PageSize:  3,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.Queues, 3)
+	require.Equal(t, []string{"queue-0", "queue-1", "queue-2"}, []string{
+		resp.Queues[0].QueueName,
+		resp.Queues[1].QueueName,
+		resp.Queues[2].QueueName,
+	})
+	require.Equal(t, nextPageToken, resp.NextPageToken)
+	require.Equal(t, 2, page)
+	var listQueries []*recordingQuery
+	for _, query := range session.queries {
+		if query.stmt == templateGetQueueNamesQuery {
+			listQueries = append(listQueries, query.query)
+		}
+	}
+	require.Equal(t, 3, listQueries[0].pageSize)
+	require.Empty(t, listQueries[0].pageState)
+	require.Equal(t, 2, listQueries[1].pageSize)
+	require.Equal(t, pageToken, listQueries[1].pageState)
+	require.Equal(t, 1, pages[0].closeCalls)
+	require.Equal(t, 1, pages[1].closeCalls)
+}
+
 func TestListQueuesQueryKeepsUpgradeCompatibleQueueSchema(t *testing.T) {
 	require.Contains(t, templateGetQueueNamesQuery, "ALLOW FILTERING")
 }
@@ -857,6 +930,8 @@ func TestGetHistoryNodeTableLayout(t *testing.T) {
 func TestGetHistoryNodeTableGenerations(t *testing.T) {
 	historyNodeID := [16]byte{1}
 	historyNodeV2ID := [16]byte{2}
+	historyTreeID := [16]byte{3}
+	historyTreeV2ID := [16]byte{4}
 	session := &recordingSession{
 		t: t,
 		queryFn: func(stmt string, args ...any) cgocql.Query {
@@ -866,8 +941,15 @@ func TestGetHistoryNodeTableGenerations(t *testing.T) {
 			return &recordingQuery{
 				scanFn: func(dest ...any) error {
 					id := historyNodeID
-					if table == historyNodeV2TableName {
+					switch table {
+					case historyNodeV2TableName:
 						id = historyNodeV2ID
+					case historyTreeTableName:
+						id = historyTreeID
+					case historyTreeV2TableName:
+						id = historyTreeV2ID
+					default:
+						id = historyNodeID
 					}
 					*dest[0].(*[16]byte) = id
 					return nil
@@ -881,7 +963,11 @@ func TestGetHistoryNodeTableGenerations(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, historyNodeID, generations.historyNode)
 	require.Equal(t, historyNodeV2ID, generations.historyNodeV2)
+	require.Equal(t, historyTreeID, generations.historyTree)
+	require.Equal(t, historyTreeV2ID, generations.historyTreeV2)
 	require.Equal(t, []string{
+		templateGetHistoryNodeTableID,
+		templateGetHistoryNodeTableID,
 		templateGetHistoryNodeTableID,
 		templateGetHistoryNodeTableID,
 	}, recordedStatements(session.queries))

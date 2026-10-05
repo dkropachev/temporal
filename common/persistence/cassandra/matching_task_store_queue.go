@@ -59,10 +59,28 @@ const (
 		`AND type = ? ` +
 		`AND pass = 0 ` +
 		`AND task_id = ?`
+	templateGetTaskQueueWithMigrationQuery = `SELECT ` +
+		`range_id, ` +
+		`task_queue, ` +
+		`task_queue_encoding, ` +
+		`migration_authority, ` +
+		`migration_bucket_count, ` +
+		`migration_timestamp ` +
+		`FROM tasks_v2 ` +
+		`WHERE namespace_id = ? ` +
+		`AND task_queue_name = ? ` +
+		`AND task_queue_type = ? ` +
+		`AND type = ? ` +
+		`AND pass = 0 ` +
+		`AND task_id = ?`
 
 	templateInsertTaskQueueQuery = `INSERT INTO tasks_v2 ` +
 		`(namespace_id, task_queue_name, task_queue_type, type, pass, task_id, range_id, task_queue, task_queue_encoding) ` +
 		`VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?) IF NOT EXISTS`
+	templateInsertTaskQueueWithMigrationQuery = `INSERT INTO tasks_v2 ` +
+		`(namespace_id, task_queue_name, task_queue_type, type, pass, task_id, range_id, task_queue, ` +
+		`task_queue_encoding, migration_authority, migration_bucket_count) ` +
+		`VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?) IF NOT EXISTS`
 
 	templateUpdateTaskQueueQuery = `UPDATE tasks_v2 SET ` +
 		`range_id = ?, ` +
@@ -75,6 +93,20 @@ const (
 		`AND pass = 0 ` +
 		`AND task_id = ? ` +
 		`IF range_id = ?`
+	templateUpdateTaskQueueWithMigrationQuery = `UPDATE tasks_v2 SET ` +
+		`range_id = ?, ` +
+		`task_queue = ?, ` +
+		`task_queue_encoding = ?, ` +
+		`migration_authority = ?, ` +
+		`migration_bucket_count = ?, ` +
+		`migration_timestamp = null ` +
+		`WHERE namespace_id = ? ` +
+		`AND task_queue_name = ? ` +
+		`AND task_queue_type = ? ` +
+		`AND type = ? ` +
+		`AND pass = 0 ` +
+		`AND task_id = ? ` +
+		`IF range_id = ? AND migration_authority = ? AND migration_bucket_count = ?`
 
 	templateUpdateTaskQueueQueryWithTTLPart1 = `INSERT INTO tasks_v2 ` +
 		`(namespace_id, task_queue_name, task_queue_type, type, pass, task_id) ` +
@@ -91,6 +123,20 @@ const (
 		`AND pass = 0 ` +
 		`AND task_id = ? ` +
 		`IF range_id = ?`
+	templateUpdateTaskQueueWithMigrationQueryWithTTLPart2 = `UPDATE tasks_v2 USING TTL ? SET ` +
+		`range_id = ?, ` +
+		`task_queue = ?, ` +
+		`task_queue_encoding = ?, ` +
+		`migration_authority = ?, ` +
+		`migration_bucket_count = ?, ` +
+		`migration_timestamp = null ` +
+		`WHERE namespace_id = ? ` +
+		`AND task_queue_name = ? ` +
+		`AND task_queue_type = ? ` +
+		`AND type = ? ` +
+		`AND pass = 0 ` +
+		`AND task_id = ? ` +
+		`IF range_id = ? AND migration_authority = ? AND migration_bucket_count = ?`
 
 	templateDeleteTaskQueueQuery = `DELETE FROM tasks_v2 ` +
 		`WHERE namespace_id = ? ` +
@@ -100,19 +146,30 @@ const (
 		`AND pass = 0 ` +
 		`AND task_id = ? ` +
 		`IF range_id = ?`
+	templateDeleteTaskQueueWithMigrationQuery = `DELETE FROM tasks_v2 ` +
+		`WHERE namespace_id = ? ` +
+		`AND task_queue_name = ? ` +
+		`AND task_queue_type = ? ` +
+		`AND type = ? ` +
+		`AND pass = 0 ` +
+		`AND task_id = ? ` +
+		`IF range_id = ? AND migration_authority = ? AND migration_bucket_count = ?`
 )
 
 // taskQueueStore handles unified task queue operations for both v1 and v2
 type taskQueueStore struct {
-	Session gocql.Session
-	version matchingTaskVersion
+	Session              gocql.Session
+	version              matchingTaskVersion
+	migrationAuthority   int
+	migrationBucketCount int16
 }
 
 func (d *taskQueueStore) CreateTaskQueue(
 	ctx context.Context,
 	request *p.InternalCreateTaskQueueRequest,
 ) error {
-	query := d.Session.Query(switchTasksTable(templateInsertTaskQueueQuery, d.version),
+	queryTemplate := templateInsertTaskQueueQuery
+	args := []any{
 		request.NamespaceID,
 		request.TaskQueue,
 		request.TaskType,
@@ -121,7 +178,12 @@ func (d *taskQueueStore) CreateTaskQueue(
 		request.RangeID,
 		request.TaskQueueInfo.Data,
 		request.TaskQueueInfo.EncodingType.String(),
-	).WithContext(ctx)
+	}
+	if d.migrationAuthority != 0 {
+		queryTemplate = templateInsertTaskQueueWithMigrationQuery
+		args = append(args, d.migrationAuthority, d.migrationBucketCount)
+	}
+	query := d.Session.Query(switchTasksTable(queryTemplate, d.version), args...).WithContext(ctx)
 
 	previous := make(map[string]any)
 	applied, err := query.MapScanCAS(previous)
@@ -144,7 +206,14 @@ func (d *taskQueueStore) GetTaskQueue(
 	ctx context.Context,
 	request *p.InternalGetTaskQueueRequest,
 ) (*p.InternalGetTaskQueueResponse, error) {
-	query := d.Session.Query(switchTasksTable(templateGetTaskQueueQuery, d.version),
+	if err := d.ensureMigrationAuthority(ctx, request.NamespaceID, request.TaskQueue, request.TaskType); err != nil {
+		return nil, err
+	}
+	queryTemplate := templateGetTaskQueueQuery
+	if d.migrationAuthority != 0 {
+		queryTemplate = templateGetTaskQueueWithMigrationQuery
+	}
+	query := d.Session.Query(switchTasksTable(queryTemplate, d.version),
 		request.NamespaceID,
 		request.TaskQueue,
 		request.TaskType,
@@ -155,8 +224,27 @@ func (d *taskQueueStore) GetTaskQueue(
 	var rangeID int64
 	var tlBytes []byte
 	var tlEncoding string
-	if err := query.Scan(&rangeID, &tlBytes, &tlEncoding); err != nil {
-		return nil, gocql.ConvertError("GetTaskQueue", err)
+	if d.migrationAuthority == 0 {
+		if err := query.Scan(&rangeID, &tlBytes, &tlEncoding); err != nil {
+			return nil, gocql.ConvertError("GetTaskQueue", err)
+		}
+	} else {
+		var authority *int
+		var bucketCount *int16
+		var migrationTimestamp *int64
+		if err := query.Scan(
+			&rangeID,
+			&tlBytes,
+			&tlEncoding,
+			&authority,
+			&bucketCount,
+			&migrationTimestamp,
+		); err != nil {
+			return nil, gocql.ConvertError("GetTaskQueue", err)
+		}
+		if err := d.validateMigrationAuthority(request.NamespaceID, request.TaskQueue, request.TaskType, authority, bucketCount); err != nil {
+			return nil, err
+		}
 	}
 
 	return &p.InternalGetTaskQueueResponse{
@@ -169,6 +257,9 @@ func (d *taskQueueStore) UpdateTaskQueue(
 	ctx context.Context,
 	request *p.InternalUpdateTaskQueueRequest,
 ) (*p.UpdateTaskQueueResponse, error) {
+	if err := d.ensureMigrationAuthority(ctx, request.NamespaceID, request.TaskQueue, request.TaskType); err != nil {
+		return nil, err
+	}
 	var err error
 	var applied bool
 	previous := make(map[string]any)
@@ -193,7 +284,8 @@ func (d *taskQueueStore) UpdateTaskQueue(
 			expiryTTL,
 		)
 
-		batch.Query(switchTasksTable(templateUpdateTaskQueueQueryWithTTLPart2, d.version),
+		queryTemplate := templateUpdateTaskQueueQueryWithTTLPart2
+		args := []any{
 			expiryTTL,
 			request.RangeID,
 			request.TaskQueueInfo.Data,
@@ -204,11 +296,32 @@ func (d *taskQueueStore) UpdateTaskQueue(
 			rowTypeTaskQueue,
 			taskQueueTaskID,
 			request.PrevRangeID,
-		)
+		}
+		if d.migrationAuthority != 0 {
+			queryTemplate = templateUpdateTaskQueueWithMigrationQueryWithTTLPart2
+			args = []any{
+				expiryTTL,
+				request.RangeID,
+				request.TaskQueueInfo.Data,
+				request.TaskQueueInfo.EncodingType.String(),
+				d.migrationAuthority,
+				d.migrationBucketCount,
+				request.NamespaceID,
+				request.TaskQueue,
+				request.TaskType,
+				rowTypeTaskQueue,
+				taskQueueTaskID,
+				request.PrevRangeID,
+				d.migrationAuthority,
+				d.migrationBucketCount,
+			}
+		}
+		batch.Query(switchTasksTable(queryTemplate, d.version), args...)
 		applied, _, err = d.Session.MapExecuteBatchCAS(batch, previous)
 	} else {
 		// Regular update logic for both V1 and V2
-		query := d.Session.Query(switchTasksTable(templateUpdateTaskQueueQuery, d.version),
+		queryTemplate := templateUpdateTaskQueueQuery
+		args := []any{
 			request.RangeID,
 			request.TaskQueueInfo.Data,
 			request.TaskQueueInfo.EncodingType.String(),
@@ -218,7 +331,26 @@ func (d *taskQueueStore) UpdateTaskQueue(
 			rowTypeTaskQueue,
 			taskQueueTaskID,
 			request.PrevRangeID,
-		).WithContext(ctx)
+		}
+		if d.migrationAuthority != 0 {
+			queryTemplate = templateUpdateTaskQueueWithMigrationQuery
+			args = []any{
+				request.RangeID,
+				request.TaskQueueInfo.Data,
+				request.TaskQueueInfo.EncodingType.String(),
+				d.migrationAuthority,
+				d.migrationBucketCount,
+				request.NamespaceID,
+				request.TaskQueue,
+				request.TaskType,
+				rowTypeTaskQueue,
+				taskQueueTaskID,
+				request.PrevRangeID,
+				d.migrationAuthority,
+				d.migrationBucketCount,
+			}
+		}
+		query := d.Session.Query(switchTasksTable(queryTemplate, d.version), args...).WithContext(ctx)
 		applied, err = query.MapScanCAS(previous)
 	}
 
@@ -252,14 +384,28 @@ func (d *taskQueueStore) DeleteTaskQueue(
 	ctx context.Context,
 	request *p.DeleteTaskQueueRequest,
 ) error {
-	query := d.Session.Query(switchTasksTable(templateDeleteTaskQueueQuery, d.version),
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.TaskQueue.NamespaceID,
+		request.TaskQueue.TaskQueueName,
+		request.TaskQueue.TaskQueueType,
+	); err != nil {
+		return err
+	}
+	queryTemplate := templateDeleteTaskQueueQuery
+	args := []any{
 		request.TaskQueue.NamespaceID,
 		request.TaskQueue.TaskQueueName,
 		request.TaskQueue.TaskQueueType,
 		rowTypeTaskQueue,
 		taskQueueTaskID,
 		request.RangeID,
-	).WithContext(ctx)
+	}
+	if d.migrationAuthority != 0 {
+		queryTemplate = templateDeleteTaskQueueWithMigrationQuery
+		args = append(args, d.migrationAuthority, d.migrationBucketCount)
+	}
+	query := d.Session.Query(switchTasksTable(queryTemplate, d.version), args...).WithContext(ctx)
 
 	previous := make(map[string]any)
 	applied, err := query.MapScanCAS(previous)

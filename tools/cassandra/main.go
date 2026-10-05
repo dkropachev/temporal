@@ -284,6 +284,71 @@ func buildCLIOptions() *cli.App {
 			},
 		},
 		{
+			Name:  "validate-history-node-v2",
+			Usage: "compare history_node and history_node_v2 rows and write timestamps",
+			Flags: []cli.Flag{
+				cli.IntFlag{
+					Name:  historyNodeBackfillPageSizeFlag,
+					Value: defaultHistoryNodeBackfillPageSize,
+					Usage: "number of history node rows fetched per page",
+				},
+				cli.IntFlag{
+					Name:  historyNodeBackfillConcurrencyFlag,
+					Value: defaultHistoryNodeBackfillConcurrency,
+					Usage: "maximum concurrent history node comparisons",
+				},
+			},
+			Action: func(c *cli.Context) {
+				cliHandler(c, validateHistoryNodeV2, logger)
+			},
+		},
+		{
+			Name:  "backfill-history-tree-v2",
+			Usage: "copy history_tree into the bucket-partitioned history_tree_v2 table",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, backfillHistoryTreeV2, logger)
+			},
+		},
+		{
+			Name:  "backfill-history-tree-v1",
+			Usage: "copy history_tree_v2 into the rollback-compatible history_tree table",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, backfillHistoryTreeV1, logger)
+			},
+		},
+		{
+			Name:  "reconcile-history-tree-v2",
+			Usage: "seal each legacy tree and make history_tree_v2 exactly match it before target cutover",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, reconcileHistoryTreeV2, logger)
+			},
+		},
+		{
+			Name:  "reconcile-history-tree-v1",
+			Usage: "seal each target tree and exactly restore history_tree before rollback",
+			Flags: historyNodeBackfillCLIFlags(),
+			Action: func(c *cli.Context) {
+				cliHandler(c, reconcileHistoryTreeV1, logger)
+			},
+		},
+		{
+			Name:  "validate-history-tree-v2",
+			Usage: "compare history_tree and history_tree_v2 rows and write timestamps",
+			Flags: []cli.Flag{
+				cli.IntFlag{
+					Name:  historyNodeBackfillPageSizeFlag,
+					Value: defaultHistoryNodeBackfillPageSize,
+					Usage: "number of history tree rows fetched per page",
+				},
+			},
+			Action: func(c *cli.Context) {
+				cliHandler(c, validateHistoryTreeV2, logger)
+			},
+		},
+		{
 			Name:  "recreate-history-node-v2",
 			Usage: "clear and recreate history_node_v2 while history_node is authoritative",
 			Flags: []cli.Flag{
@@ -309,7 +374,21 @@ func buildCLIOptions() *cli.App {
 				cliHandler(c, recreateHistoryNodeV1, logger)
 			},
 		},
+		{
+			Name:  "recreate-history-tree-v2",
+			Usage: "clear and recreate history_tree_v2 while history_tree is authoritative",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  confirmHistoryNodeSourceRebuildFlag,
+					Usage: "confirm every Temporal process is using an authoritative-source rebuild mode",
+				},
+			},
+			Action: func(c *cli.Context) {
+				cliHandler(c, recreateHistoryTreeV2, logger)
+			},
+		},
 	}
+	app.Commands = append(app.Commands, migrationCLICommands(logger)...)
 
 	return app
 }

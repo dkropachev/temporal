@@ -56,8 +56,9 @@ The `executions` table partitions mutable state and history tasks by
 `shard_id`. A low shard count creates larger, hotter partitions and limits
 parallelism. A cluster's shard count is persisted in cluster metadata and
 cannot be changed by configuration. The upgrade-safe default remains 4; new
-clusters can opt into the measured 512-shard configuration by setting
-`NUM_HISTORY_SHARDS` before cluster creation.
+clusters should raise it only after their complete workload validates the
+immutable choice. The 512-shard small-payload screening did not survive a
+1 MiB, concurrency-128 burst on the measured 3 node x 4 shard Scylla target.
 
 Existing low-shard clusters need a supported online resharding/data-migration
 design to receive the same partition-size and throughput benefits.

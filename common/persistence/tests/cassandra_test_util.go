@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -85,6 +86,7 @@ func setUpCassandraTestWithConfig(
 	testData.Logger = log.NewZapLogger(zaptest.NewLogger(t))
 	SetUpCassandraDatabase(t, testData.Cfg, testData.Logger)
 	SetUpCassandraSchema(t, testData.Cfg, testData.Logger)
+	initializeCassandraTargetOnlyLayouts(t, testData.Cfg, testData.Logger)
 
 	testData.Factory = cassandra.NewFactory(
 		*testData.Cfg,
@@ -101,6 +103,76 @@ func setUpCassandraTestWithConfig(
 	}
 
 	return testData, tearDown
+}
+
+func initializeCassandraTargetOnlyLayouts(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
+	t.Helper()
+	session := newCassandraTestSession(t, cfg, logger)
+	defer session.Close()
+	initialize := func(name cassandra.SchemaLayoutName, table string, parameter int64) {
+		t.Helper()
+		if err := cassandra.InitializeSchemaLayoutTargetOnly(
+			context.Background(), session, cfg.Keyspace, name, table, parameter,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cfg.ExecutionMigrationMode == config.CassandraExecutionMigrationModeTargetOnly {
+		buckets := cfg.ExecutionStorageBuckets
+		if buckets == 0 {
+			buckets = 16
+		}
+		initialize(cassandra.SchemaLayoutExecutions, "executions_v2", int64(buckets))
+	}
+	if cfg.HistoryNodeMigrationMode == config.CassandraHistoryNodeMigrationModeV2Only {
+		initialize(cassandra.SchemaLayoutHistoryNode, "history_node_v2", 0)
+	}
+	if cfg.HistoryTreeMigrationMode == config.CassandraHistoryTreeMigrationModeTargetOnly {
+		initialize(cassandra.SchemaLayoutHistoryTree, "history_tree_v2", 16)
+	}
+	if cfg.QueueV2MigrationMode == config.CassandraQueueV2MigrationModeTargetOnly {
+		span := cfg.QueueV2MessageBucketSpan
+		if span == 0 {
+			span = cassandra.DefaultQueueV2MessageBucketSpan
+		}
+		initialize(cassandra.SchemaLayoutQueueV2Metadata, "queues_v2", 64)
+		initialize(cassandra.SchemaLayoutQueueV2Messages, "queue_messages_v3", span)
+	}
+	if cfg.LegacyQueueMigrationMode == config.CassandraLegacyQueueMigrationModeTargetOnly {
+		span := cfg.LegacyQueueMessageBucketSize
+		if span == 0 {
+			span = cassandra.DefaultLegacyQueueV2MessageBucketSize
+		}
+		initialize(cassandra.SchemaLayoutLegacyQueue, "legacy_queue_v2_messages", span)
+		for _, queueType := range []p.QueueType{
+			p.NamespaceReplicationQueueType,
+			-p.NamespaceReplicationQueueType,
+		} {
+			if err := cassandra.InitializeEmptyLegacyQueueV2Target(
+				context.Background(),
+				session,
+				queueType,
+				span,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if cfg.MatchingTaskMigrationMode == config.CassandraMatchingTaskMigrationModeTargetOnly {
+		buckets := cfg.MatchingTaskStorageBucketCount
+		if buckets == 0 {
+			buckets = cassandra.DefaultMatchingTaskStorageBucketCount
+		}
+		initialize(cassandra.SchemaLayoutMatchingTasks, "tasks_v3", int64(buckets))
+		initialize(cassandra.SchemaLayoutMatchingTasksFair, "tasks_v3_fair", int64(buckets))
+	}
+	if cfg.TaskQueueUserDataMigrationMode == config.CassandraTaskQueueUserDataMigrationModeTargetOnly {
+		buckets := cfg.TaskQueueUserDataBucketCount
+		if buckets == 0 {
+			buckets = cassandra.DefaultTaskQueueUserDataBucketCount
+		}
+		initialize(cassandra.SchemaLayoutTaskQueueUserData, "task_queue_user_data_v2", int64(buckets))
+	}
 }
 
 func SetUpCassandraDatabase(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
