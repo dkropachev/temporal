@@ -24,7 +24,7 @@ The payload is used for the workflow input and every activity input. Four bucket
 In managed-server mode, every calibration, steady-state, and fixed-N sample follows the same lifecycle:
 
 1. If configured, execute `-reset-command` and wait for it to finish.
-2. Start `-server-binary` with the unchanged `-config-file` and wait for frontend health.
+2. Start `-server-binary` with the unchanged `-config-file`, then wait for frontend membership and history shard readiness.
 3. Connect to Temporal, start in-process SDK workers, and run a rate-controlled warmup.
 4. Run the measured sample through the same client, workers, and task queues.
 5. Validate that every submitted workflow completed and that no workflow failed.
@@ -36,10 +36,14 @@ Reset and cleanup commands receive these environment variables:
 - `TEMPORALPERF_ADDRESS`
 - `TEMPORALPERF_NAMESPACE`
 - `TEMPORALPERF_CONFIG_FILE`
+- `TEMPORALPERF_RESUME_ID`
+- `TEMPORALPERF_RUN_NAME`
 - `TEMPORALPERF_PROFILE`
 - `TEMPORALPERF_PAYLOAD_BYTES`
 - `TEMPORALPERF_STAGE`
 - `TEMPORALPERF_TRIAL`
+- `TEMPORALPERF_TARGET_RPS`
+- `TEMPORALPERF_TARGET_RATIO`
 - `TEMPORALPERF_ARTIFACT_DIR`
 
 The Temporal config is passed directly to the selected server binary. The default `temporalperf-server` preserves the configured workflow/history datastore but replaces visibility with an in-process no-op store, so Cassandra/Scylla, MySQL, PostgreSQL, TLS, consistency, and connection settings are used without adding visibility-backend latency. Visibility writes and deletes are acknowledged; visibility reads and administrative calls fail closed. Pass the regular `temporal-server` explicitly when visibility performance is part of the test.
@@ -47,6 +51,12 @@ The Temporal config is passed directly to the selected server binary. The defaul
 The optional reset command owns only database-specific lifecycle in managed mode. It must leave equivalent initialized schemas for every sample and return only when the database is stable. It must not start Temporal. Omitting reset and cleanup intentionally reuses an initialized database, so results include database growth and sample-order effects.
 
 Without `-config-file`, the suite retains external-server mode. In that mode the reset command must also start Temporal and wait for frontend health, as before. This supports remote and multi-node deployments.
+
+## Resuming interrupted suites
+
+Set `-resume-id` to an immutable identifier for the complete benchmark protocol to enable sample-level checkpoints. The identifier and every effective suite option are recorded in `checkpoint.json`; a subsequent invocation resumes only when both match exactly. Completed calibration, steady-state, and batch samples are reused in their original order, while an interrupted sample directory is moved under `rejected-samples` before that sample is retried.
+
+Resume mode requires explicit reset and cleanup commands. Before a sample can be checkpointed, its cleanup hook must write `sample-clean.json`, `sample-capture-state.json`, and a sorted `observability.sha256` manifest in the sample artifact directory. The clean marker must contain version `1`, the exact resume ID and run name from the hook environment, and `clean: true`. The observability manifest may reference only regular files below `observability/`. The suite verifies and records hashes for the lifecycle artifacts and every file in that manifest, then fails closed if any accepted artifact changes.
 
 ## Calibration
 
@@ -86,4 +96,4 @@ The repository smoke test uses `temporalperf-server` and verifies every managed 
 
 Unless `-address` is set explicitly, managed mode derives the local frontend address from the config's `services.frontend.rpc` settings. For reproducible clean-store comparisons, supply backend-specific `-reset-command` and `-cleanup-command` hooks. Server output for each sample is saved in that sample's `server.log`.
 
-`suite.json` is updated atomically after every completed profile/payload case. It contains median throughput and p50/p95/p99 workflow latency across trials at each target. Each sample directory contains the server, configured hook, warmup, and measurement logs plus the raw load result and generic runtime metadata.
+`suite.json` is updated atomically after every completed profile/payload case. In resume mode, `checkpoint.json` is updated atomically after every accepted clean sample. The suite contains median throughput and p50/p95/p99 workflow latency across trials at each target. Each sample directory contains the server, configured hook, warmup, and measurement logs plus the raw load result and generic runtime metadata.

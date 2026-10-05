@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.temporal.io/server/api/adminservice/v1"
+	enumsspb "go.temporal.io/server/api/enums/v1"
 	serverconfig "go.temporal.io/server/common/config"
 	"go.temporal.io/server/temporal/environment"
 	"google.golang.org/grpc"
@@ -50,6 +51,11 @@ func prepareConfig(cfg *config) error {
 	if err != nil {
 		return fmt.Errorf("load Temporal server config: %w", err)
 	}
+	if cfg.requireTargetOnly {
+		if err := validateCassandraTargetOnly(serverCfg); err != nil {
+			return err
+		}
+	}
 	cfg.serverConfigFile = configFile
 	if !cfg.addressExplicit {
 		cfg.address, err = frontendAddress(serverCfg)
@@ -60,7 +66,55 @@ func prepareConfig(cfg *config) error {
 	return nil
 }
 
+func validateCassandraTargetOnly(cfg *serverconfig.Config) error {
+	store, ok := cfg.Persistence.DataStores[cfg.Persistence.DefaultStore]
+	if !ok {
+		return fmt.Errorf("default persistence store %q is not configured", cfg.Persistence.DefaultStore)
+	}
+	if store.Cassandra == nil {
+		return errors.New("-require-cassandra-target-only requires a Cassandra default store")
+	}
+	cassandra := store.Cassandra
+	checks := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{name: "historyNodeMigrationMode", got: string(cassandra.HistoryNodeMigrationMode), want: string(serverconfig.CassandraHistoryNodeMigrationModeV2Only)},
+		{name: "historyTreeMigrationMode", got: string(cassandra.HistoryTreeMigrationMode), want: "target-only"},
+		{name: "executionMigrationMode", got: string(cassandra.ExecutionMigrationMode), want: string(serverconfig.CassandraExecutionMigrationModeTargetOnly)},
+		{name: "queueV2MigrationMode", got: string(cassandra.QueueV2MigrationMode), want: "target-only"},
+		{name: "legacyQueueMigrationMode", got: string(cassandra.LegacyQueueMigrationMode), want: "target-only"},
+		{name: "matchingTaskMigrationMode", got: string(cassandra.MatchingTaskMigrationMode), want: "target-only"},
+		{name: "taskQueueUserDataMigrationMode", got: string(cassandra.TaskQueueUserDataMigrationMode), want: "target-only"},
+	}
+	for _, check := range checks {
+		if check.got != check.want {
+			return fmt.Errorf("-require-cassandra-target-only requires %s=%q, got %q", check.name, check.want, check.got)
+		}
+	}
+	if cassandra.ExecutionStorageBuckets <= 0 {
+		return errors.New("-require-cassandra-target-only requires positive executionStorageBuckets")
+	}
+	if cassandra.TaskQueueUserDataBucketCount <= 0 {
+		return errors.New("-require-cassandra-target-only requires positive taskQueueUserDataBucketCount")
+	}
+	if cassandra.LegacyQueueMessageBucketSize <= 0 {
+		return errors.New("-require-cassandra-target-only requires positive legacyQueueMessageBucketSize")
+	}
+	if cassandra.MatchingTaskStorageBucketCount <= 0 {
+		return errors.New("-require-cassandra-target-only requires positive matchingTaskStorageBucketCount")
+	}
+	if cassandra.QueueV2MessageBucketSpan <= 0 {
+		return errors.New("-require-cassandra-target-only requires positive queueV2MessageBucketSpan")
+	}
+	return nil
+}
+
 func validateManagedServerConfig(cfg config) error {
+	if cfg.requireTargetOnly && cfg.serverConfigFile == "" {
+		return errors.New("-require-cassandra-target-only requires -config-file")
+	}
 	if cfg.serverConfigFile == "" {
 		return nil
 	}
@@ -192,7 +246,7 @@ func waitForManagedServer(
 		case <-ctx.Done():
 			timer.Stop()
 			return errors.Join(
-				fmt.Errorf("wait for Temporal frontend health at %s: %w", address, ctx.Err()),
+				fmt.Errorf("wait for managed Temporal server health at %s: %w", address, ctx.Err()),
 				lastHealthErr,
 			)
 		case <-timer.C:
@@ -217,14 +271,25 @@ func checkTemporalHealth(ctx context.Context, address string) (retErr error) {
 	if health.Status != healthpb.HealthCheckResponse_SERVING {
 		return fmt.Errorf("frontend health status is %s", health.Status)
 	}
-	membership, err := adminservice.NewAdminServiceClient(connection).DescribeCluster(
+	adminClient := adminservice.NewAdminServiceClient(connection)
+	membership, err := adminClient.DescribeCluster(
 		ctx,
 		&adminservice.DescribeClusterRequest{},
 	)
 	if err != nil {
 		return fmt.Errorf("describe Temporal cluster: %w", err)
 	}
-	return validateManagedServerMembership(membership)
+	if err := validateManagedServerMembership(membership); err != nil {
+		return err
+	}
+	deepHealth, err := adminClient.DeepHealthCheck(ctx, &adminservice.DeepHealthCheckRequest{})
+	if err != nil {
+		return fmt.Errorf("deep health check: %w", err)
+	}
+	if deepHealth.GetState() != enumsspb.HEALTH_STATE_SERVING {
+		return fmt.Errorf("deep health state is %s", deepHealth.GetState())
+	}
+	return nil
 }
 
 func validateManagedServerMembership(response *adminservice.DescribeClusterResponse) error {

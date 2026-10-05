@@ -4,15 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/server/api/adminservice/v1"
 	clusterspb "go.temporal.io/server/api/cluster/v1"
+	enumsspb "go.temporal.io/server/api/enums/v1"
 	serverconfig "go.temporal.io/server/common/config"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func TestPrepareConfigLoadsTemporalServerConfigAndDerivesAddress(t *testing.T) {
@@ -32,6 +38,12 @@ func TestManagedServerDefaultsToNoopVisibilityServer(t *testing.T) {
 	require.Equal(t, "./temporalperf-server", cfg.serverBinary)
 }
 
+func TestTargetOnlyRequirementRejectsExternalServerMode(t *testing.T) {
+	cfg, err := parseFlags([]string{"-require-cassandra-target-only", "-reset-command", ":"})
+	require.NoError(t, err)
+	require.ErrorContains(t, validateManagedServerConfig(cfg), "requires -config-file")
+}
+
 func TestPrepareConfigPreservesExplicitAddress(t *testing.T) {
 	configFile, err := filepath.Abs("../../../config/development-sqlite.yaml")
 	require.NoError(t, err)
@@ -44,6 +56,33 @@ func TestPrepareConfigPreservesExplicitAddress(t *testing.T) {
 
 	require.NoError(t, prepareConfig(&cfg))
 	require.Equal(t, "frontend.example:8233", cfg.address)
+}
+
+func TestValidateCassandraTargetOnly(t *testing.T) {
+	cassandra := &serverconfig.Cassandra{
+		HistoryNodeMigrationMode:       serverconfig.CassandraHistoryNodeMigrationModeV2Only,
+		HistoryTreeMigrationMode:       serverconfig.CassandraHistoryTreeMigrationModeTargetOnly,
+		ExecutionMigrationMode:         serverconfig.CassandraExecutionMigrationModeTargetOnly,
+		ExecutionStorageBuckets:        16,
+		QueueV2MigrationMode:           serverconfig.CassandraQueueV2MigrationModeTargetOnly,
+		QueueV2MessageBucketSpan:       4096,
+		LegacyQueueMigrationMode:       serverconfig.CassandraLegacyQueueMigrationModeTargetOnly,
+		LegacyQueueMessageBucketSize:   4096,
+		MatchingTaskMigrationMode:      serverconfig.CassandraMatchingTaskMigrationModeTargetOnly,
+		MatchingTaskStorageBucketCount: 16,
+		TaskQueueUserDataMigrationMode: serverconfig.CassandraTaskQueueUserDataMigrationModeTargetOnly,
+		TaskQueueUserDataBucketCount:   64,
+	}
+	cfg := &serverconfig.Config{Persistence: serverconfig.Persistence{
+		DefaultStore: "default",
+		DataStores: map[string]serverconfig.DataStore{
+			"default": {Cassandra: cassandra},
+		},
+	}}
+
+	require.NoError(t, validateCassandraTargetOnly(cfg))
+	cassandra.QueueV2MigrationMode = serverconfig.CassandraQueueV2MigrationModeSourceDual
+	require.ErrorContains(t, validateCassandraTargetOnly(cfg), "queueV2MigrationMode")
 }
 
 func TestFrontendAddressUsesReachableLoopbackForWildcard(t *testing.T) {
@@ -71,6 +110,67 @@ func TestFrontendAddressUsesReachableLoopbackForWildcard(t *testing.T) {
 func TestFrontendAddressRejectsMissingFrontend(t *testing.T) {
 	_, err := frontendAddress(&serverconfig.Config{})
 	require.ErrorContains(t, err, "frontend service")
+}
+
+func TestCheckTemporalHealthRequiresReadyHistoryService(t *testing.T) {
+	frontendHealth := health.NewServer()
+	frontendHealth.SetServingStatus(workflowServiceHealthName, healthpb.HealthCheckResponse_SERVING)
+	admin := &managedServerTestAdminService{}
+	frontendAddress := startTestGRPCServer(t, func(server *grpc.Server) {
+		healthpb.RegisterHealthServer(server, frontendHealth)
+		adminservice.RegisterAdminServiceServer(server, admin)
+	})
+
+	admin.healthState.Store(int32(enumsspb.HEALTH_STATE_NOT_SERVING))
+	err := checkTemporalHealth(t.Context(), frontendAddress)
+	require.ErrorContains(t, err, "NotServing")
+
+	admin.healthState.Store(int32(enumsspb.HEALTH_STATE_SERVING))
+	require.NoError(t, checkTemporalHealth(t.Context(), frontendAddress))
+}
+
+type managedServerTestAdminService struct {
+	adminservice.UnimplementedAdminServiceServer
+	healthState atomic.Int32
+}
+
+func (*managedServerTestAdminService) DescribeCluster(
+	context.Context,
+	*adminservice.DescribeClusterRequest,
+) (*adminservice.DescribeClusterResponse, error) {
+	response := &adminservice.DescribeClusterResponse{MembershipInfo: &clusterspb.MembershipInfo{}}
+	for _, service := range managedServerServices {
+		response.MembershipInfo.Rings = append(response.MembershipInfo.Rings, &clusterspb.RingInfo{
+			Role: service, MemberCount: 1,
+		})
+	}
+	return response, nil
+}
+
+func (s *managedServerTestAdminService) DeepHealthCheck(
+	context.Context,
+	*adminservice.DeepHealthCheckRequest,
+) (*adminservice.DeepHealthCheckResponse, error) {
+	return &adminservice.DeepHealthCheckResponse{
+		State: enumsspb.HealthState(s.healthState.Load()),
+	}, nil
+}
+
+func startTestGRPCServer(t *testing.T, register func(*grpc.Server)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	register(server)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		require.NoError(t, <-serveErr)
+	})
+	return listener.Addr().String()
 }
 
 func TestManagedServerCommandUsesUnchangedTemporalConfig(t *testing.T) {
