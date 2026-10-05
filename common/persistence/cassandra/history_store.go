@@ -1,17 +1,34 @@
 package cassandra
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
+	"slices"
+	"sort"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common/config"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/primitives"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
+	historyNodePageTokenMetadataVersion       = byte(2)
+	historyNodeLegacyPageTokenMetadataVersion = byte(1)
+	historyNodePageTokenMetadataLength        = 18
+	// Nine 0xff bytes are invalid in both Cassandra's legacy-short and modern-vint paging-state formats.
+	historyNodePageTokenEnvelopePrefix       = "\xff\xff\xff\xff\xff\xff\xff\xff\xffTEMPORAL-HISTORY-PAGE"
+	historyNodePageTokenEnvelopeVersion      = byte(1)
+	historyNodePageTokenEnvelopeHeaderLength = len(historyNodePageTokenEnvelopePrefix) + 1 + 4
+
 	// below are templates for history_node table
 	v2templateUpsertHistoryNode = `INSERT INTO history_node (` +
 		`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) ` +
@@ -23,12 +40,32 @@ const (
 	v2templateReadHistoryNodeReverse = `SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node ` +
 		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? ORDER BY branch_id DESC, node_id DESC `
 
+	v2templateReadHistoryNodeReverseOldV2 = `SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node ` +
+		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? ORDER BY node_id DESC `
+
 	v2templateReadHistoryNodeMetadata = `SELECT node_id, prev_txn_id, txn_id FROM history_node ` +
 		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? `
 
 	v2templateDeleteHistoryNode = `DELETE FROM history_node WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ? `
 
 	v2templateRangeDeleteHistoryNode = `DELETE FROM history_node WHERE tree_id = ? AND branch_id = ? AND node_id >= ? `
+
+	v2templateUpsertHistoryNodeV2 = `INSERT INTO history_node_v2 (` +
+		`tree_id, branch_id, node_id, prev_txn_id, txn_id, data, data_encoding) ` +
+		`VALUES (?, ?, ?, ?, ?, ?, ?) `
+
+	v2templateReadHistoryNodeV2 = `SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node_v2 ` +
+		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? `
+
+	v2templateReadHistoryNodeReverseV2 = `SELECT node_id, prev_txn_id, txn_id, data, data_encoding FROM history_node_v2 ` +
+		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? ORDER BY node_id DESC `
+
+	v2templateReadHistoryNodeMetadataV2 = `SELECT node_id, prev_txn_id, txn_id FROM history_node_v2 ` +
+		`WHERE tree_id = ? AND branch_id = ? AND node_id >= ? AND node_id < ? `
+
+	v2templateDeleteHistoryNodeV2 = `DELETE FROM history_node_v2 WHERE tree_id = ? AND branch_id = ? AND node_id = ? AND txn_id = ? `
+
+	v2templateRangeDeleteHistoryNodeV2 = `DELETE FROM history_node_v2 WHERE tree_id = ? AND branch_id = ? AND node_id >= ? `
 
 	// below are templates for history_tree table
 	v2templateInsertTree = `INSERT INTO history_tree (` +
@@ -40,23 +77,497 @@ const (
 	v2templateDeleteBranch = `DELETE FROM history_tree WHERE tree_id = ? AND branch_id = ? `
 
 	v2templateScanAllTreeBranches = `SELECT tree_id, branch_id, branch, branch_encoding FROM history_tree `
+
+	v2templateInsertTreeV2 = `INSERT INTO history_tree_v2 (` +
+		`tree_id, branch_bucket, branch_id, branch, branch_encoding) ` +
+		`VALUES (?, ?, ?, ?, ?) `
+
+	v2templateReadAllBranchesV2 = `SELECT branch_id, branch, branch_encoding FROM history_tree_v2 ` +
+		`WHERE tree_id = ? AND branch_bucket = ? `
+
+	v2templateDeleteBranchV2 = `DELETE FROM history_tree_v2 ` +
+		`WHERE tree_id = ? AND branch_bucket = ? AND branch_id = ? `
+
+	v2templateScanAllTreeBranchesV2 = `SELECT tree_id, branch_bucket, branch_id, branch, branch_encoding FROM history_tree_v2 `
 )
 
 type (
 	HistoryStore struct {
 		Session gocql.Session
 		p.HistoryBranchUtil
+		historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode
+		historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode
+		historyNodeGenerations   historyNodeTableGenerations
 	}
+
+	historyNodeMutationPlan struct {
+		primaryQuery        string
+		mirrorQuery         string
+		optionalMirrorTable string
+	}
+
+	historyNodeReadLayout byte
+)
+
+const (
+	historyNodeReadLayoutLegacyV1 historyNodeReadLayout = iota + 1
+	historyNodeReadLayoutOldV2
+	historyNodeReadLayoutCanonicalV2
 )
 
 func NewHistoryStore(
 	session gocql.Session,
 	serializer serialization.Serializer,
+	historyNodeMigrationMode ...config.CassandraHistoryNodeMigrationMode,
+) *HistoryStore {
+	mode := config.CassandraHistoryNodeMigrationModeLegacyV1Dual
+	if len(historyNodeMigrationMode) > 0 {
+		mode = normalizeHistoryNodeMigrationMode(historyNodeMigrationMode[0])
+	}
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		mode,
+		config.CassandraHistoryTreeMigrationModeSourceOnly,
+		historyNodeTableGenerations{},
+	)
+}
+
+// NewHistoryStoreWithMigrationModes creates a history store with independently selectable node and tree layouts.
+func NewHistoryStoreWithMigrationModes(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
+) *HistoryStore {
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		normalizeHistoryNodeMigrationMode(historyNodeMigrationMode),
+		normalizeHistoryTreeMigrationMode(historyTreeMigrationMode),
+		historyNodeTableGenerations{},
+	)
+}
+
+func newHistoryStoreWithMigrationModes(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
+	generations historyNodeTableGenerations,
 ) *HistoryStore {
 	return &HistoryStore{
-		Session:           session,
-		HistoryBranchUtil: p.NewHistoryBranchUtil(serializer),
+		Session:                  session,
+		HistoryBranchUtil:        p.NewHistoryBranchUtil(serializer),
+		historyNodeMigrationMode: historyNodeMigrationMode,
+		historyTreeMigrationMode: historyTreeMigrationMode,
+		historyNodeGenerations:   generations,
 	}
+}
+
+func newHistoryStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	mode config.CassandraHistoryNodeMigrationMode,
+	generations historyNodeTableGenerations,
+) *HistoryStore {
+	return newHistoryStoreWithMigrationModes(
+		session,
+		serializer,
+		mode,
+		config.CassandraHistoryTreeMigrationModeSourceOnly,
+		generations,
+	)
+}
+
+func (h *HistoryStore) historyNodeMutationPlan(
+	legacyQuery string,
+	v2Query string,
+) (historyNodeMutationPlan, error) {
+	switch h.historyNodeMigrationMode {
+	case config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+		config.CassandraHistoryNodeMigrationModeOldV2RebuildV2:
+		return historyNodeMutationPlan{
+			primaryQuery:        legacyQuery,
+			mirrorQuery:         v2Query,
+			optionalMirrorTable: historyNodeV2TableName,
+		}, nil
+	case config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual:
+		return historyNodeMutationPlan{
+			primaryQuery: legacyQuery,
+			mirrorQuery:  v2Query,
+		}, nil
+	case config.CassandraHistoryNodeMigrationModeV1RebuildDual:
+		return historyNodeMutationPlan{
+			primaryQuery:        v2Query,
+			mirrorQuery:         legacyQuery,
+			optionalMirrorTable: historyNodeTableName,
+		}, nil
+	case config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
+		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual:
+		return historyNodeMutationPlan{
+			primaryQuery: v2Query,
+			mirrorQuery:  legacyQuery,
+		}, nil
+	case config.CassandraHistoryNodeMigrationModeV2Only:
+		return historyNodeMutationPlan{primaryQuery: v2Query}, nil
+	default:
+		return historyNodeMutationPlan{}, fmt.Errorf(
+			"unsupported Cassandra history node migration mode %q",
+			h.historyNodeMigrationMode,
+		)
+	}
+}
+
+func (h *HistoryStore) historyNodeMutationQueries(
+	legacyQuery string,
+	v2Query string,
+) ([]string, error) {
+	plan, err := h.historyNodeMutationPlan(legacyQuery, v2Query)
+	if err != nil {
+		return nil, err
+	}
+	queries := []string{plan.primaryQuery}
+	if plan.mirrorQuery != "" {
+		queries = append(queries, plan.mirrorQuery)
+	}
+	return queries, nil
+}
+
+func (h *HistoryStore) historyNodeReadLayout() (historyNodeReadLayout, error) {
+	switch h.historyNodeMigrationMode {
+	case config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual:
+		return historyNodeReadLayoutLegacyV1, nil
+	case config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
+		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual:
+		return historyNodeReadLayoutOldV2, nil
+	case config.CassandraHistoryNodeMigrationModeOldV2CutoverDual,
+		config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+		config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeV2Only,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual:
+		return historyNodeReadLayoutCanonicalV2, nil
+	default:
+		return 0, fmt.Errorf(
+			"unsupported Cassandra history node migration mode %q",
+			h.historyNodeMigrationMode,
+		)
+	}
+}
+
+func (h *HistoryStore) historyNodeReadQuery(metadataOnly bool, reverseOrder bool) (string, error) {
+	layout, err := h.historyNodeReadLayout()
+	if err != nil {
+		return "", err
+	}
+	return historyNodeReadQueryForLayout(layout, metadataOnly, reverseOrder)
+}
+
+func historyNodeReadQueryForLayout(
+	layout historyNodeReadLayout,
+	metadataOnly bool,
+	reverseOrder bool,
+) (string, error) {
+	switch layout {
+	case historyNodeReadLayoutLegacyV1:
+		switch {
+		case metadataOnly:
+			return v2templateReadHistoryNodeMetadata, nil
+		case reverseOrder:
+			return v2templateReadHistoryNodeReverse, nil
+		default:
+			return v2templateReadHistoryNode, nil
+		}
+	case historyNodeReadLayoutOldV2:
+		switch {
+		case metadataOnly:
+			return v2templateReadHistoryNodeMetadata, nil
+		case reverseOrder:
+			return v2templateReadHistoryNodeReverseOldV2, nil
+		default:
+			return v2templateReadHistoryNode, nil
+		}
+	case historyNodeReadLayoutCanonicalV2:
+		switch {
+		case metadataOnly:
+			return v2templateReadHistoryNodeMetadataV2, nil
+		case reverseOrder:
+			return v2templateReadHistoryNodeReverseV2, nil
+		default:
+			return v2templateReadHistoryNodeV2, nil
+		}
+	default:
+		return "", fmt.Errorf(
+			"unsupported Cassandra history node read layout %d",
+			layout,
+		)
+	}
+}
+
+func (h *HistoryStore) encodeHistoryNodePageTokenMetadata(layout historyNodeReadLayout) []byte {
+	generation := h.historyNodeGenerationForLayout(layout)
+	if generation == ([16]byte{}) {
+		return []byte{historyNodeLegacyPageTokenMetadataVersion, byte(layout)}
+	}
+	metadata := make([]byte, historyNodePageTokenMetadataLength)
+	metadata[0] = historyNodePageTokenMetadataVersion
+	metadata[1] = byte(layout)
+	copy(metadata[2:], generation[:])
+	return metadata
+}
+
+func (h *HistoryStore) decodeHistoryNodePageTokenMetadata(
+	pageState []byte,
+	metadata []byte,
+) (historyNodeReadLayout, error) {
+	configuredLayout, err := h.historyNodeReadLayout()
+	if err != nil {
+		return 0, err
+	}
+	if len(metadata) == 0 {
+		if len(pageState) == 0 {
+			return configuredLayout, nil
+		}
+		if h.acceptsRawHistoryNodePageToken() {
+			return configuredLayout, nil
+		}
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: "history node page token has no source-layout metadata; restart pagination",
+		}
+	}
+	if len(pageState) == 0 {
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: "invalid history node page token metadata without Cassandra page state",
+		}
+	}
+	version := metadata[0]
+	switch version {
+	case historyNodeLegacyPageTokenMetadataVersion:
+		if len(metadata) != 2 {
+			return 0, &p.InvalidPersistenceRequestError{
+				Msg: fmt.Sprintf(
+					"invalid history node page token metadata length %d",
+					len(metadata),
+				),
+			}
+		}
+	case historyNodePageTokenMetadataVersion:
+		if len(metadata) != historyNodePageTokenMetadataLength {
+			return 0, &p.InvalidPersistenceRequestError{
+				Msg: fmt.Sprintf(
+					"invalid history node page token metadata length %d",
+					len(metadata),
+				),
+			}
+		}
+	default:
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: fmt.Sprintf("invalid history node page token metadata version %d", version),
+		}
+	}
+
+	layout := historyNodeReadLayout(metadata[1])
+	switch layout {
+	case historyNodeReadLayoutLegacyV1,
+		historyNodeReadLayoutOldV2,
+		historyNodeReadLayoutCanonicalV2:
+	default:
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: fmt.Sprintf("invalid history node page token metadata read layout %d", layout),
+		}
+	}
+	expectedGeneration := h.historyNodeGenerationForLayout(layout)
+	if version == historyNodeLegacyPageTokenMetadataVersion && expectedGeneration != ([16]byte{}) {
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: "history node page token has no table generation; restart pagination",
+		}
+	}
+	if version == historyNodePageTokenMetadataVersion &&
+		!slices.Equal(metadata[2:], expectedGeneration[:]) {
+		return 0, &p.InvalidPersistenceRequestError{
+			Msg: "history node page token refers to a different table generation; restart pagination",
+		}
+	}
+	if err := h.validateHistoryNodeContinuationLayout(layout); err != nil {
+		return 0, err
+	}
+	return layout, nil
+}
+
+func encodeHistoryNodePageState(
+	pageState []byte,
+	layout historyNodeReadLayout,
+) []byte {
+	if len(pageState) == 0 || layout != historyNodeReadLayoutCanonicalV2 {
+		return pageState
+	}
+
+	envelopeLength := historyNodePageTokenEnvelopeHeaderLength + len(pageState)
+	envelope := make([]byte, envelopeLength)
+	offset := copy(envelope, historyNodePageTokenEnvelopePrefix)
+	envelope[offset] = historyNodePageTokenEnvelopeVersion
+	offset++
+	binary.BigEndian.PutUint32(envelope[offset:], uint32(len(pageState)))
+	offset += 4
+	copy(envelope[offset:], pageState)
+	return envelope
+}
+
+func decodeHistoryNodePageState(
+	pageToken []byte,
+	layout historyNodeReadLayout,
+) ([]byte, error) {
+	if len(pageToken) == 0 || layout != historyNodeReadLayoutCanonicalV2 {
+		return pageToken, nil
+	}
+	prefix := []byte(historyNodePageTokenEnvelopePrefix)
+	if !bytes.HasPrefix(pageToken, prefix) {
+		return nil, &p.InvalidPersistenceRequestError{
+			Msg: "canonical history node page token is not guarded; restart pagination",
+		}
+	}
+	if len(pageToken) < historyNodePageTokenEnvelopeHeaderLength {
+		return nil, &p.InvalidPersistenceRequestError{
+			Msg: "canonical history node page token envelope is truncated; restart pagination",
+		}
+	}
+
+	offset := len(prefix)
+	if pageToken[offset] != historyNodePageTokenEnvelopeVersion {
+		return nil, &p.InvalidPersistenceRequestError{
+			Msg: fmt.Sprintf(
+				"canonical history node page token envelope version %d is invalid; restart pagination",
+				pageToken[offset],
+			),
+		}
+	}
+	offset++
+	pageStateLength := int(binary.BigEndian.Uint32(pageToken[offset:]))
+	offset += 4
+	if pageStateLength == 0 || pageStateLength != len(pageToken)-offset {
+		return nil, &p.InvalidPersistenceRequestError{
+			Msg: "canonical history node page token envelope length is invalid; restart pagination",
+		}
+	}
+	return pageToken[offset:], nil
+}
+
+func (h *HistoryStore) historyNodeGenerationForLayout(layout historyNodeReadLayout) [16]byte {
+	switch layout {
+	case historyNodeReadLayoutLegacyV1, historyNodeReadLayoutOldV2:
+		return h.historyNodeGenerations.historyNode
+	case historyNodeReadLayoutCanonicalV2:
+		return h.historyNodeGenerations.historyNodeV2
+	default:
+		return [16]byte{}
+	}
+}
+
+func (h *HistoryStore) validateHistoryNodeContinuationLayout(layout historyNodeReadLayout) error {
+	var safeLayouts []historyNodeReadLayout
+	switch h.historyNodeMigrationMode {
+	case config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1RollbackDual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual:
+		safeLayouts = []historyNodeReadLayout{
+			historyNodeReadLayoutLegacyV1,
+		}
+		if h.historyNodeMigrationMode != config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2 {
+			safeLayouts = append(safeLayouts, historyNodeReadLayoutCanonicalV2)
+		}
+	case config.CassandraHistoryNodeMigrationModeOldV2RebuildV2:
+		safeLayouts = []historyNodeReadLayout{historyNodeReadLayoutOldV2}
+	case config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual,
+		config.CassandraHistoryNodeMigrationModeOldV2CutoverDual:
+		safeLayouts = []historyNodeReadLayout{
+			historyNodeReadLayoutOldV2,
+			historyNodeReadLayoutCanonicalV2,
+		}
+	case config.CassandraHistoryNodeMigrationModeV1RebuildDual,
+		config.CassandraHistoryNodeMigrationModeV2Only:
+		safeLayouts = []historyNodeReadLayout{historyNodeReadLayoutCanonicalV2}
+	case config.CassandraHistoryNodeMigrationModeV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual:
+		safeLayouts = []historyNodeReadLayout{
+			historyNodeReadLayoutLegacyV1,
+			historyNodeReadLayoutCanonicalV2,
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported Cassandra history node migration mode %q",
+			h.historyNodeMigrationMode,
+		)
+	}
+	if !slices.Contains(safeLayouts, layout) {
+		return &p.InvalidPersistenceRequestError{
+			Msg: fmt.Sprintf(
+				"history node page token layout %d is unsafe in migration mode %q; restart pagination",
+				layout,
+				h.historyNodeMigrationMode,
+			),
+		}
+	}
+	return nil
+}
+
+func (h *HistoryStore) acceptsRawHistoryNodePageToken() bool {
+	switch h.historyNodeMigrationMode {
+	case config.CassandraHistoryNodeMigrationModeLegacyV1RebuildV2,
+		config.CassandraHistoryNodeMigrationModeLegacyV1Dual,
+		config.CassandraHistoryNodeMigrationModeLegacyV1CutoverDual,
+		config.CassandraHistoryNodeMigrationModeOldV2RebuildV2,
+		config.CassandraHistoryNodeMigrationModeOldV2Dual,
+		config.CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *HistoryStore) executeHistoryNodeMutation(
+	ctx context.Context,
+	plan historyNodeMutationPlan,
+	addSharedQueries func(*gocql.Batch),
+	addHistoryNodeQueries func(*gocql.Batch, string) bool,
+) error {
+	batch := h.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	if addSharedQueries != nil {
+		addSharedQueries(batch)
+	}
+	hasHistoryNodeQueries := addHistoryNodeQueries(batch, plan.primaryQuery)
+	if hasHistoryNodeQueries && plan.mirrorQuery != "" {
+		addHistoryNodeQueries(batch, plan.mirrorQuery)
+	}
+	return h.Session.ExecuteBatch(batch)
+}
+
+func (h *HistoryStore) executeOptionalHistoryNodeMutation(
+	ctx context.Context,
+	plan historyNodeMutationPlan,
+	args ...any,
+) (bool, error) {
+	if plan.optionalMirrorTable == "" {
+		return false, nil
+	}
+	if err := h.Session.Query(plan.primaryQuery, args...).WithContext(ctx).Exec(); err != nil {
+		return true, err
+	}
+	err := h.Session.Query(plan.mirrorQuery, args...).WithContext(ctx).Exec()
+	if gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
+		return true, nil
+	}
+	return true, err
 }
 
 // AppendHistoryNodes upsert a batch of events as a single node to a history branch
@@ -65,34 +576,234 @@ func (h *HistoryStore) AppendHistoryNodes(
 	ctx context.Context,
 	request *p.InternalAppendHistoryNodesRequest,
 ) error {
-	branchInfo := request.BranchInfo
-	node := request.Node
-
-	if !request.IsNewBranch {
-		query := h.Session.Query(v2templateUpsertHistoryNode,
-			branchInfo.TreeId,
-			branchInfo.BranchId,
-			node.NodeID,
-			node.PrevTransactionID,
-			node.TransactionID,
-			node.Events.Data,
-			node.Events.EncodingType.String(),
-		).WithContext(ctx)
-		if err := query.Exec(); err != nil {
-			return convertTimeoutError(gocql.ConvertError("AppendHistoryNodes", err))
-		}
-		return nil
+	plan, err := h.historyNodeMutationPlan(
+		v2templateUpsertHistoryNode,
+		v2templateUpsertHistoryNodeV2,
+	)
+	if err != nil {
+		return err
 	}
 
-	treeInfoDataBlob := request.TreeInfo
-	batch := h.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
-	batch.Query(v2templateInsertTree,
+	if err := h.executeHistoryNodeUpserts(ctx, plan, request); err != nil {
+		return convertTimeoutError(gocql.ConvertError("AppendHistoryNodes", err))
+	}
+	return nil
+}
+
+func (h *HistoryStore) executeHistoryNodeUpserts(
+	ctx context.Context,
+	plan historyNodeMutationPlan,
+	request *p.InternalAppendHistoryNodesRequest,
+) error {
+	branchInfo := request.BranchInfo
+	node := request.Node
+	timestamp := time.Now().UnixMicro()
+	var treePlan historyTreeMutationPlan
+	treeMutation := historyTreeMutation{timestamp: timestamp}
+
+	if request.IsNewBranch {
+		var err error
+		treePlan, err = h.historyTreeMutationPlan(v2templateInsertTree, v2templateInsertTreeV2)
+		if err != nil {
+			return err
+		}
+		treeMutation, err = h.prepareHistoryTreeMutation(
+			ctx,
+			branchInfo.TreeId,
+			branchInfo.BranchId,
+		)
+		if err != nil {
+			return err
+		}
+		timestamp = treeMutation.timestamp
+		treeInfoDataBlob := request.TreeInfo
+		if treeMutation.authority != historyTreeMigrationAuthorityUnspecified {
+			if err := h.executeHistoryTreeUpsertWithMutation(
+				ctx,
+				treePlan.primaryQuery,
+				branchInfo.TreeId,
+				branchInfo.BranchId,
+				treeInfoDataBlob.Data,
+				treeInfoDataBlob.EncodingType.String(),
+				treeMutation,
+			); err != nil {
+				return err
+			}
+			if err := h.executeHistoryNodeUpsert(
+				ctx,
+				plan.primaryQuery,
+				branchInfo,
+				node,
+				timestamp,
+			); err != nil {
+				return err
+			}
+		} else {
+			primaryBatch := h.Session.NewBatch(gocql.LoggedBatch).
+				WithContext(ctx).
+				WithTimestamp(timestamp)
+			if err := h.addHistoryTreeUpsert(
+				primaryBatch,
+				treePlan.primaryQuery,
+				branchInfo.TreeId,
+				branchInfo.BranchId,
+				treeInfoDataBlob.Data,
+				treeInfoDataBlob.EncodingType.String(),
+			); err != nil {
+				return err
+			}
+			h.addHistoryNodeUpsert(primaryBatch, plan.primaryQuery, branchInfo, node)
+			if err := h.Session.ExecuteBatch(primaryBatch); err != nil {
+				return err
+			}
+		}
+	} else if err := h.executeHistoryNodeUpsert(
+		ctx,
+		plan.primaryQuery,
+		branchInfo,
+		node,
+		timestamp,
+	); err != nil {
+		return err
+	}
+
+	// Keep the large event blob out of a cross-table batch. Workflow mutations
+	// append history before mutable state, so a required mirror failure prevents
+	// the state commit and retries can complete these idempotent inserts.
+	if plan.mirrorQuery != "" {
+		if err := h.executeHistoryNodeUpsert(
+			ctx,
+			plan.mirrorQuery,
+			branchInfo,
+			node,
+			timestamp,
+		); err != nil &&
+			!gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
+			return err
+		}
+	}
+	if request.IsNewBranch && treePlan.mirrorQuery != "" {
+		treeInfoDataBlob := request.TreeInfo
+		if err := h.executeHistoryTreeUpsertWithMutation(
+			ctx,
+			treePlan.mirrorQuery,
+			branchInfo.TreeId,
+			branchInfo.BranchId,
+			treeInfoDataBlob.Data,
+			treeInfoDataBlob.EncodingType.String(),
+			treeMutation,
+		); err != nil &&
+			!gocql.IsUnconfiguredTableError(err, treePlan.optionalMirrorTable) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *HistoryStore) addHistoryTreeUpsert(
+	batch *gocql.Batch,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+) error {
+	if query == v2templateInsertTreeV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		batch.Query(query, treeID, bucket, branchID, data, encoding)
+		return nil
+	}
+	batch.Query(query, treeID, branchID, data, encoding)
+	return nil
+}
+
+func (h *HistoryStore) executeHistoryTreeUpsert(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+	timestamp int64,
+) error {
+	return h.executeHistoryTreeUpsertWithMutation(
+		ctx,
+		query,
+		treeID,
+		branchID,
+		data,
+		encoding,
+		historyTreeMutation{timestamp: timestamp},
+	)
+}
+
+func (h *HistoryStore) executeHistoryTreeUpsertWithMutation(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	data []byte,
+	encoding string,
+	mutation historyTreeMutation,
+) error {
+	if query == v2templateInsertTreeV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		return h.Session.Query(query, treeID, bucket, branchID, data, encoding).
+			WithContext(ctx).
+			WithTimestamp(mutation.timestamp).
+			Exec()
+	}
+	if mutation.authority != historyTreeMigrationAuthorityUnspecified {
+		return h.executeGuardedHistoryTreeSourceMutation(
+			ctx,
+			mutation,
+			treeID,
+			"WriteHistoryTreeSource",
+			query,
+			treeID,
+			branchID,
+			data,
+			encoding,
+		)
+	}
+	return h.Session.Query(query, treeID, branchID, data, encoding).
+		WithContext(ctx).
+		WithTimestamp(mutation.timestamp).
+		Exec()
+}
+
+func (h *HistoryStore) executeHistoryNodeUpsert(
+	ctx context.Context,
+	query string,
+	branchInfo *persistencespb.HistoryBranch,
+	node p.InternalHistoryNode,
+	timestamp int64,
+) error {
+	return h.Session.Query(
+		query,
 		branchInfo.TreeId,
 		branchInfo.BranchId,
-		treeInfoDataBlob.Data,
-		treeInfoDataBlob.EncodingType.String(),
-	)
-	batch.Query(v2templateUpsertHistoryNode,
+		node.NodeID,
+		node.PrevTransactionID,
+		node.TransactionID,
+		node.Events.Data,
+		node.Events.EncodingType.String(),
+	).WithContext(ctx).WithTimestamp(timestamp).Exec()
+}
+
+func (h *HistoryStore) addHistoryNodeUpsert(
+	batch *gocql.Batch,
+	query string,
+	branchInfo *persistencespb.HistoryBranch,
+	node p.InternalHistoryNode,
+) {
+	batch.Query(query,
 		branchInfo.TreeId,
 		branchInfo.BranchId,
 		node.NodeID,
@@ -101,10 +812,6 @@ func (h *HistoryStore) AppendHistoryNodes(
 		node.Events.Data,
 		node.Events.EncodingType.String(),
 	)
-	if err := h.Session.ExecuteBatch(batch); err != nil {
-		return convertTimeoutError(gocql.ConvertError("AppendHistoryNodes", err))
-	}
-	return nil
 }
 
 // DeleteHistoryNodes delete a history node
@@ -124,13 +831,35 @@ func (h *HistoryStore) DeleteHistoryNodes(
 		}
 	}
 
-	query := h.Session.Query(v2templateDeleteHistoryNode,
+	plan, err := h.historyNodeMutationPlan(
+		v2templateDeleteHistoryNode,
+		v2templateDeleteHistoryNodeV2,
+	)
+	if err != nil {
+		return err
+	}
+	if handled, err := h.executeOptionalHistoryNodeMutation(
+		ctx,
+		plan,
 		treeID,
 		branchID,
 		nodeID,
 		txnID,
-	).WithContext(ctx)
-	if err := query.Exec(); err != nil {
+	); handled {
+		if err != nil {
+			return gocql.ConvertError("DeleteHistoryNodes", err)
+		}
+		return nil
+	}
+	if err := h.executeHistoryNodeMutation(ctx, plan, nil, func(batch *gocql.Batch, query string) bool {
+		batch.Query(query,
+			treeID,
+			branchID,
+			nodeID,
+			txnID,
+		)
+		return true
+	}); err != nil {
 		return gocql.ConvertError("DeleteHistoryNodes", err)
 	}
 	return nil
@@ -157,37 +886,70 @@ func (h *HistoryStore) ReadHistoryBranch(
 		return nil, serviceerror.NewInternalf("ReadHistoryBranch - Gocql BranchId UUID cast failed. Error: %v", err)
 	}
 
-	var queryString string
-	if request.MetadataOnly {
-		queryString = v2templateReadHistoryNodeMetadata
-	} else if request.ReverseOrder {
-		queryString = v2templateReadHistoryNodeReverse
-	} else {
-		queryString = v2templateReadHistoryNode
+	readLayout, err := h.decodeHistoryNodePageTokenMetadata(
+		request.NextPageToken,
+		request.NextPageTokenMetadata,
+	)
+	if err != nil {
+		return nil, err
+	}
+	pageState, err := decodeHistoryNodePageState(request.NextPageToken, readLayout)
+	if err != nil {
+		return nil, err
+	}
+
+	queryString, err := historyNodeReadQueryForLayout(
+		readLayout,
+		request.MetadataOnly,
+		request.ReverseOrder,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	query := h.Session.Query(queryString, treeID, branchID, request.MinNodeID, request.MaxNodeID).WithContext(ctx)
 
-	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
-	var pagingToken []byte
-	if len(iter.PageState()) > 0 {
-		pagingToken = iter.PageState()
+	iter := query.PageSize(request.PageSize).PageState(pageState).Iter()
+
+	nodes := make([]p.InternalHistoryNode, 0, iter.NumRows())
+	var nodeID int64
+	var prevTxnID int64
+	var txnID int64
+	var data []byte
+	var dataEncoding string
+	scanDestinations := []any{&nodeID, &prevTxnID, &txnID}
+	if !request.MetadataOnly {
+		scanDestinations = append(scanDestinations, &data, &dataEncoding)
+	}
+	for iter.Scan(scanDestinations...) {
+		nodes = append(nodes, p.InternalHistoryNode{
+			NodeID:            nodeID,
+			PrevTransactionID: prevTxnID,
+			TransactionID:     txnID,
+			Events:            p.NewDataBlob(data, dataEncoding),
+		})
+
+		nodeID = 0
+		prevTxnID = 0
+		txnID = 0
+		data = nil
+		dataEncoding = ""
 	}
 
-	nodes := make([]p.InternalHistoryNode, 0, request.PageSize)
-	message := make(map[string]any)
-	for iter.MapScan(message) {
-		nodes = append(nodes, convertHistoryNode(message))
-		message = make(map[string]any)
+	pagingToken := iter.PageState()
+	var pagingTokenMetadata []byte
+	if len(pagingToken) > 0 {
+		pagingTokenMetadata = h.encodeHistoryNodePageTokenMetadata(readLayout)
+		pagingToken = encodeHistoryNodePageState(pagingToken, readLayout)
 	}
-
 	if err := iter.Close(); err != nil {
 		return nil, gocql.ConvertError("ReadHistoryBranch", err)
 	}
 
 	return &p.InternalReadHistoryBranchResponse{
-		Nodes:         nodes,
-		NextPageToken: pagingToken,
+		Nodes:                 nodes,
+		NextPageToken:         pagingToken,
+		NextPageTokenMetadata: pagingTokenMetadata,
 	}, nil
 }
 
@@ -255,10 +1017,37 @@ func (h *HistoryStore) ForkHistoryBranch(
 	if err != nil {
 		return serviceerror.NewInternalf("ForkHistoryBranch - Gocql NewBranchID UUID cast failed. Error: %v", err)
 	}
-	query := h.Session.Query(v2templateInsertTree, cqlTreeID, cqlNewBranchID, datablob.Data, datablob.EncodingType.String()).WithContext(ctx)
-	err = query.Exec()
+	plan, err := h.historyTreeMutationPlan(v2templateInsertTree, v2templateInsertTreeV2)
 	if err != nil {
+		return err
+	}
+	mutation, err := h.prepareHistoryTreeMutation(ctx, cqlTreeID, cqlNewBranchID)
+	if err != nil {
+		return err
+	}
+	if err := h.executeHistoryTreeUpsertWithMutation(
+		ctx,
+		plan.primaryQuery,
+		cqlTreeID,
+		cqlNewBranchID,
+		datablob.Data,
+		datablob.EncodingType.String(),
+		mutation,
+	); err != nil {
 		return gocql.ConvertError("ForkHistoryBranch", err)
+	}
+	if plan.mirrorQuery != "" {
+		if err := h.executeHistoryTreeUpsertWithMutation(
+			ctx,
+			plan.mirrorQuery,
+			cqlTreeID,
+			cqlNewBranchID,
+			datablob.Data,
+			datablob.EncodingType.String(),
+			mutation,
+		); err != nil && !gocql.IsUnconfiguredTableError(err, plan.optionalMirrorTable) {
+			return gocql.ConvertError("ForkHistoryBranch", err)
+		}
 	}
 
 	return nil
@@ -270,55 +1059,169 @@ func (h *HistoryStore) DeleteHistoryBranch(
 	request *p.InternalDeleteHistoryBranchRequest,
 ) error {
 
-	batch := h.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
-	batch.Query(v2templateDeleteBranch, request.BranchInfo.TreeId, request.BranchInfo.BranchId)
-
-	// delete each branch range
+	plan, err := h.historyNodeMutationPlan(
+		v2templateRangeDeleteHistoryNode,
+		v2templateRangeDeleteHistoryNodeV2,
+	)
+	if err != nil {
+		return err
+	}
 	for _, br := range request.BranchRanges {
-		h.deleteBranchRangeNodes(batch, request.BranchInfo.TreeId, br.BranchId, br.BeginNodeId)
+		if handled, optionalErr := h.executeOptionalHistoryNodeMutation(
+			ctx,
+			plan,
+			request.BranchInfo.TreeId,
+			br.BranchId,
+			br.BeginNodeId,
+		); handled {
+			if optionalErr != nil {
+				return gocql.ConvertError("DeleteHistoryBranch", optionalErr)
+			}
+			continue
+		}
+		err = h.executeHistoryNodeMutation(
+			ctx,
+			plan,
+			nil,
+			func(batch *gocql.Batch, query string) bool {
+				batch.Query(
+					query,
+					request.BranchInfo.TreeId,
+					br.BranchId,
+					br.BeginNodeId,
+				)
+				return true
+			},
+		)
+		if err != nil {
+			return gocql.ConvertError("DeleteHistoryBranch", err)
+		}
 	}
 
-	err := h.Session.ExecuteBatch(batch)
+	treePlan, err := h.historyTreeMutationPlan(v2templateDeleteBranch, v2templateDeleteBranchV2)
 	if err != nil {
+		return err
+	}
+	mutation, err := h.prepareHistoryTreeMutation(
+		ctx,
+		request.BranchInfo.TreeId,
+		request.BranchInfo.BranchId,
+	)
+	if err != nil {
+		return err
+	}
+	if err := h.executeHistoryTreeDeleteWithMutation(
+		ctx,
+		treePlan.primaryQuery,
+		request.BranchInfo.TreeId,
+		request.BranchInfo.BranchId,
+		mutation,
+	); err != nil {
 		return gocql.ConvertError("DeleteHistoryBranch", err)
+	}
+	if treePlan.mirrorQuery != "" {
+		if err := h.executeHistoryTreeDeleteWithMutation(
+			ctx,
+			treePlan.mirrorQuery,
+			request.BranchInfo.TreeId,
+			request.BranchInfo.BranchId,
+			mutation,
+		); err != nil && !gocql.IsUnconfiguredTableError(err, treePlan.optionalMirrorTable) {
+			return gocql.ConvertError("DeleteHistoryBranch", err)
+		}
 	}
 	return nil
 }
 
-func (h *HistoryStore) deleteBranchRangeNodes(
-	batch *gocql.Batch,
+func (h *HistoryStore) executeHistoryTreeDelete(
+	ctx context.Context,
+	query string,
 	treeID string,
 	branchID string,
-	beginNodeID int64,
-) {
-
-	batch.Query(v2templateRangeDeleteHistoryNode,
+) error {
+	return h.executeHistoryTreeDeleteWithMutation(
+		ctx,
+		query,
 		treeID,
 		branchID,
-		beginNodeID)
+		historyTreeMutation{timestamp: time.Now().UTC().UnixMicro()},
+	)
+}
+
+func (h *HistoryStore) executeHistoryTreeDeleteWithMutation(
+	ctx context.Context,
+	query string,
+	treeID string,
+	branchID string,
+	mutation historyTreeMutation,
+) error {
+	if query == v2templateDeleteBranchV2 {
+		bucket, err := historyTreeBranchBucket(branchID)
+		if err != nil {
+			return err
+		}
+		return h.Session.Query(query, treeID, bucket, branchID).
+			WithContext(ctx).
+			WithTimestamp(mutation.timestamp).
+			Exec()
+	}
+	if mutation.authority != historyTreeMigrationAuthorityUnspecified {
+		return h.executeGuardedHistoryTreeSourceMutation(
+			ctx,
+			mutation,
+			treeID,
+			"DeleteHistoryTreeSource",
+			query,
+			treeID,
+			branchID,
+		)
+	}
+	return h.Session.Query(query, treeID, branchID).
+		WithContext(ctx).
+		WithTimestamp(mutation.timestamp).
+		Exec()
 }
 
 func (h *HistoryStore) GetAllHistoryTreeBranches(
 	ctx context.Context,
 	request *p.GetAllHistoryTreeBranchesRequest,
 ) (*p.InternalGetAllHistoryTreeBranchesResponse, error) {
-
-	query := h.Session.Query(v2templateScanAllTreeBranches).WithContext(ctx)
-
-	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
-
-	var pagingToken []byte
-	if len(iter.PageState()) > 0 {
-		pagingToken = iter.PageState()
+	layout, pageState, err := h.decodeHistoryTreePageState(request.NextPageToken)
+	if err != nil {
+		return nil, err
 	}
+	queryString := v2templateScanAllTreeBranches
+	if layout == historyTreeReadLayoutBucketV2 {
+		queryString = v2templateScanAllTreeBranchesV2
+	}
+	query := h.Session.Query(queryString).WithContext(ctx)
 
-	branches := make([]p.InternalHistoryBranchDetail, 0, request.PageSize)
+	iter := query.PageSize(request.PageSize).PageState(pageState).Iter()
+
+	branches := make([]p.InternalHistoryBranchDetail, 0, preallocatedResultCapacity(request.PageSize))
 	treeUUID := ""
 	branchUUID := ""
 	var data []byte
 	var encoding string
 
-	for iter.Scan(&treeUUID, &branchUUID, &data, &encoding) {
+	for {
+		var scanned bool
+		if layout == historyTreeReadLayoutBucketV2 {
+			var branchBucket int
+			scanned = iter.Scan(&treeUUID, &branchBucket, &branchUUID, &data, &encoding)
+		} else {
+			scanned = iter.Scan(&treeUUID, &branchUUID, &data, &encoding)
+		}
+		if !scanned {
+			break
+		}
+		if layout == historyTreeReadLayoutLegacyV1 && branchUUID == historyTreeAuthorityBranchID {
+			treeUUID = ""
+			branchUUID = ""
+			data = nil
+			encoding = ""
+			continue
+		}
 		branch := p.InternalHistoryBranchDetail{
 			TreeID:   treeUUID,
 			BranchID: branchUUID,
@@ -333,6 +1236,10 @@ func (h *HistoryStore) GetAllHistoryTreeBranches(
 		encoding = ""
 	}
 
+	var pagingToken []byte
+	if len(iter.PageState()) > 0 {
+		pagingToken = h.encodeHistoryTreePageState(iter.PageState(), layout)
+	}
 	if err := iter.Close(); err != nil {
 		return nil, gocql.ConvertError("GetAllHistoryTreeBranches", err)
 	}
@@ -360,65 +1267,85 @@ func (h *HistoryStore) GetHistoryTreeContainingBranch(
 	if err != nil {
 		return nil, serviceerror.NewInternalf("ReadHistoryBranch. Gocql TreeId UUID cast failed. Error: %v", err)
 	}
-	query := h.Session.Query(v2templateReadAllBranches, treeID).WithContext(ctx)
-
 	pageSize := 100
-	var pagingToken []byte
-	treeInfos := make([]*commonpb.DataBlob, 0, pageSize)
+	type branchData struct {
+		branchID string
+		data     *commonpb.DataBlob
+	}
+	branches := make([]branchData, 0, pageSize)
+	layout, err := h.historyTreeReadLayout()
+	if err != nil {
+		return nil, err
+	}
+	bucketLimit := 1
+	if layout == historyTreeReadLayoutBucketV2 {
+		bucketLimit = historyTreeV2BucketCount
+	}
+	bucketBranches := make([][]branchData, bucketLimit)
+	group, groupCtx := errgroup.WithContext(ctx)
+	for bucket := range bucketLimit {
+		group.Go(func() error {
+			queryString := v2templateReadAllBranches
+			queryArgs := []any{treeID}
+			if layout == historyTreeReadLayoutBucketV2 {
+				queryString = v2templateReadAllBranchesV2
+				queryArgs = append(queryArgs, bucket)
+			}
+			query := h.Session.Query(queryString, queryArgs...).WithContext(groupCtx)
+			var pagingToken []byte
+			for {
+				iter := query.
+					PageSize(pageSize).
+					PageState(pagingToken).
+					Iter()
 
-	var iter gocql.Iter
-	for {
-		iter = query.PageSize(pageSize).PageState(pagingToken).Iter()
-		pagingToken = iter.PageState()
-
-		branchUUID := ""
-		var data []byte
-		var encoding string
-		for iter.Scan(&branchUUID, &data, &encoding) {
-			treeInfos = append(treeInfos, p.NewDataBlob(data, encoding))
-
-			branchUUID = ""
-			data = []byte{}
-			encoding = ""
-		}
-
-		if err := iter.Close(); err != nil {
-			return nil, gocql.ConvertError("GetHistoryTree", err)
-		}
-
-		if len(pagingToken) == 0 {
-			break
-		}
+				branchUUID := ""
+				var data []byte
+				var encoding string
+				for iter.Scan(&branchUUID, &data, &encoding) {
+					if layout == historyTreeReadLayoutLegacyV1 && branchUUID == historyTreeAuthorityBranchID {
+						branchUUID = ""
+						data = nil
+						encoding = ""
+						continue
+					}
+					bucketBranches[bucket] = append(bucketBranches[bucket], branchData{
+						branchID: branchUUID,
+						data:     p.NewDataBlob(data, encoding),
+					})
+					branchUUID = ""
+					data = nil
+					encoding = ""
+				}
+				nextPagingToken := iter.PageState()
+				if err := iter.Close(); err != nil {
+					return gocql.ConvertError("GetHistoryTree", err)
+				}
+				if len(nextPagingToken) == 0 {
+					break
+				}
+				pagingToken = nextPagingToken
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	for bucket := range bucketLimit {
+		branches = append(branches, bucketBranches[bucket]...)
+	}
+	sort.Slice(branches, func(i, j int) bool { return branches[i].branchID < branches[j].branchID })
+	treeInfos := make([]*commonpb.DataBlob, len(branches))
+	for index := range branches {
+		treeInfos[index] = branches[index].data
 	}
 
-	return &p.InternalGetHistoryTreeContainingBranchResponse{
-		TreeInfos: treeInfos,
-	}, nil
+	return &p.InternalGetHistoryTreeContainingBranchResponse{TreeInfos: treeInfos}, nil
 }
 
 func (h *HistoryStore) GetHistoryBranchUtil() p.HistoryBranchUtil {
 	return h.HistoryBranchUtil
-}
-
-func convertHistoryNode(
-	message map[string]any,
-) p.InternalHistoryNode {
-	nodeID := message["node_id"].(int64)
-	prevTxnID := message["prev_txn_id"].(int64)
-	txnID := message["txn_id"].(int64)
-
-	var data []byte
-	var dataEncoding string
-	if _, ok := message["data"]; ok {
-		data = message["data"].([]byte)
-		dataEncoding = message["data_encoding"].(string)
-	}
-	return p.InternalHistoryNode{
-		NodeID:            nodeID,
-		PrevTransactionID: prevTxnID,
-		TransactionID:     txnID,
-		Events:            p.NewDataBlob(data, dataEncoding),
-	}
 }
 
 func convertTimeoutError(err error) error {

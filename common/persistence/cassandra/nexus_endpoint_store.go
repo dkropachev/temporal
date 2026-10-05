@@ -191,7 +191,7 @@ func (s *NexusEndpointStore) ListNexusEndpoints(
 	ctx context.Context,
 	request *p.ListNexusEndpointsRequest,
 ) (*p.InternalListNexusEndpointsResponse, error) {
-	if request.NextPageToken == nil {
+	if len(request.NextPageToken) == 0 {
 		return s.listFirstPageWithVersion(ctx, request)
 	}
 
@@ -202,6 +202,7 @@ func (s *NexusEndpointStore) ListNexusEndpoints(
 
 	endpoints, err := s.getEndpointList(iter)
 	if err != nil {
+		_ = iter.Close()
 		return nil, err
 	}
 	response.Endpoints = endpoints
@@ -313,10 +314,12 @@ func (s *NexusEndpointStore) listFirstPageWithVersion(
 
 	tableVersion, err := getTypedFieldFromRow[int64]("version", partitionStateRow)
 	if err != nil {
+		_ = iter.Close()
 		return nil, err
 	}
 	response.TableVersion = tableVersion
 	if request.LastKnownTableVersion != 0 && request.LastKnownTableVersion != tableVersion {
+		_ = iter.Close()
 		return nil, fmt.Errorf("%w. provided table version: %v current table version: %v",
 			p.ErrNexusTableVersionConflict,
 			request.LastKnownTableVersion,
@@ -325,6 +328,7 @@ func (s *NexusEndpointStore) listFirstPageWithVersion(
 
 	endpoints, err := s.getEndpointList(iter)
 	if err != nil {
+		_ = iter.Close()
 		return nil, err
 	}
 	response.Endpoints = endpoints

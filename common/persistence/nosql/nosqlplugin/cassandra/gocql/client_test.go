@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/resolver"
+	"go.temporal.io/server/common/util"
 	"go.uber.org/mock/gomock"
 )
 
@@ -181,6 +183,40 @@ func TestNewCassandraCluster(t *testing.T) {
 				_, _, err := authenticator.Challenge([]byte("org.apache.cassandra.auth.LDAPAuthenticator"))
 				assert.NoError(t, err)
 			},
+		},
+		"scylla_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr[float32](4),
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.InDelta(t, float32(4), cluster.MaxExcessShardConnectionsRate, 0)
+			},
+		},
+		"scylla_zero_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr[float32](0),
+			},
+			verify: func(t *testing.T, cluster *gocql.ClusterConfig) {
+				require.InDelta(t, float32(0), cluster.MaxExcessShardConnectionsRate, 0)
+			},
+		},
+		"scylla_nan_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr(float32(math.NaN())),
+			},
+			err: errors.New("maxExcessShardConnectionsRate must be a finite non-negative number"),
+		},
+		"scylla_infinite_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr(float32(math.Inf(1))),
+			},
+			err: errors.New("maxExcessShardConnectionsRate must be a finite non-negative number"),
+		},
+		"scylla_negative_max_excess_shard_connections_rate": {
+			cfg: config.Cassandra{
+				MaxExcessShardConnectionsRate: util.Ptr(float32(-1)),
+			},
+			err: errors.New("maxExcessShardConnectionsRate must be a finite non-negative number"),
 		},
 	}
 

@@ -24,6 +24,10 @@ func (it *iter) MapScan(m map[string]any) bool {
 	return it.gocqlIter.MapScan(m)
 }
 
+func (it *iter) NumRows() int {
+	return it.gocqlIter.NumRows()
+}
+
 func (it *iter) PageState() []byte {
 	return it.gocqlIter.PageState()
 }

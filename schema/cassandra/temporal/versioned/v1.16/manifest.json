@@ -1,0 +1,17 @@
+{
+  "CurrVersion": "1.16",
+  "MinCompatibleVersion": "1.0",
+  "Description": "Add bucketed Cassandra persistence layouts",
+  "SchemaUpdateCqlFiles": [
+    "schema_layout_metadata.cql",
+    "executions_v2.cql",
+    "history_tree_source_authority.cql",
+    "history_tree_v2.cql",
+    "matching_tasks_source_authority.cql",
+    "matching_tasks_v3.cql",
+    "task_queue_user_data_v2.cql",
+    "legacy_queue_v2.cql",
+    "queues_v2_bucketed.cql",
+    "queue_messages_v3.cql"
+  ]
+}

@@ -647,6 +647,8 @@ func (db *taskQueueDB) GetTasks(
 		ExclusiveMaxTaskID: exclusiveMaxTaskID,
 		Subqueue:           int(subqueue),
 		PageSize:           batchSize,
+		TaskIDRangeSize:    db.config.RangeSize,
+		TaskIDMaxBatchSize: max(1, db.config.MaxTaskBatchSize()),
 	})
 }
 

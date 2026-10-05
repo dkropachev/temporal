@@ -1226,12 +1226,12 @@ Note: this should be greater than matching.longPollExpirationInterval and matchi
 	)
 	MatchingNumTaskqueueWritePartitions = NewTaskQueueIntSettingWithConstrainedDefault(
 		"matching.numTaskqueueWritePartitions",
-		defaultNumTaskQueuePartitions,
+		defaultNumTaskQueueWritePartitions,
 		`MatchingNumTaskqueueWritePartitions is the number of write partitions for a task queue`,
 	)
 	MatchingNumTaskqueueReadPartitions = NewTaskQueueIntSettingWithConstrainedDefault(
 		"matching.numTaskqueueReadPartitions",
-		defaultNumTaskQueuePartitions,
+		defaultNumTaskQueueReadPartitions,
 		`MatchingNumTaskqueueReadPartitions is the number of read partitions for a task queue`,
 	)
 	MetricsBreakdownByTaskQueue = NewTaskQueueBoolSetting(

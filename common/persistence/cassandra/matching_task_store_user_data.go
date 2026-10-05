@@ -3,7 +3,9 @@ package cassandra
 import (
 	"context"
 	"fmt"
+	"sync"
 
+	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 )
@@ -34,14 +36,20 @@ const (
 	(?           , ?       , ?)`
 	templateDeleteBuildIdTaskQueueMappingQuery = `DELETE FROM task_queue_user_data
 	WHERE namespace_id = ? AND build_id = ? AND task_queue_name = ?`
-	templateCountTaskQueueByBuildIdQuery = `SELECT COUNT(*) FROM task_queue_user_data WHERE namespace_id = ? AND build_id = ?`
+	templateCountTaskQueueByBuildIDQuery        = `SELECT COUNT(*) FROM task_queue_user_data WHERE namespace_id = ? AND build_id = ?`
+	templateLimitedCountTaskQueueByBuildIDQuery = `SELECT task_queue_name FROM task_queue_user_data WHERE namespace_id = ? AND build_id = ? LIMIT ?`
 )
 
 type userDataStore struct {
-	Session gocql.Session
+	Session              gocql.Session
+	logger               log.Logger
+	migrationMode        TaskQueueUserDataMigrationMode
+	bucketCount          int
+	authorityIdentity    *taskQueueUserDataAuthorityIdentityCache
+	targetAuthorityCache *sync.Map
 }
 
-func (d *userDataStore) GetTaskQueueUserData(
+func (d *userDataStore) getTaskQueueUserDataV1(
 	ctx context.Context,
 	request *p.GetTaskQueueUserDataRequest,
 ) (*p.InternalGetTaskQueueUserDataResponse, error) {
@@ -62,9 +70,24 @@ func (d *userDataStore) GetTaskQueueUserData(
 	}, nil
 }
 
-func (d *userDataStore) UpdateTaskQueueUserData(
+func (d *userDataStore) updateTaskQueueUserDataV1(
 	ctx context.Context,
 	request *p.InternalUpdateTaskQueueUserDataRequest,
+) error {
+	return d.updateTaskQueueUserDataV1Guarded(
+		ctx,
+		request,
+		taskQueueUserDataAuthorityRecord{},
+		taskQueueUserDataAuthorityUnspecified,
+	)
+}
+
+//nolint:revive // The guarded update atomically handles version, build-ID, and authority conditions.
+func (d *userDataStore) updateTaskQueueUserDataV1Guarded(
+	ctx context.Context,
+	request *p.InternalUpdateTaskQueueUserDataRequest,
+	identity taskQueueUserDataAuthorityRecord,
+	authority taskQueueUserDataAuthority,
 ) error {
 	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 
@@ -93,6 +116,7 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 			batch.Query(templateDeleteBuildIdTaskQueueMappingQuery, request.NamespaceID, buildId, taskQueue)
 		}
 	}
+	addTaskQueueUserDataSourceAuthorityGuard(batch, request.NamespaceID, identity, authority)
 
 	previous := make(map[string]any)
 	applied, iter, err := d.Session.MapExecuteBatchCAS(batch, previous)
@@ -104,9 +128,24 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 	if err != nil {
 		return gocql.ConvertError("UpdateTaskQueueUserData", err)
 	}
-	defer iter.Close()
 
 	if !applied {
+		if authorityErr := d.validateTaskQueueUserDataSourceGuard(
+			ctx,
+			request.NamespaceID,
+			identity,
+			authority,
+		); authorityErr != nil {
+			if iter != nil {
+				_ = iter.Close()
+			}
+			return authorityErr
+		}
+		defer func() {
+			if iter != nil {
+				_ = iter.Close()
+			}
+		}()
 		// No error, but not applied. That means we had a conflict.
 		// Iterate through results to identify first conflicting row.
 		for {
@@ -130,30 +169,40 @@ func (d *userDataStore) UpdateTaskQueueUserData(
 		return &p.ConditionFailedError{Msg: "Failed to update task queues: unknown conflict"}
 	}
 
+	if err := iter.Close(); err != nil {
+		return gocql.ConvertError("UpdateTaskQueueUserData", err)
+	}
 	return nil
 }
 
-func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, request *p.ListTaskQueueUserDataEntriesRequest) (*p.InternalListTaskQueueUserDataEntriesResponse, error) {
+func (d *userDataStore) listTaskQueueUserDataEntriesV1(ctx context.Context, request *p.ListTaskQueueUserDataEntriesRequest) (*p.InternalListTaskQueueUserDataEntriesResponse, error) {
 	query := d.Session.Query(templateListTaskQueueUserDataQuery, request.NamespaceID).WithContext(ctx)
 	iter := query.PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
 	response := &p.InternalListTaskQueueUserDataEntriesResponse{}
 	row := make(map[string]any)
+	closeIter := func() {
+		_ = iter.Close()
+	}
 	for iter.MapScan(row) {
 		taskQueue, err := getTypedFieldFromRow[string]("task_queue_name", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		data, err := getTypedFieldFromRow[[]byte]("data", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		dataEncoding, err := getTypedFieldFromRow[string]("data_encoding", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 		version, err := getTypedFieldFromRow[int64]("version", row)
 		if err != nil {
+			closeIter()
 			return nil, err
 		}
 
@@ -171,22 +220,27 @@ func (d *userDataStore) ListTaskQueueUserDataEntries(ctx context.Context, reques
 	return response, nil
 }
 
-func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.GetTaskQueuesByBuildIdRequest) ([]string, error) {
-	query := d.Session.Query(templateListTaskQueueNamesByBuildIdQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
-	iter := query.PageSize(listTaskQueueNamesByBuildIdPageSize).Iter()
-
+func (d *userDataStore) getTaskQueuesByBuildIDV1(ctx context.Context, request *p.GetTaskQueuesByBuildIdRequest) ([]string, error) {
 	var taskQueues []string
-	row := make(map[string]any)
+	var pageToken []byte
 
 	for {
+		query := d.Session.Query(templateListTaskQueueNamesByBuildIdQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
+		iter := query.
+			PageSize(listTaskQueueNamesByBuildIdPageSize).
+			PageState(pageToken).
+			Iter()
+		row := make(map[string]any)
 		for iter.MapScan(row) {
 			taskQueueRaw, ok := row["task_queue_name"]
 			if !ok {
+				_ = iter.Close()
 				return nil, newFieldNotFoundError("task_queue_name", row)
 			}
 			taskQueue, ok := taskQueueRaw.(string)
 			if !ok {
 				var stringType string
+				_ = iter.Close()
 				return nil, newPersistedTypeMismatchError("task_queue_name", stringType, taskQueueRaw, row)
 			}
 
@@ -194,20 +248,37 @@ func (d *userDataStore) GetTaskQueuesByBuildId(ctx context.Context, request *p.G
 
 			row = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
 		}
-		if len(iter.PageState()) == 0 {
-			break
+		nextPageToken := iter.PageState()
+		if err := iter.Close(); err != nil {
+			return nil, gocql.ConvertError("GetTaskQueuesByBuildId", err)
 		}
+		if len(nextPageToken) == 0 {
+			return taskQueues, nil
+		}
+		pageToken = nextPageToken
 	}
-
-	if err := iter.Close(); err != nil {
-		return nil, gocql.ConvertError("GetTaskQueuesByBuildId", err)
-	}
-	return taskQueues, nil
 }
 
-func (d *userDataStore) CountTaskQueuesByBuildId(ctx context.Context, request *p.CountTaskQueuesByBuildIdRequest) (int, error) {
+func (d *userDataStore) countTaskQueuesByBuildIDV1(ctx context.Context, request *p.CountTaskQueuesByBuildIdRequest) (int, error) {
+	if request.Limit > 0 {
+		query := d.Session.Query(templateLimitedCountTaskQueueByBuildIDQuery, request.NamespaceID, request.BuildID, request.Limit).WithContext(ctx)
+		iter := query.PageSize(request.Limit).Iter()
+		count := 0
+		var taskQueue string
+		for iter.Scan(&taskQueue) {
+			count++
+		}
+		if err := iter.Close(); err != nil {
+			return 0, gocql.ConvertError("CountTaskQueuesByBuildId", err)
+		}
+		return count, nil
+	}
+
 	var count int
-	query := d.Session.Query(templateCountTaskQueueByBuildIdQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
+	query := d.Session.Query(templateCountTaskQueueByBuildIDQuery, request.NamespaceID, request.BuildID).WithContext(ctx)
 	err := query.Scan(&count)
-	return count, err
+	if err != nil {
+		return 0, gocql.ConvertError("CountTaskQueuesByBuildId", err)
+	}
+	return count, nil
 }

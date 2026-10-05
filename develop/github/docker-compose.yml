@@ -5,12 +5,26 @@ x-healthcheck-defaults: &healthcheck-defaults
 
 services:
   cassandra:
+    image: cassandra:5.0
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_LISTEN_ADDRESS: 127.0.0.1
+      MAX_HEAP_SIZE: "2G"
+      HEAP_NEWSIZE: "200M"
+      JVM_EXTRA_OPTS: "-Dcassandra.native_transport_max_threads=512"
+    healthcheck:
+      !!merge <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+
+  scylla:
     image: scylladb/scylla:2026.1
     ports:
       - "9042:9042"
+      - "19042:19042"
     command:
       - --smp
-      - "1"
+      - "2"
       - --memory
       - 2G
       - --overprovisioned

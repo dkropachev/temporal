@@ -2,14 +2,20 @@ package cassandra
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/server/common/config"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/service/history/tasks"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -47,12 +53,18 @@ const (
 	templateGetHistoryScheduledTasksQuery = `SELECT visibility_ts, task_id, task_data, task_encoding ` +
 		`FROM executions ` +
 		`WHERE shard_id = ? ` +
-		`and type = ?` +
+		`and type = ? ` +
 		`and namespace_id = ? ` +
-		`and workflow_id = ?` +
-		`and run_id = ?` +
+		`and workflow_id = ? ` +
+		`and run_id = ? ` +
 		`and visibility_ts >= ? ` +
 		`and visibility_ts < ?`
+
+	templateGetHistoryScheduledTasksTargetQuery = `SELECT visibility_ts, task_id, task_data, task_encoding ` +
+		`FROM executions ` +
+		`WHERE shard_id = ? ` +
+		`and (type, namespace_id, workflow_id, run_id, visibility_ts, task_id) >= (?, ?, ?, ?, ?, ?) ` +
+		`and (type, namespace_id, workflow_id, run_id, visibility_ts, task_id) < (?, ?, ?, ?, ?, ?)`
 
 	templateGetTransferTasksQuery = `SELECT task_id, transfer, transfer_encoding ` +
 		`FROM executions ` +
@@ -134,12 +146,18 @@ const (
 	templateGetTimerTasksQuery = `SELECT visibility_ts, task_id, timer, timer_encoding ` +
 		`FROM executions ` +
 		`WHERE shard_id = ? ` +
-		`and type = ?` +
+		`and type = ? ` +
 		`and namespace_id = ? ` +
-		`and workflow_id = ?` +
-		`and run_id = ?` +
+		`and workflow_id = ? ` +
+		`and run_id = ? ` +
 		`and visibility_ts >= ? ` +
 		`and visibility_ts < ?`
+
+	templateGetTimerTasksTargetQuery = `SELECT visibility_ts, task_id, timer, timer_encoding ` +
+		`FROM executions ` +
+		`WHERE shard_id = ? ` +
+		`and (type, namespace_id, workflow_id, run_id, visibility_ts, task_id) >= (?, ?, ?, ?, ?, ?) ` +
+		`and (type, namespace_id, workflow_id, run_id, visibility_ts, task_id) < (?, ?, ?, ?, ?, ?)`
 
 	templateCompleteTimerTaskQuery = `DELETE FROM executions ` +
 		`WHERE shard_id = ? ` +
@@ -164,13 +182,31 @@ type (
 	MutableStateTaskStore struct {
 		Session    gocql.Session
 		serializer serialization.Serializer
+		layout     executionLayout
+		logger     log.Logger
 	}
 )
 
 func NewMutableStateTaskStore(session gocql.Session, serializer serialization.Serializer) *MutableStateTaskStore {
+	return newMutableStateTaskStore(
+		session,
+		serializer,
+		executionLayout{mode: config.CassandraExecutionMigrationModeLegacy, buckets: 1},
+		log.NewNoopLogger(),
+	)
+}
+
+func newMutableStateTaskStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	layout executionLayout,
+	logger log.Logger,
+) *MutableStateTaskStore {
 	return &MutableStateTaskStore{
 		Session:    session,
 		serializer: serializer,
+		layout:     layout,
+		logger:     logger,
 	}
 }
 
@@ -178,11 +214,28 @@ func (d *MutableStateTaskStore) AddHistoryTasks(
 	ctx context.Context,
 	request *p.InternalAddHistoryTasksRequest,
 ) error {
-	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.AddHistoryTasks(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.AddHistoryTasks(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("AddHistoryTasks", mirror.AddHistoryTasks(ctx, request))
+	}
+	batch := newExecutionBatch(d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx), d.layout)
+	shardID, err := d.layout.workflowPartition(request.ShardID, request.NamespaceID, request.WorkflowID)
+	if err != nil {
+		return err
+	}
 
 	if err := applyTasks(
 		batch,
-		request.ShardID,
+		shardID,
 		request.Tasks,
 	); err != nil {
 		return err
@@ -190,7 +243,7 @@ func (d *MutableStateTaskStore) AddHistoryTasks(
 
 	batch.Query(templateUpdateLeaseQuery,
 		request.RangeID,
-		request.ShardID,
+		shardID,
 		rowTypeShard,
 		rowTypeShardNamespaceID,
 		rowTypeShardWorkflowID,
@@ -199,9 +252,10 @@ func (d *MutableStateTaskStore) AddHistoryTasks(
 		rowTypeShardTaskID,
 		request.RangeID,
 	)
+	batch.addShardAuthorityGuard(shardID)
 
 	previous := make(map[string]any)
-	applied, iter, err := d.Session.MapExecuteBatchCAS(batch, previous)
+	applied, iter, err := d.Session.MapExecuteBatchCAS(batch.Batch, previous)
 	if err != nil {
 		return gocql.ConvertError("AddTasks", err)
 	}
@@ -227,6 +281,23 @@ func (d *MutableStateTaskStore) GetHistoryTasks(
 	ctx context.Context,
 	request *p.GetHistoryTasksRequest,
 ) (*p.InternalGetHistoryTasksResponse, error) {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.GetHistoryTasks(ctx, request)
+	}
+	if d.layout.isTarget() {
+		return d.getBucketedHistoryTasks(ctx, request)
+	}
+	return d.getHistoryTasksFromPartition(ctx, request)
+}
+
+func (d *MutableStateTaskStore) getHistoryTasksFromPartition(
+	ctx context.Context,
+	request *p.GetHistoryTasksRequest,
+) (*p.InternalGetHistoryTasksResponse, error) {
 	switch request.TaskCategory.ID() {
 	case tasks.CategoryIDTransfer:
 		return d.getTransferTasks(ctx, request)
@@ -249,6 +320,43 @@ func (d *MutableStateTaskStore) CompleteHistoryTask(
 	if request.BestEffort {
 		return nil
 	}
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.CompleteHistoryTask(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.CompleteHistoryTask(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("CompleteHistoryTask", mirror.CompleteHistoryTask(ctx, request))
+	}
+	if d.layout.isTarget() {
+		partitions, err := d.layout.partitions(request.ShardID)
+		if err != nil {
+			return err
+		}
+		group, groupCtx := errgroup.WithContext(ctx)
+		group.SetLimit(min(len(partitions), 16))
+		for _, partition := range partitions {
+			partition := partition
+			group.Go(func() error {
+				partitionRequest := *request
+				partitionRequest.ShardID = partition
+				return d.completeHistoryTaskFromPartition(groupCtx, &partitionRequest)
+			})
+		}
+		return group.Wait()
+	}
+	return d.completeHistoryTaskFromPartition(ctx, request)
+}
+
+func (d *MutableStateTaskStore) completeHistoryTaskFromPartition(
+	ctx context.Context,
+	request *p.CompleteHistoryTaskRequest,
+) error {
 	switch request.TaskCategory.ID() {
 	case tasks.CategoryIDTransfer:
 		return d.completeTransferTask(ctx, request)
@@ -267,6 +375,43 @@ func (d *MutableStateTaskStore) RangeCompleteHistoryTasks(
 	ctx context.Context,
 	request *p.RangeCompleteHistoryTasksRequest,
 ) error {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.RangeCompleteHistoryTasks(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.RangeCompleteHistoryTasks(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("RangeCompleteHistoryTasks", mirror.RangeCompleteHistoryTasks(ctx, request))
+	}
+	if d.layout.isTarget() {
+		partitions, err := d.layout.partitions(request.ShardID)
+		if err != nil {
+			return err
+		}
+		group, groupCtx := errgroup.WithContext(ctx)
+		group.SetLimit(min(len(partitions), 16))
+		for _, partition := range partitions {
+			partition := partition
+			group.Go(func() error {
+				partitionRequest := *request
+				partitionRequest.ShardID = partition
+				return d.rangeCompleteHistoryTasksFromPartition(groupCtx, &partitionRequest)
+			})
+		}
+		return group.Wait()
+	}
+	return d.rangeCompleteHistoryTasksFromPartition(ctx, request)
+}
+
+func (d *MutableStateTaskStore) rangeCompleteHistoryTasksFromPartition(
+	ctx context.Context,
+	request *p.RangeCompleteHistoryTasksRequest,
+) error {
 	switch request.TaskCategory.ID() {
 	case tasks.CategoryIDTransfer:
 		return d.rangeCompleteTransferTasks(ctx, request)
@@ -281,13 +426,97 @@ func (d *MutableStateTaskStore) RangeCompleteHistoryTasks(
 	}
 }
 
+type executionTaskPageToken struct {
+	Version      int   `json:"version"`
+	CategoryID   int   `json:"categoryId"`
+	FireTimeNano int64 `json:"fireTimeNano"`
+	TaskID       int64 `json:"taskId"`
+}
+
+func (d *MutableStateTaskStore) getBucketedHistoryTasks(
+	ctx context.Context,
+	request *p.GetHistoryTasksRequest,
+) (*p.InternalGetHistoryTasksResponse, error) {
+	if request.BatchSize <= 0 {
+		return nil, serviceerror.NewInvalidArgument("GetHistoryTasks batch size must be positive")
+	}
+	minKey := request.InclusiveMinTaskKey
+	if len(request.NextPageToken) > 0 {
+		var token executionTaskPageToken
+		if err := json.Unmarshal(request.NextPageToken, &token); err != nil ||
+			token.Version != 1 || token.CategoryID != request.TaskCategory.ID() {
+			return nil, serviceerror.NewInvalidArgument("invalid executions_v2 history-task page token")
+		}
+		lastKey := tasks.NewKey(time.Unix(0, token.FireTimeNano).UTC(), token.TaskID)
+		if minKey.CompareTo(lastKey) <= 0 {
+			minKey = lastKey.Next()
+		}
+	}
+
+	partitions, err := d.layout.partitions(request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	responses := make([]*p.InternalGetHistoryTasksResponse, len(partitions))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(min(len(partitions), 16))
+	for index, partition := range partitions {
+		index, partition := index, partition
+		group.Go(func() error {
+			partitionRequest := *request
+			partitionRequest.ShardID = partition
+			partitionRequest.InclusiveMinTaskKey = minKey
+			partitionRequest.BatchSize = request.BatchSize + 1
+			partitionRequest.NextPageToken = nil
+			response, err := d.getHistoryTasksFromPartition(groupCtx, &partitionRequest)
+			if err != nil {
+				return err
+			}
+			responses[index] = response
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	allTasks := make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize))
+	hasMore := false
+	for _, response := range responses {
+		allTasks = append(allTasks, response.Tasks...)
+		hasMore = hasMore || len(response.NextPageToken) > 0
+	}
+
+	sort.Slice(allTasks, func(i, j int) bool {
+		return allTasks[i].Key.CompareTo(allTasks[j].Key) < 0
+	})
+	if len(allTasks) > request.BatchSize {
+		allTasks = allTasks[:request.BatchSize]
+		hasMore = true
+	}
+	response := &p.InternalGetHistoryTasksResponse{Tasks: allTasks}
+	if hasMore && len(allTasks) > 0 {
+		lastKey := allTasks[len(allTasks)-1].Key
+		response.NextPageToken, err = json.Marshal(executionTaskPageToken{
+			Version:      1,
+			CategoryID:   request.TaskCategory.ID(),
+			FireTimeNano: lastKey.FireTime.UnixNano(), //nolint:forbidigo // This is page-token precision, not a Cassandra timestamp.
+			TaskID:       lastKey.TaskID,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return response, nil
+}
+
 func (d *MutableStateTaskStore) getTransferTasks(
 	ctx context.Context,
 	request *p.GetHistoryTasksRequest,
 ) (*p.InternalGetHistoryTasksResponse, error) {
 
 	// Reading transfer tasks need to be quorum level consistent, otherwise we could lose task
-	query := d.Session.Query(templateGetTransferTasksQuery,
+	query := d.Session.Query(d.layout.query(templateGetTransferTasksQuery),
 		request.ShardID,
 		rowTypeTransferTask,
 		rowTypeTransferNamespaceID,
@@ -299,7 +528,9 @@ func (d *MutableStateTaskStore) getTransferTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -329,7 +560,7 @@ func (d *MutableStateTaskStore) completeTransferTask(
 	ctx context.Context,
 	request *p.CompleteHistoryTaskRequest,
 ) error {
-	query := d.Session.Query(templateCompleteTransferTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeTransferTask,
 		rowTypeTransferNamespaceID,
@@ -337,17 +568,18 @@ func (d *MutableStateTaskStore) completeTransferTask(
 		rowTypeTransferRunID,
 		defaultVisibilityTimestamp,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("CompleteTransferTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"CompleteTransferTask", templateCompleteTransferTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) rangeCompleteTransferTasks(
 	ctx context.Context,
 	request *p.RangeCompleteHistoryTasksRequest,
 ) error {
-	query := d.Session.Query(templateRangeCompleteTransferTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeTransferTask,
 		rowTypeTransferNamespaceID,
@@ -356,10 +588,11 @@ func (d *MutableStateTaskStore) rangeCompleteTransferTasks(
 		defaultVisibilityTimestamp,
 		request.InclusiveMinTaskKey.TaskID,
 		request.ExclusiveMaxTaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("RangeCompleteTransferTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"RangeCompleteTransferTask", templateRangeCompleteTransferTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) getTimerTasks(
@@ -369,18 +602,39 @@ func (d *MutableStateTaskStore) getTimerTasks(
 	// Reading timer tasks need to be quorum level consistent, otherwise we could lose tasks
 	minTimestamp := p.UnixMilliseconds(request.InclusiveMinTaskKey.FireTime)
 	maxTimestamp := p.UnixMilliseconds(request.ExclusiveMaxTaskKey.FireTime)
-	query := d.Session.Query(templateGetTimerTasksQuery,
-		request.ShardID,
-		rowTypeTimerTask,
-		rowTypeTimerNamespaceID,
-		rowTypeTimerWorkflowID,
-		rowTypeTimerRunID,
-		minTimestamp,
-		maxTimestamp,
-	).WithContext(ctx)
+	var query gocql.Query
+	if d.layout.isTarget() {
+		query = d.Session.Query(d.layout.query(templateGetTimerTasksTargetQuery),
+			request.ShardID,
+			rowTypeTimerTask,
+			rowTypeTimerNamespaceID,
+			rowTypeTimerWorkflowID,
+			rowTypeTimerRunID,
+			minTimestamp,
+			request.InclusiveMinTaskKey.TaskID,
+			rowTypeTimerTask,
+			rowTypeTimerNamespaceID,
+			rowTypeTimerWorkflowID,
+			rowTypeTimerRunID,
+			maxTimestamp,
+			request.ExclusiveMaxTaskKey.TaskID,
+		).WithContext(ctx)
+	} else {
+		query = d.Session.Query(d.layout.query(templateGetTimerTasksQuery),
+			request.ShardID,
+			rowTypeTimerTask,
+			rowTypeTimerNamespaceID,
+			rowTypeTimerWorkflowID,
+			rowTypeTimerRunID,
+			minTimestamp,
+			maxTimestamp,
+		).WithContext(ctx)
+	}
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
+	}
 	var timestamp time.Time
 	var taskID int64
 	var data []byte
@@ -413,7 +667,7 @@ func (d *MutableStateTaskStore) completeTimerTask(
 	request *p.CompleteHistoryTaskRequest,
 ) error {
 	ts := p.UnixMilliseconds(request.TaskKey.FireTime)
-	query := d.Session.Query(templateCompleteTimerTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeTimerTask,
 		rowTypeTimerNamespaceID,
@@ -421,10 +675,11 @@ func (d *MutableStateTaskStore) completeTimerTask(
 		rowTypeTimerRunID,
 		ts,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("CompleteTimerTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"CompleteTimerTask", templateCompleteTimerTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) rangeCompleteTimerTasks(
@@ -433,7 +688,7 @@ func (d *MutableStateTaskStore) rangeCompleteTimerTasks(
 ) error {
 	start := p.UnixMilliseconds(request.InclusiveMinTaskKey.FireTime)
 	end := p.UnixMilliseconds(request.ExclusiveMaxTaskKey.FireTime)
-	query := d.Session.Query(templateRangeCompleteTimerTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeTimerTask,
 		rowTypeTimerNamespaceID,
@@ -441,10 +696,11 @@ func (d *MutableStateTaskStore) rangeCompleteTimerTasks(
 		rowTypeTimerRunID,
 		start,
 		end,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("RangeCompleteTimerTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"RangeCompleteTimerTask", templateRangeCompleteTimerTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) getReplicationTasks(
@@ -453,7 +709,7 @@ func (d *MutableStateTaskStore) getReplicationTasks(
 ) (*p.InternalGetHistoryTasksResponse, error) {
 
 	// Reading replication tasks need to be quorum level consistent, otherwise we could lose task
-	query := d.Session.Query(templateGetReplicationTasksQuery,
+	query := d.Session.Query(d.layout.query(templateGetReplicationTasksQuery),
 		request.ShardID,
 		rowTypeReplicationTask,
 		rowTypeReplicationNamespaceID,
@@ -471,7 +727,7 @@ func (d *MutableStateTaskStore) completeReplicationTask(
 	ctx context.Context,
 	request *p.CompleteHistoryTaskRequest,
 ) error {
-	query := d.Session.Query(templateCompleteReplicationTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeReplicationTask,
 		rowTypeReplicationNamespaceID,
@@ -479,17 +735,18 @@ func (d *MutableStateTaskStore) completeReplicationTask(
 		rowTypeReplicationRunID,
 		defaultVisibilityTimestamp,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("CompleteReplicationTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"CompleteReplicationTask", templateCompleteReplicationTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) rangeCompleteReplicationTasks(
 	ctx context.Context,
 	request *p.RangeCompleteHistoryTasksRequest,
 ) error {
-	query := d.Session.Query(templateRangeCompleteReplicationTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeReplicationTask,
 		rowTypeReplicationNamespaceID,
@@ -498,25 +755,43 @@ func (d *MutableStateTaskStore) rangeCompleteReplicationTasks(
 		defaultVisibilityTimestamp,
 		request.InclusiveMinTaskKey.TaskID,
 		request.ExclusiveMaxTaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("RangeCompleteReplicationTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"RangeCompleteReplicationTask", templateRangeCompleteReplicationTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) PutReplicationTaskToDLQ(
 	ctx context.Context,
 	request *p.PutReplicationTaskToDLQRequest,
 ) error {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.PutReplicationTaskToDLQ(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.PutReplicationTaskToDLQ(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("PutReplicationTaskToDLQ", mirror.PutReplicationTaskToDLQ(ctx, request))
+	}
 	task := request.TaskInfo
 	datablob, err := d.serializer.ReplicationTaskInfoToBlob(task)
 	if err != nil {
 		return gocql.ConvertError("PutReplicationTaskToDLQ", err)
 	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, rowTypeDLQNamespaceID, request.SourceClusterName)
+	if err != nil {
+		return err
+	}
 
 	// Use source cluster name as the workflow id for replication dlq
-	query := d.Session.Query(templateCreateReplicationTaskQuery,
-		request.ShardID,
+	args := []any{
+		shardID,
 		rowTypeDLQ,
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
@@ -525,23 +800,31 @@ func (d *MutableStateTaskStore) PutReplicationTaskToDLQ(
 		datablob.EncodingType.String(),
 		defaultVisibilityTimestamp,
 		task.GetTaskId(),
-	).WithContext(ctx)
-
-	err = query.Exec()
-	if err != nil {
-		return gocql.ConvertError("PutReplicationTaskToDLQ", err)
 	}
-
-	return nil
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, shardID,
+		"PutReplicationTaskToDLQ", templateCreateReplicationTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) GetReplicationTasksFromDLQ(
 	ctx context.Context,
 	request *p.GetReplicationTasksFromDLQRequest,
 ) (*p.InternalGetHistoryTasksResponse, error) {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != d {
+		return resolved.GetReplicationTasksFromDLQ(ctx, request)
+	}
 	// Reading replication tasks need to be quorum level consistent, otherwise we could lose tasks
-	query := d.Session.Query(templateGetReplicationTasksQuery,
-		request.ShardID,
+	shardID, err := d.layout.workflowPartition(request.ShardID, rowTypeDLQNamespaceID, request.SourceClusterName)
+	if err != nil {
+		return nil, err
+	}
+	query := d.Session.Query(d.layout.query(templateGetReplicationTasksQuery),
+		shardID,
 		rowTypeDLQ,
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
@@ -558,28 +841,63 @@ func (d *MutableStateTaskStore) DeleteReplicationTaskFromDLQ(
 	ctx context.Context,
 	request *p.DeleteReplicationTaskFromDLQRequest,
 ) error {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.DeleteReplicationTaskFromDLQ(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.DeleteReplicationTaskFromDLQ(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("DeleteReplicationTaskFromDLQ", mirror.DeleteReplicationTaskFromDLQ(ctx, request))
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, rowTypeDLQNamespaceID, request.SourceClusterName)
+	if err != nil {
+		return err
+	}
 
-	query := d.Session.Query(templateCompleteReplicationTaskQuery,
-		request.ShardID,
+	args := []any{
+		shardID,
 		rowTypeDLQ,
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
 		rowTypeDLQRunID,
 		defaultVisibilityTimestamp,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("DeleteReplicationTaskFromDLQ", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, shardID,
+		"DeleteReplicationTaskFromDLQ", templateCompleteReplicationTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) RangeDeleteReplicationTaskFromDLQ(
 	ctx context.Context,
 	request *p.RangeDeleteReplicationTaskFromDLQRequest,
 ) error {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if resolved != d {
+		return resolved.RangeDeleteReplicationTaskFromDLQ(ctx, request)
+	}
+	if primary, mirror, ok := d.migrationStores(); ok {
+		if err := primary.RangeDeleteReplicationTaskFromDLQ(ctx, request); err != nil {
+			return err
+		}
+		return d.handleMirrorError("RangeDeleteReplicationTaskFromDLQ", mirror.RangeDeleteReplicationTaskFromDLQ(ctx, request))
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, rowTypeDLQNamespaceID, request.SourceClusterName)
+	if err != nil {
+		return err
+	}
 
-	query := d.Session.Query(templateRangeCompleteReplicationTaskQuery,
-		request.ShardID,
+	args := []any{
+		shardID,
 		rowTypeDLQ,
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
@@ -587,19 +905,31 @@ func (d *MutableStateTaskStore) RangeDeleteReplicationTaskFromDLQ(
 		defaultVisibilityTimestamp,
 		request.InclusiveMinTaskKey.TaskID,
 		request.ExclusiveMaxTaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("RangeDeleteReplicationTaskFromDLQ", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, shardID,
+		"RangeDeleteReplicationTaskFromDLQ", templateRangeCompleteReplicationTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) IsReplicationDLQEmpty(
 	ctx context.Context,
 	request *p.GetReplicationTasksFromDLQRequest,
 ) (bool, error) {
+	resolved, err := d.forExecutionShard(ctx, request.ShardID)
+	if err != nil {
+		return true, err
+	}
+	if resolved != d {
+		return resolved.IsReplicationDLQEmpty(ctx, request)
+	}
+	shardID, err := d.layout.workflowPartition(request.ShardID, rowTypeDLQNamespaceID, request.SourceClusterName)
+	if err != nil {
+		return true, err
+	}
 
-	query := d.Session.Query(templateIsQueueEmptyQuery,
-		request.ShardID,
+	query := d.Session.Query(d.layout.query(templateIsQueueEmptyQuery),
+		shardID,
 		rowTypeDLQ,
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
@@ -623,7 +953,7 @@ func (d *MutableStateTaskStore) getVisibilityTasks(
 ) (*p.InternalGetHistoryTasksResponse, error) {
 
 	// Reading Visibility tasks need to be quorum level consistent, otherwise we could lose task
-	query := d.Session.Query(templateGetVisibilityTasksQuery,
+	query := d.Session.Query(d.layout.query(templateGetVisibilityTasksQuery),
 		request.ShardID,
 		rowTypeVisibilityTask,
 		rowTypeVisibilityTaskNamespaceID,
@@ -635,7 +965,9 @@ func (d *MutableStateTaskStore) getVisibilityTasks(
 	).WithContext(ctx)
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -665,7 +997,7 @@ func (d *MutableStateTaskStore) completeVisibilityTask(
 	ctx context.Context,
 	request *p.CompleteHistoryTaskRequest,
 ) error {
-	query := d.Session.Query(templateCompleteVisibilityTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeVisibilityTask,
 		rowTypeVisibilityTaskNamespaceID,
@@ -673,17 +1005,18 @@ func (d *MutableStateTaskStore) completeVisibilityTask(
 		rowTypeVisibilityTaskRunID,
 		defaultVisibilityTimestamp,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("CompleteVisibilityTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"CompleteVisibilityTask", templateCompleteVisibilityTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) rangeCompleteVisibilityTasks(
 	ctx context.Context,
 	request *p.RangeCompleteHistoryTasksRequest,
 ) error {
-	query := d.Session.Query(templateRangeCompleteVisibilityTaskQuery,
+	args := []any{
 		request.ShardID,
 		rowTypeVisibilityTask,
 		rowTypeVisibilityTaskNamespaceID,
@@ -692,10 +1025,11 @@ func (d *MutableStateTaskStore) rangeCompleteVisibilityTasks(
 		defaultVisibilityTimestamp,
 		request.InclusiveMinTaskKey.TaskID,
 		request.ExclusiveMaxTaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("RangeCompleteVisibilityTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"RangeCompleteVisibilityTask", templateRangeCompleteVisibilityTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) populateGetReplicationTasksResponse(
@@ -751,7 +1085,7 @@ func (d *MutableStateTaskStore) getHistoryImmedidateTasks(
 	// execution manager should already validated the request
 	// Reading history tasks need to be quorum level consistent, otherwise we could lose task
 
-	query := d.Session.Query(templateGetHistoryImmediateTasksQuery,
+	query := d.Session.Query(d.layout.query(templateGetHistoryImmediateTasksQuery),
 		request.ShardID,
 		request.TaskCategory.ID(),
 		rowTypeHistoryTaskNamespaceID,
@@ -764,7 +1098,9 @@ func (d *MutableStateTaskStore) getHistoryImmedidateTasks(
 
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
+	}
 	var taskID int64
 	var data []byte
 	var encoding string
@@ -799,19 +1135,40 @@ func (d *MutableStateTaskStore) getHistoryScheduledTasks(
 
 	minTimestamp := p.UnixMilliseconds(request.InclusiveMinTaskKey.FireTime)
 	maxTimestamp := p.UnixMilliseconds(request.ExclusiveMaxTaskKey.FireTime)
-	query := d.Session.Query(templateGetHistoryScheduledTasksQuery,
-		request.ShardID,
-		request.TaskCategory.ID(),
-		rowTypeHistoryTaskNamespaceID,
-		rowTypeHistoryTaskWorkflowID,
-		rowTypeHistoryTaskRunID,
-		minTimestamp,
-		maxTimestamp,
-	).WithContext(ctx)
+	var query gocql.Query
+	if d.layout.isTarget() {
+		query = d.Session.Query(d.layout.query(templateGetHistoryScheduledTasksTargetQuery),
+			request.ShardID,
+			request.TaskCategory.ID(),
+			rowTypeHistoryTaskNamespaceID,
+			rowTypeHistoryTaskWorkflowID,
+			rowTypeHistoryTaskRunID,
+			minTimestamp,
+			request.InclusiveMinTaskKey.TaskID,
+			request.TaskCategory.ID(),
+			rowTypeHistoryTaskNamespaceID,
+			rowTypeHistoryTaskWorkflowID,
+			rowTypeHistoryTaskRunID,
+			maxTimestamp,
+			request.ExclusiveMaxTaskKey.TaskID,
+		).WithContext(ctx)
+	} else {
+		query = d.Session.Query(d.layout.query(templateGetHistoryScheduledTasksQuery),
+			request.ShardID,
+			request.TaskCategory.ID(),
+			rowTypeHistoryTaskNamespaceID,
+			rowTypeHistoryTaskWorkflowID,
+			rowTypeHistoryTaskRunID,
+			minTimestamp,
+			maxTimestamp,
+		).WithContext(ctx)
+	}
 
 	iter := query.PageSize(request.BatchSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetHistoryTasksResponse{}
+	response := &p.InternalGetHistoryTasksResponse{
+		Tasks: make([]p.InternalHistoryTask, 0, preallocatedResultCapacity(request.BatchSize)),
+	}
 	var timestamp time.Time
 	var taskID int64
 	var data []byte
@@ -847,7 +1204,7 @@ func (d *MutableStateTaskStore) completeHistoryTask(
 	if request.TaskCategory.Type() == tasks.CategoryTypeScheduled {
 		ts = p.UnixMilliseconds(request.TaskKey.FireTime)
 	}
-	query := d.Session.Query(templateCompleteHistoryTaskQuery,
+	args := []any{
 		request.ShardID,
 		request.TaskCategory.ID(),
 		rowTypeHistoryTaskNamespaceID,
@@ -855,10 +1212,11 @@ func (d *MutableStateTaskStore) completeHistoryTask(
 		rowTypeHistoryTaskRunID,
 		ts,
 		request.TaskKey.TaskID,
-	).WithContext(ctx)
-
-	err := query.Exec()
-	return gocql.ConvertError("CompleteHistoryTask", err)
+	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"CompleteHistoryTask", templateCompleteHistoryTaskQuery, args, false,
+	)
 }
 
 func (d *MutableStateTaskStore) rangeCompleteHistoryTasks(
@@ -866,9 +1224,13 @@ func (d *MutableStateTaskStore) rangeCompleteHistoryTasks(
 	request *p.RangeCompleteHistoryTasksRequest,
 ) error {
 	// execution manager should already validated the request
-	var query gocql.Query
+	var (
+		query string
+		args  []any
+	)
 	if request.TaskCategory.Type() == tasks.CategoryTypeImmediate {
-		query = d.Session.Query(templateRangeCompleteHistoryImmediateTasksQuery,
+		query = templateRangeCompleteHistoryImmediateTasksQuery
+		args = []any{
 			request.ShardID,
 			request.TaskCategory.ID(),
 			rowTypeHistoryTaskNamespaceID,
@@ -877,11 +1239,12 @@ func (d *MutableStateTaskStore) rangeCompleteHistoryTasks(
 			defaultVisibilityTimestamp,
 			request.InclusiveMinTaskKey.TaskID,
 			request.ExclusiveMaxTaskKey.TaskID,
-		).WithContext(ctx)
+		}
 	} else {
 		minTimestamp := p.UnixMilliseconds(request.InclusiveMinTaskKey.FireTime)
 		maxTimestamp := p.UnixMilliseconds(request.ExclusiveMaxTaskKey.FireTime)
-		query = d.Session.Query(templateRangeCompleteHistoryScheduledTasksQuery,
+		query = templateRangeCompleteHistoryScheduledTasksQuery
+		args = []any{
 			request.ShardID,
 			request.TaskCategory.ID(),
 			rowTypeHistoryTaskNamespaceID,
@@ -889,9 +1252,51 @@ func (d *MutableStateTaskStore) rangeCompleteHistoryTasks(
 			rowTypeHistoryTaskRunID,
 			minTimestamp,
 			maxTimestamp,
-		).WithContext(ctx)
+		}
 	}
+	return executeGuardedExecutionMutation(
+		ctx, d.Session, d.layout, request.ShardID, request.ShardID,
+		"RangeCompleteHistoryTasks", query, args, false,
+	)
+}
 
-	err := query.Exec()
-	return gocql.ConvertError("RangeCompleteHistoryTasks", err)
+func (d *MutableStateTaskStore) migrationStores() (primaryStore *MutableStateTaskStore, mirrorStore *MutableStateTaskStore, hasMirror bool) {
+	mirrorLayout, ok := d.layout.mirrorLayout()
+	if !ok {
+		return nil, nil, false
+	}
+	primary := *d
+	primary.layout = d.layout.authoritativeLayout()
+	mirror := *d
+	mirror.layout = mirrorLayout
+	return &primary, &mirror, true
+}
+
+func (d *MutableStateTaskStore) forExecutionShard(
+	ctx context.Context,
+	shardID int32,
+) (*MutableStateTaskStore, error) {
+	layout, err := resolveTargetDualExecutionLayout(ctx, d.Session, d.layout, shardID)
+	if err != nil {
+		return nil, err
+	}
+	if layout == d.layout {
+		return d, nil
+	}
+	resolved := *d
+	resolved.layout = layout
+	return &resolved, nil
+}
+
+func (d *MutableStateTaskStore) handleMirrorError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if d.layout.mirrorRequired() {
+		return fmt.Errorf("mirror %s: %w", operation, err)
+	}
+	if d.logger != nil {
+		d.logger.Warn("Cassandra executions source-rebuild task mirror failed", tag.Operation(operation), tag.Error(err))
+	}
+	return nil
 }

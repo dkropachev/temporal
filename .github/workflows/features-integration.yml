@@ -44,6 +44,13 @@ jobs:
         env:
           BRANCH_TAG: ${{ steps.build-docker.outputs.branch-tag }}
         run: |
+          for image in server admin-tools; do
+            container=$(docker create "temporaliotest/${image}:${BRANCH_TAG}")
+            docker commit \
+              --change 'ENV CASSANDRA_DISABLE_INITIAL_HOST_LOOKUP=true' \
+              "$container" "temporaliotest/${image}:${BRANCH_TAG}"
+            docker rm "$container"
+          done
           docker save "temporaliotest/server:${BRANCH_TAG}" -o /tmp/temporal-server.tar
           docker save "temporaliotest/admin-tools:${BRANCH_TAG}" -o /tmp/temporal-admin-tools.tar
           echo "${BRANCH_TAG}" > /tmp/image_tag

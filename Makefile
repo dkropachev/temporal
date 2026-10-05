@@ -632,13 +632,20 @@ install-schema-xdc: temporal-cassandra-tool temporal-elasticsearch-tool
 	./temporal-elasticsearch-tool -ep http://127.0.0.1:9200 create-index --index temporal_visibility_v1_dev_cluster_c
 
 ##### Run server #####
-DOCKER_COMPOSE_FILES     := -f ./develop/docker-compose/docker-compose.yml -f ./develop/docker-compose/docker-compose.$(GOOS).yml
-DOCKER_COMPOSE_CDC_FILES := -f ./develop/docker-compose/docker-compose.cdc.yml -f ./develop/docker-compose/docker-compose.cdc.$(GOOS).yml
+DOCKER_COMPOSE_FILES        := -f ./develop/docker-compose/docker-compose.yml -f ./develop/docker-compose/docker-compose.$(GOOS).yml
+DOCKER_COMPOSE_CDC_FILES    := -f ./develop/docker-compose/docker-compose.cdc.yml -f ./develop/docker-compose/docker-compose.cdc.$(GOOS).yml
+DOCKER_COMPOSE_SCYLLA_FILES := -f ./develop/docker-compose/docker-compose.scylla.yml
 start-dependencies:
 	docker compose $(DOCKER_COMPOSE_FILES) up
 
 stop-dependencies:
 	docker compose $(DOCKER_COMPOSE_FILES) down
+
+start-dependencies-scylla:
+	docker compose $(DOCKER_COMPOSE_FILES) $(DOCKER_COMPOSE_SCYLLA_FILES) up
+
+stop-dependencies-scylla:
+	docker compose $(DOCKER_COMPOSE_FILES) $(DOCKER_COMPOSE_SCYLLA_FILES) down
 
 start-dependencies-dual:
 	docker compose $(DOCKER_COMPOSE_FILES) -f ./develop/docker-compose/docker-compose.secondary-es.yml up

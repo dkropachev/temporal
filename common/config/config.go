@@ -25,6 +25,35 @@ const (
 	infinity = time.Duration(math.MaxInt64)
 )
 
+// CassandraHistoryNodeMigrationMode selects the history table topology used during an online migration.
+type CassandraHistoryNodeMigrationMode string
+
+// CassandraExecutionMigrationMode selects the executions table topology used by Cassandra persistence.
+type CassandraExecutionMigrationMode string
+
+const (
+	CassandraHistoryNodeMigrationModeLegacyV1RebuildV2       CassandraHistoryNodeMigrationMode = "legacy-v1-rebuild-v2"
+	CassandraHistoryNodeMigrationModeLegacyV1Dual            CassandraHistoryNodeMigrationMode = "legacy-v1-dual"
+	CassandraHistoryNodeMigrationModeLegacyV1RollbackDual    CassandraHistoryNodeMigrationMode = "legacy-v1-rollback-dual"
+	CassandraHistoryNodeMigrationModeLegacyV1CutoverDual     CassandraHistoryNodeMigrationMode = "legacy-v1-cutover-dual"
+	CassandraHistoryNodeMigrationModeOldV2RebuildV2          CassandraHistoryNodeMigrationMode = "old-v2-rebuild-v2"
+	CassandraHistoryNodeMigrationModeOldV2Dual               CassandraHistoryNodeMigrationMode = "old-v2-dual"
+	CassandraHistoryNodeMigrationModeOldV2PrepareCutoverDual CassandraHistoryNodeMigrationMode = "old-v2-prepare-cutover-dual"
+	CassandraHistoryNodeMigrationModeOldV2CutoverDual        CassandraHistoryNodeMigrationMode = "old-v2-cutover-dual"
+	CassandraHistoryNodeMigrationModeV1RebuildDual           CassandraHistoryNodeMigrationMode = "v1-rebuild-dual"
+	CassandraHistoryNodeMigrationModeV1CutoverDual           CassandraHistoryNodeMigrationMode = "v1-cutover-dual"
+	CassandraHistoryNodeMigrationModeV2Only                  CassandraHistoryNodeMigrationMode = "v2-only"
+	CassandraHistoryNodeMigrationModeCanonicalDual           CassandraHistoryNodeMigrationMode = "canonical-dual"
+)
+
+const (
+	CassandraExecutionMigrationModeLegacy        CassandraExecutionMigrationMode = "legacy"
+	CassandraExecutionMigrationModeSourceRebuild CassandraExecutionMigrationMode = "source-rebuild"
+	CassandraExecutionMigrationModeSourceDual    CassandraExecutionMigrationMode = "source-dual"
+	CassandraExecutionMigrationModeTargetDual    CassandraExecutionMigrationMode = "target-dual"
+	CassandraExecutionMigrationModeTargetOnly    CassandraExecutionMigrationMode = "target-only"
+)
+
 type (
 	// Config contains the configuration for a set of temporal services
 	Config struct {
@@ -365,6 +394,8 @@ type (
 		// MaxPreparedStmts is the maximum number of prepared statements cached by the gocql client.
 		// Non-positive values use the default of 6000.
 		MaxPreparedStmts int `yaml:"maxPreparedStmts"`
+		// MaxExcessShardConnectionsRate limits excess Scylla shard-aware connections per shard
+		MaxExcessShardConnectionsRate *float32 `yaml:"maxExcessShardConnectionsRate"`
 		// ConnectTimeout is a timeout for initial dial to cassandra server (default: 600 milliseconds)
 		ConnectTimeout time.Duration `yaml:"connectTimeout"`
 		// Timeout is a timeout for reads and, unless otherwise specified, writes. If not specified, ConnectTimeout is used.
@@ -377,6 +408,30 @@ type (
 		Consistency *CassandraStoreConsistency `yaml:"consistency"`
 		// DisableInitialHostLookup instructs the gocql client to connect only using the supplied hosts
 		DisableInitialHostLookup bool `yaml:"disableInitialHostLookup"`
+		// HistoryNodeMigrationMode controls history node reads and writes during Cassandra primary-key migration.
+		HistoryNodeMigrationMode CassandraHistoryNodeMigrationMode `yaml:"historyNodeMigrationMode"`
+		// HistoryTreeMigrationMode controls history tree reads and writes during Cassandra primary-key migration.
+		HistoryTreeMigrationMode CassandraHistoryTreeMigrationMode `yaml:"historyTreeMigrationMode"`
+		// ExecutionMigrationMode controls executions table reads and writes during Cassandra primary-key migration.
+		ExecutionMigrationMode CassandraExecutionMigrationMode `yaml:"executionMigrationMode"`
+		// ExecutionStorageBuckets is the immutable number of storage partitions per history shard in executions_v2.
+		ExecutionStorageBuckets int `yaml:"executionStorageBuckets"`
+		// QueueV2MigrationMode controls QueueV2 metadata reads and writes during Cassandra primary-key migration.
+		QueueV2MigrationMode CassandraQueueV2MigrationMode `yaml:"queueV2MigrationMode"`
+		// QueueV2MessageBucketSpan is immutable for a queue_messages_v3 layout generation.
+		QueueV2MessageBucketSpan int64 `yaml:"queueV2MessageBucketSpan"`
+		// LegacyQueueMigrationMode controls legacy queue message reads and writes during Cassandra migration.
+		LegacyQueueMigrationMode CassandraLegacyQueueMigrationMode `yaml:"legacyQueueMigrationMode"`
+		// LegacyQueueMessageBucketSize is immutable for a legacy_queue_v2 layout generation.
+		LegacyQueueMessageBucketSize int64 `yaml:"legacyQueueMessageBucketSize"`
+		// MatchingTaskMigrationMode controls matching task table reads and writes during Cassandra migration.
+		MatchingTaskMigrationMode CassandraMatchingTaskMigrationMode `yaml:"matchingTaskMigrationMode"`
+		// MatchingTaskStorageBucketCount is immutable for a tasks_v3 layout generation.
+		MatchingTaskStorageBucketCount int `yaml:"matchingTaskStorageBucketCount"`
+		// TaskQueueUserDataMigrationMode controls worker-versioning metadata reads and writes during Cassandra migration.
+		TaskQueueUserDataMigrationMode CassandraTaskQueueUserDataMigrationMode `yaml:"taskQueueUserDataMigrationMode"`
+		// TaskQueueUserDataBucketCount is immutable for a task_queue_user_data_v2 layout generation.
+		TaskQueueUserDataBucketCount int `yaml:"taskQueueUserDataBucketCount"`
 		// AddressTranslator translates Cassandra IP addresses, used for cases when IP addresses gocql driver returns are not accessible from the server
 		AddressTranslator *CassandraAddressTranslator `yaml:"addressTranslator"`
 	}

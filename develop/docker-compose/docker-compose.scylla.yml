@@ -1,0 +1,27 @@
+# Replaces the default Cassandra dependency with ScyllaDB.
+services:
+  cassandra:
+    image: scylladb/scylla:2026.1
+    ports:
+      - "19042:19042"
+    environment:
+      CASSANDRA_LISTEN_ADDRESS: null
+      MAX_HEAP_SIZE: null
+      HEAP_NEWSIZE: null
+    command:
+      - --smp
+      - "1"
+      - --memory
+      - 2G
+      - --overprovisioned
+      - "1"
+      - --developer-mode
+      - "1"
+      - --api-address
+      - 0.0.0.0
+      - --listen-address
+      - 0.0.0.0
+      - --rpc-address
+      - 0.0.0.0
+      - --broadcast-rpc-address
+      - 127.0.0.1

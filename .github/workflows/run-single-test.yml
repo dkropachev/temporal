@@ -78,6 +78,7 @@ jobs:
       matrix:
         name:
           - cass_es
+          - scylla_es
           - cass_es8
           - cass_os2
           - cass_os3
@@ -90,6 +91,11 @@ jobs:
             persistence_type: nosql
             persistence_driver: cassandra
             containers: [cassandra, elasticsearch]
+            runs_on_override: ubuntu-latest-8-cores
+          - name: scylla_es
+            persistence_type: nosql
+            persistence_driver: cassandra
+            containers: [scylla, elasticsearch]
             runs_on_override: ubuntu-latest-8-cores
           - name: cass_es8
             persistence_type: nosql

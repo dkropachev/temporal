@@ -1,11 +1,13 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +31,9 @@ const (
 	// TODO hard code this dir for now
 	//  need to merge persistence test config / initialization in one place
 	testCassandraExecutionSchema = "../../../schema/cassandra/temporal/schema.cql"
+
+	testCassandraMaxConnsEnv                  = "CASSANDRA_MAX_CONNS"
+	testCassandraMaxExcessShardConnectionsEnv = "CASSANDRA_MAX_EXCESS_SHARD_CONNECTIONS_RATE"
 )
 
 // TODO merge the initialization with existing persistence setup
@@ -49,12 +54,39 @@ type (
 	}
 )
 
-func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
+func setUpCassandraTest(t testing.TB) (CassandraTestData, func()) {
+	return setUpCassandraTestWithConfig(t, nil)
+}
+
+func setUpCassandraTestWithHistoryNodeV2Reads(t testing.TB) (CassandraTestData, func()) {
+	return setUpCassandraTestWithHistoryNodeMigrationMode(
+		t,
+		config.CassandraHistoryNodeMigrationModeCanonicalDual,
+	)
+}
+
+func setUpCassandraTestWithHistoryNodeMigrationMode(
+	t testing.TB,
+	mode config.CassandraHistoryNodeMigrationMode,
+) (CassandraTestData, func()) {
+	return setUpCassandraTestWithConfig(t, func(cfg *config.Cassandra) {
+		cfg.HistoryNodeMigrationMode = mode
+	})
+}
+
+func setUpCassandraTestWithConfig(
+	t testing.TB,
+	configure func(*config.Cassandra),
+) (CassandraTestData, func()) {
 	var testData CassandraTestData
 	testData.Cfg = NewCassandraConfig()
+	if configure != nil {
+		configure(testData.Cfg)
+	}
 	testData.Logger = log.NewZapLogger(zaptest.NewLogger(t))
 	SetUpCassandraDatabase(t, testData.Cfg, testData.Logger)
 	SetUpCassandraSchema(t, testData.Cfg, testData.Logger)
+	initializeCassandraTargetOnlyLayouts(t, testData.Cfg, testData.Logger)
 
 	testData.Factory = cassandra.NewFactory(
 		*testData.Cfg,
@@ -73,7 +105,77 @@ func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
 	return testData, tearDown
 }
 
-func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func initializeCassandraTargetOnlyLayouts(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
+	t.Helper()
+	session := newCassandraTestSession(t, cfg, logger)
+	defer session.Close()
+	initialize := func(name cassandra.SchemaLayoutName, table string, parameter int64) {
+		t.Helper()
+		if err := cassandra.InitializeSchemaLayoutTargetOnly(
+			context.Background(), session, cfg.Keyspace, name, table, parameter,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cfg.ExecutionMigrationMode == config.CassandraExecutionMigrationModeTargetOnly {
+		buckets := cfg.ExecutionStorageBuckets
+		if buckets == 0 {
+			buckets = 16
+		}
+		initialize(cassandra.SchemaLayoutExecutions, "executions_v2", int64(buckets))
+	}
+	if cfg.HistoryNodeMigrationMode == config.CassandraHistoryNodeMigrationModeV2Only {
+		initialize(cassandra.SchemaLayoutHistoryNode, "history_node_v2", 0)
+	}
+	if cfg.HistoryTreeMigrationMode == config.CassandraHistoryTreeMigrationModeTargetOnly {
+		initialize(cassandra.SchemaLayoutHistoryTree, "history_tree_v2", 16)
+	}
+	if cfg.QueueV2MigrationMode == config.CassandraQueueV2MigrationModeTargetOnly {
+		span := cfg.QueueV2MessageBucketSpan
+		if span == 0 {
+			span = cassandra.DefaultQueueV2MessageBucketSpan
+		}
+		initialize(cassandra.SchemaLayoutQueueV2Metadata, "queues_v2", 64)
+		initialize(cassandra.SchemaLayoutQueueV2Messages, "queue_messages_v3", span)
+	}
+	if cfg.LegacyQueueMigrationMode == config.CassandraLegacyQueueMigrationModeTargetOnly {
+		span := cfg.LegacyQueueMessageBucketSize
+		if span == 0 {
+			span = cassandra.DefaultLegacyQueueV2MessageBucketSize
+		}
+		initialize(cassandra.SchemaLayoutLegacyQueue, "legacy_queue_v2_messages", span)
+		for _, queueType := range []p.QueueType{
+			p.NamespaceReplicationQueueType,
+			-p.NamespaceReplicationQueueType,
+		} {
+			if err := cassandra.InitializeEmptyLegacyQueueV2Target(
+				context.Background(),
+				session,
+				queueType,
+				span,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if cfg.MatchingTaskMigrationMode == config.CassandraMatchingTaskMigrationModeTargetOnly {
+		buckets := cfg.MatchingTaskStorageBucketCount
+		if buckets == 0 {
+			buckets = cassandra.DefaultMatchingTaskStorageBucketCount
+		}
+		initialize(cassandra.SchemaLayoutMatchingTasks, "tasks_v3", int64(buckets))
+		initialize(cassandra.SchemaLayoutMatchingTasksFair, "tasks_v3_fair", int64(buckets))
+	}
+	if cfg.TaskQueueUserDataMigrationMode == config.CassandraTaskQueueUserDataMigrationModeTargetOnly {
+		buckets := cfg.TaskQueueUserDataBucketCount
+		if buckets == 0 {
+			buckets = cassandra.DefaultTaskQueueUserDataBucketCount
+		}
+		initialize(cassandra.SchemaLayoutTaskQueueUserData, "task_queue_user_data_v2", int64(buckets))
+	}
+}
+
+func SetUpCassandraDatabase(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"
@@ -101,21 +203,12 @@ func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logg
 	}
 }
 
-func SetUpCassandraSchema(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func SetUpCassandraSchema(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	ApplySchemaUpdate(t, cfg, testCassandraExecutionSchema, logger)
 }
 
-func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
-	session, err := commongocql.NewSession(
-		func() (*gocql.ClusterConfig, error) {
-			return commongocql.NewCassandraCluster(*cfg, resolver.NewNoopResolver())
-		},
-		logger,
-		metrics.NoopMetricsHandler,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+func ApplySchemaUpdate(t testing.TB, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
+	session := newCassandraTestSession(t, cfg, logger)
 	defer session.Close()
 
 	schemaPath, err := filepath.Abs(schemaFile)
@@ -136,7 +229,25 @@ func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, l
 	}
 }
 
-func TearDownCassandraKeyspace(t *testing.T, cfg *config.Cassandra) {
+func newCassandraTestSession(
+	t testing.TB,
+	cfg *config.Cassandra,
+	logger log.Logger,
+) commongocql.Session {
+	session, err := commongocql.NewSession(
+		func() (*gocql.ClusterConfig, error) {
+			return commongocql.NewCassandraCluster(*cfg, resolver.NewNoopResolver())
+		},
+		logger,
+		metrics.NoopMetricsHandler,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func TearDownCassandraKeyspace(t testing.TB, cfg *config.Cassandra) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"
@@ -222,11 +333,30 @@ func GetSchemaFiles(t *testing.T, schemaDir string, logger log.Logger) []string 
 // NewCassandraConfig returns a new Cassandra config for test
 func NewCassandraConfig() *config.Cassandra {
 	return &config.Cassandra{
-		User:           testCassandraUser,
-		Password:       testCassandraPassword,
-		Hosts:          environment.GetCassandraAddress(),
-		Port:           environment.GetCassandraPort(),
-		Keyspace:       testCassandraDatabaseNamePrefix + shuffle.String(testCassandraDatabaseNameSuffix),
-		ConnectTimeout: 30 * time.Second,
+		User:                          testCassandraUser,
+		Password:                      testCassandraPassword,
+		Hosts:                         environment.GetCassandraAddress(),
+		Port:                          environment.GetCassandraPort(),
+		MaxConns:                      testCassandraMaxConns(),
+		MaxExcessShardConnectionsRate: testCassandraMaxExcessShardConnectionsRate(),
+		Keyspace:                      testCassandraDatabaseNamePrefix + shuffle.String(testCassandraDatabaseNameSuffix),
+		ConnectTimeout:                30 * time.Second,
 	}
+}
+
+func testCassandraMaxConns() int {
+	maxConns, err := strconv.Atoi(os.Getenv(testCassandraMaxConnsEnv))
+	if err != nil {
+		return 0
+	}
+	return maxConns
+}
+
+func testCassandraMaxExcessShardConnectionsRate() *float32 {
+	rate, err := strconv.ParseFloat(os.Getenv(testCassandraMaxExcessShardConnectionsEnv), 32)
+	if err != nil {
+		return nil
+	}
+	rate32 := float32(rate)
+	return &rate32
 }

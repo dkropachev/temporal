@@ -66,3 +66,45 @@ func ConvertError(
 func IsNotFoundError(err error) bool {
 	return errors.Is(err, gocql.ErrNotFound)
 }
+
+func IsUnconfiguredTableError(err error, table string) bool {
+	if err == nil {
+		return false
+	}
+	code, message, ok := cassandraRequestError(err)
+	if !ok || (code != gocql.ErrCodeInvalid && code != gocql.ErrCodeConfig) {
+		return false
+	}
+	message = strings.ToLower(message)
+	if !strings.Contains(message, "unconfigured table") &&
+		(!strings.Contains(message, "table") || !strings.Contains(message, "does not exist")) {
+		return false
+	}
+	table = strings.ToLower(table)
+	for _, field := range strings.Fields(message) {
+		field = strings.NewReplacer(`"`, "", "'", "", "`", "").Replace(field)
+		field = strings.Trim(field, ";,.")
+		if field == table || strings.HasSuffix(field, "."+table) {
+			return true
+		}
+	}
+	return false
+}
+
+func cassandraRequestError(err error) (int, string, bool) {
+	var requestErr gocql.RequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.Code(), requestErr.Message(), true
+	}
+
+	// The Scylla gocql fork exposes protocol errors through getter methods.
+	var getterError interface {
+		error
+		GetCode() int
+		GetMessage() string
+	}
+	if errors.As(err, &getterError) {
+		return getterError.GetCode(), getterError.GetMessage(), true
+	}
+	return 0, "", false
+}

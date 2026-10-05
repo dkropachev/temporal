@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -51,9 +52,19 @@ type matchingTaskStoreV2 struct {
 func newMatchingTaskStoreV2(
 	session gocql.Session,
 ) *matchingTaskStoreV2 {
+	return newMatchingTaskStoreV2WithUserData(
+		session,
+		newUserDataStore(session, nil, TaskQueueUserDataMigrationModeSourceOnly, DefaultTaskQueueUserDataBucketCount),
+	)
+}
+
+func newMatchingTaskStoreV2WithUserData(
+	session gocql.Session,
+	userData userDataStore,
+) *matchingTaskStoreV2 {
 	return &matchingTaskStoreV2{
 		Session:        session,
-		userDataStore:  userDataStore{Session: session},
+		userDataStore:  userData,
 		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion2},
 	}
 }
@@ -63,6 +74,14 @@ func (d *matchingTaskStoreV2) CreateTasks(
 	ctx context.Context,
 	request *p.InternalCreateTasksRequest,
 ) (*p.CreateTasksResponse, error) {
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
+	}
 	batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	namespaceID := request.NamespaceID
 	taskQueue := request.TaskQueue
@@ -84,18 +103,7 @@ func (d *matchingTaskStoreV2) CreateTasks(
 			task.Task.EncodingType.String())
 	}
 
-	// The following query is used to ensure that range_id didn't change
-	batch.Query(switchTasksTable(templateUpdateTaskQueueQuery, matchingTaskVersion2),
-		request.RangeID,
-		request.TaskQueueInfo.Data,
-		request.TaskQueueInfo.EncodingType.String(),
-		namespaceID,
-		taskQueue,
-		taskQueueType,
-		rowTypeTaskQueue,
-		taskQueueTaskID,
-		request.RangeID,
-	)
+	d.addCreateTasksGuard(batch, request)
 
 	previous := make(map[string]any)
 	applied, _, err := d.Session.MapExecuteBatchCAS(batch, previous)
@@ -124,6 +132,14 @@ func (d *matchingTaskStoreV2) GetTasks(
 	if request.ExclusiveMaxTaskID != math.MaxInt64 {
 		// ExclusiveMaxTaskID is not supported in fair queue.
 		return nil, serviceerror.NewInternal("invalid GetTasks request on fair queue: ExclusiveMaxTaskID is not supported")
+	}
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
 	}
 
 	// Reading taskqueue tasks need to be quorum level consistent, otherwise we could lose tasks
@@ -157,43 +173,41 @@ func (d *matchingTaskStoreV2) GetTasks(
 	}
 	iter := query.WithContext(ctx).PageSize(request.PageSize).PageState(request.NextPageToken).Iter()
 
-	response := &p.InternalGetTasksResponse{}
-	task := make(map[string]any)
-	for iter.MapScan(task) {
-		_, ok := task["task_id"]
-		if !ok { // no tasks, but static column record returned
-			continue
+	response := &p.InternalGetTasksResponse{
+		Tasks: make([]*commonpb.DataBlob, 0, preallocatedResultCapacity(request.PageSize)),
+	}
+	closeIterator := func() error {
+		if err := iter.Close(); err != nil {
+			return gocql.ConvertError("GetTasks", err)
+		}
+		return nil
+	}
+	var taskID nullableInt64
+	var taskVal []byte
+	var encodingVal string
+	for iter.Scan(&taskID, &taskVal, &encodingVal) {
+		if taskID.valid {
+			response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
 		}
 
-		rawTask, ok := task["task"]
-		if !ok {
-			return nil, newFieldNotFoundError("task", task)
-		}
-		taskVal, ok := rawTask.([]byte)
-		if !ok {
-			var byteSliceType []byte
-			return nil, newPersistedTypeMismatchError("task", byteSliceType, rawTask, task)
-		}
-
-		rawEncoding, ok := task["task_encoding"]
-		if !ok {
-			return nil, newFieldNotFoundError("task_encoding", task)
-		}
-		encodingVal, ok := rawEncoding.(string)
-		if !ok {
-			var byteSliceType []byte
-			return nil, newPersistedTypeMismatchError("task_encoding", byteSliceType, rawEncoding, task)
-		}
-		response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
-
-		task = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
+		taskID = nullableInt64{}
+		taskVal = nil
+		encodingVal = ""
 	}
 	if len(iter.PageState()) > 0 {
 		response.NextPageToken = iter.PageState()
 	}
 
-	if err := iter.Close(); err != nil {
-		return nil, gocql.ConvertError("GetTasks", err)
+	if err := closeIterator(); err != nil {
+		return nil, err
+	}
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueue,
+		request.TaskType,
+	); err != nil {
+		return nil, err
 	}
 	return response, nil
 }
@@ -209,10 +223,17 @@ func (d *matchingTaskStoreV2) CompleteTasksLessThan(
 	if request.ExclusiveMaxPass < 1 {
 		return 0, serviceerror.NewInternal("invalid CompleteTasksLessThan request on fair queue")
 	}
+	if err := d.ensureMigrationAuthority(
+		ctx,
+		request.NamespaceID,
+		request.TaskQueueName,
+		request.TaskType,
+	); err != nil {
+		return 0, err
+	}
 
 	rowType := rowTypeTaskInSubqueue(request.Subqueue)
-	query := d.Session.Query(
-		templateCompleteTasksLessThanQuery_v2,
+	args := []any{
 		request.NamespaceID,
 		request.TaskQueueName,
 		request.TaskType,
@@ -222,8 +243,28 @@ func (d *matchingTaskStoreV2) CompleteTasksLessThan(
 		rowType,
 		request.ExclusiveMaxPass,
 		request.ExclusiveMaxTaskID,
-	).WithContext(ctx)
-	err := query.Exec()
+	}
+	var err error
+	if d.migrationAuthority == 0 {
+		err = d.Session.Query(templateCompleteTasksLessThanQuery_v2, args...).WithContext(ctx).Exec()
+	} else {
+		batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+		batch.Query(templateCompleteTasksLessThanQuery_v2, args...)
+		d.addMigrationAuthorityGuard(
+			batch,
+			request.NamespaceID,
+			request.TaskQueueName,
+			request.TaskType,
+		)
+		applied, iter, batchErr := d.Session.MapExecuteBatchCAS(batch, make(map[string]any))
+		if iter != nil {
+			defer func() { _ = iter.Close() }()
+		}
+		err = batchErr
+		if err == nil && !applied {
+			return 0, &p.ConditionFailedError{Msg: "Cassandra matching task source authority changed during completion"}
+		}
+	}
 	if err != nil {
 		return 0, gocql.ConvertError("CompleteTasksLessThan", err)
 	}

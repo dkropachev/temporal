@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -86,11 +87,46 @@ type (
 
 var _ p.ExecutionStore = (*ExecutionStore)(nil)
 
-func NewExecutionStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *ExecutionStore {
+func NewExecutionStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	historyNodeMigrationMode ...config.CassandraHistoryNodeMigrationMode,
+) *ExecutionStore {
+	mode := config.CassandraHistoryNodeMigrationMode("")
+	if len(historyNodeMigrationMode) > 0 {
+		mode = historyNodeMigrationMode[0]
+	}
+	return newExecutionStore(
+		session,
+		serializer,
+		logger,
+		mode,
+		normalizeHistoryTreeMigrationMode(""),
+		historyNodeTableGenerations{},
+		executionLayout{mode: config.CassandraExecutionMigrationModeLegacy, buckets: 1},
+	)
+}
+
+func newExecutionStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	historyNodeMigrationMode config.CassandraHistoryNodeMigrationMode,
+	historyTreeMigrationMode config.CassandraHistoryTreeMigrationMode,
+	historyNodeGenerations historyNodeTableGenerations,
+	layout executionLayout,
+) *ExecutionStore {
 	return &ExecutionStore{
-		HistoryStore:          NewHistoryStore(session, serializer),
-		MutableStateStore:     NewMutableStateStore(session, serializer, logger),
-		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer),
+		HistoryStore: newHistoryStoreWithMigrationModes(
+			session,
+			serializer,
+			historyNodeMigrationMode,
+			historyTreeMigrationMode,
+			historyNodeGenerations,
+		),
+		MutableStateStore:     newMutableStateStore(session, serializer, logger, layout),
+		MutableStateTaskStore: newMutableStateTaskStore(session, serializer, layout, logger),
 	}
 }
 

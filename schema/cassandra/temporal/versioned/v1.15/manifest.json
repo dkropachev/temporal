@@ -1,0 +1,6 @@
+{
+  "CurrVersion": "1.15",
+  "MinCompatibleVersion": "1.0",
+  "Description": "Add branch-partitioned history node table",
+  "SchemaUpdateCqlFiles": ["history_node_v2.cql"]
+}
