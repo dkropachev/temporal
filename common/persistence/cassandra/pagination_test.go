@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"maps"
 	"testing"
 
 	"github.com/gocql/gocql"
@@ -253,9 +254,7 @@ func (i *recordingIter) MapScan(dest map[string]any) bool {
 	if i.mapIdx >= len(i.mapRows) {
 		return false
 	}
-	for key, value := range i.mapRows[i.mapIdx] {
-		dest[key] = value
-	}
+	maps.Copy(dest, i.mapRows[i.mapIdx])
 	i.mapIdx++
 	return true
 }
