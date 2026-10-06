@@ -117,14 +117,19 @@ const (
 
 // taskQueueStore handles unified task queue operations for both v1 and v2
 type taskQueueStore struct {
-	Session gocql.Session
-	version matchingTaskVersion
+	Session    gocql.Session
+	version    matchingTaskVersion
+	compressor *blobCompressor
 }
 
 func (d *taskQueueStore) CreateTaskQueue(
 	ctx context.Context,
 	request *p.InternalCreateTaskQueueRequest,
 ) error {
+	data, encoding, err := d.compressor.compressBlob(request.TaskQueueInfo)
+	if err != nil {
+		return err
+	}
 	query := d.Session.Query(switchTasksTable(templateInsertTaskQueueQuery, d.version),
 		request.NamespaceID,
 		request.TaskQueue,
@@ -132,8 +137,8 @@ func (d *taskQueueStore) CreateTaskQueue(
 		rowTypeTaskQueue,
 		taskQueueTaskID,
 		request.RangeID,
-		request.TaskQueueInfo.Data,
-		request.TaskQueueInfo.EncodingType.String(),
+		data,
+		encoding,
 	).WithContext(ctx)
 
 	previous := make(map[string]any)
@@ -171,10 +176,14 @@ func (d *taskQueueStore) GetTaskQueue(
 	if err := query.Scan(&rangeID, &tlBytes, &tlEncoding); err != nil {
 		return nil, gocql.ConvertError("GetTaskQueue", err)
 	}
+	taskQueueInfo, err := d.compressor.newDataBlob(tlBytes, tlEncoding)
+	if err != nil {
+		return nil, err
+	}
 
 	return &p.InternalGetTaskQueueResponse{
 		RangeID:       rangeID,
-		TaskQueueInfo: p.NewDataBlob(tlBytes, tlEncoding),
+		TaskQueueInfo: taskQueueInfo,
 	}, nil
 }
 
@@ -191,6 +200,10 @@ func (d *taskQueueStore) UpdateTaskQueue(
 		if request.ExpiryTime == nil {
 			return nil, serviceerror.NewInternal("ExpiryTime cannot be nil for sticky task queue")
 		}
+		data, encoding, err := d.compressor.compressBlob(request.TaskQueueInfo)
+		if err != nil {
+			return nil, err
+		}
 		expiryTTL := min(convert.Int64Ceil(time.Until(timestamp.TimeValue(request.ExpiryTime)).Seconds()), maxCassandraTTL)
 		batch := d.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 
@@ -206,8 +219,8 @@ func (d *taskQueueStore) UpdateTaskQueue(
 		batch.Query(switchTasksTable(templateUpdateTaskQueueQueryWithTTLPart2, d.version),
 			expiryTTL,
 			request.RangeID,
-			request.TaskQueueInfo.Data,
-			request.TaskQueueInfo.EncodingType.String(),
+			data,
+			encoding,
 			request.NamespaceID,
 			request.TaskQueue,
 			request.TaskType,
@@ -217,11 +230,15 @@ func (d *taskQueueStore) UpdateTaskQueue(
 		)
 		applied, _, err = d.Session.MapExecuteBatchCAS(batch, previous)
 	} else {
+		data, encoding, err := d.compressor.compressBlob(request.TaskQueueInfo)
+		if err != nil {
+			return nil, err
+		}
 		// Regular update logic for both V1 and V2
 		query := d.Session.Query(switchTasksTable(templateUpdateTaskQueueQuery, d.version),
 			request.RangeID,
-			request.TaskQueueInfo.Data,
-			request.TaskQueueInfo.EncodingType.String(),
+			data,
+			encoding,
 			request.NamespaceID,
 			request.TaskQueue,
 			request.TaskType,

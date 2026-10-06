@@ -75,6 +75,7 @@ type (
 		session            gocql.Session
 		logger             log.Logger
 		currentClusterName string
+		compressor         *blobCompressor
 	}
 )
 
@@ -83,11 +84,13 @@ func NewMetadataStore(
 	currentClusterName string,
 	session gocql.Session,
 	logger log.Logger,
+	compressors ...*blobCompressor,
 ) (p.MetadataStore, error) {
 	return &MetadataStore{
 		currentClusterName: currentClusterName,
 		session:            session,
 		logger:             logger,
+		compressor:         selectBlobCompressor(compressors),
 	}, nil
 }
 
@@ -133,14 +136,18 @@ func (m *MetadataStore) CreateNamespaceInV2Table(
 	if err != nil {
 		return nil, err
 	}
+	data, encoding, err := m.compressor.compressBlob(request.Namespace)
+	if err != nil {
+		return nil, err
+	}
 
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.Query(templateCreateNamespaceByNameQueryWithinBatchV2,
 		constNamespacePartition,
 		request.ID,
 		request.Name,
-		request.Namespace.Data,
-		request.Namespace.EncodingType.String(),
+		data,
+		encoding,
 		metadata.NotificationVersion,
 		request.IsGlobal,
 	)
@@ -207,10 +214,14 @@ func (m *MetadataStore) UpdateNamespace(
 	ctx context.Context,
 	request *p.InternalUpdateNamespaceRequest,
 ) error {
+	data, encoding, err := m.compressor.compressBlob(request.Namespace)
+	if err != nil {
+		return err
+	}
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.Query(templateUpdateNamespaceByNameQueryWithinBatchV2,
-		request.Namespace.Data,
-		request.Namespace.EncodingType.String(),
+		data,
+		encoding,
 		request.IsGlobal,
 		request.NotificationVersion,
 		constNamespacePartition,
@@ -256,13 +267,17 @@ func (m *MetadataStore) RenameNamespace(
 	}
 
 	// Step 2.
+	data, encoding, err := m.compressor.compressBlob(request.Namespace)
+	if err != nil {
+		return err
+	}
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.Query(templateCreateNamespaceByNameQueryWithinBatchV2,
 		constNamespacePartition,
 		request.Id,
 		request.Name,
-		request.Namespace.Data,
-		request.Namespace.EncodingType.String(),
+		data,
+		encoding,
 		request.NotificationVersion,
 		request.IsGlobal,
 	)
@@ -341,8 +356,12 @@ func (m *MetadataStore) GetNamespace(
 		return nil, handleError(request.Name, request.ID, err)
 	}
 
+	namespaceBlob, err := m.compressor.newDataBlob(detail, detailEncoding)
+	if err != nil {
+		return nil, err
+	}
 	return &p.InternalGetNamespaceResponse{
-		Namespace:           p.NewDataBlob(detail, detailEncoding),
+		Namespace:           namespaceBlob,
 		IsGlobal:            isGlobalNamespace,
 		NotificationVersion: notificationVersion,
 	}, nil
@@ -384,8 +403,12 @@ func (m *MetadataStore) ListNamespaces(
 				skippedRows++
 				continue
 			}
+			namespaceBlob, err := m.compressor.newDataBlob(detail, detailEncoding)
+			if err != nil {
+				return nil, err
+			}
 			response.Namespaces = append(response.Namespaces, &p.InternalGetNamespaceResponse{
-				Namespace:           p.NewDataBlob(detail, detailEncoding),
+				Namespace:           namespaceBlob,
 				IsGlobal:            isGlobal,
 				NotificationVersion: notificationVersion,
 			})

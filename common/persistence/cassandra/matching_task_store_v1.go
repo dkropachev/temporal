@@ -39,15 +39,19 @@ type matchingTaskStoreV1 struct {
 	Session gocql.Session
 	userDataStore
 	taskQueueStore
+	compressor *blobCompressor
 }
 
 func newMatchingTaskStoreV1(
 	session gocql.Session,
+	compressors ...*blobCompressor,
 ) *matchingTaskStoreV1 {
+	compressor := selectBlobCompressor(compressors)
 	return &matchingTaskStoreV1{
 		Session:        session,
-		userDataStore:  userDataStore{Session: session},
-		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion1},
+		userDataStore:  userDataStore{Session: session, compressor: compressor},
+		taskQueueStore: taskQueueStore{Session: session, version: matchingTaskVersion1, compressor: compressor},
+		compressor:     compressor,
 	}
 }
 
@@ -67,6 +71,10 @@ func (d *matchingTaskStoreV1) CreateTasks(
 		}
 
 		ttl := getTaskTTL(task.ExpiryTime)
+		taskData, taskEncoding, err := d.compressor.compressBlob(task.Task)
+		if err != nil {
+			return nil, err
+		}
 
 		if ttl <= 0 || ttl > maxCassandraTTL {
 			batch.Query(templateCreateTaskQuery,
@@ -75,8 +83,8 @@ func (d *matchingTaskStoreV1) CreateTasks(
 				taskQueueType,
 				rowTypeTaskInSubqueue(task.Subqueue),
 				task.TaskId,
-				task.Task.Data,
-				task.Task.EncodingType.String())
+				taskData,
+				taskEncoding)
 		} else {
 			batch.Query(templateCreateTaskWithTTLQuery,
 				namespaceID,
@@ -84,8 +92,8 @@ func (d *matchingTaskStoreV1) CreateTasks(
 				taskQueueType,
 				rowTypeTaskInSubqueue(task.Subqueue),
 				task.TaskId,
-				task.Task.Data,
-				task.Task.EncodingType.String(),
+				taskData,
+				taskEncoding,
 				ttl)
 		}
 	}
@@ -94,10 +102,14 @@ func (d *matchingTaskStoreV1) CreateTasks(
 	// When UpdateMetadata is true, we also write the metadata blob (backlog counts, etc.).
 	// When false, we only check the range_id for write fencing.
 	if request.UpdateMetadata {
+		taskQueueData, taskQueueEncoding, err := d.compressor.compressBlob(request.TaskQueueInfo)
+		if err != nil {
+			return nil, err
+		}
 		batch.Query(switchTasksTable(templateUpdateTaskQueueQuery, matchingTaskVersion1),
 			request.RangeID,
-			request.TaskQueueInfo.Data,
-			request.TaskQueueInfo.EncodingType.String(),
+			taskQueueData,
+			taskQueueEncoding,
 			namespaceID,
 			taskQueue,
 			taskQueueType,
@@ -180,7 +192,11 @@ func (d *matchingTaskStoreV1) GetTasks(
 			var byteSliceType []byte
 			return nil, newPersistedTypeMismatchError("task_encoding", byteSliceType, rawEncoding, task)
 		}
-		response.Tasks = append(response.Tasks, p.NewDataBlob(taskVal, encodingVal))
+		blob, err := d.compressor.newDataBlob(taskVal, encodingVal)
+		if err != nil {
+			return nil, err
+		}
+		response.Tasks = append(response.Tasks, blob)
 
 		task = make(map[string]any) // Reinitialize map as initialized fails on unmarshalling
 	}

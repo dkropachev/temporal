@@ -164,13 +164,19 @@ type (
 	MutableStateTaskStore struct {
 		Session    gocql.Session
 		serializer serialization.Serializer
+		compressor *blobCompressor
 	}
 )
 
-func NewMutableStateTaskStore(session gocql.Session, serializer serialization.Serializer) *MutableStateTaskStore {
+func NewMutableStateTaskStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	compressors ...*blobCompressor,
+) *MutableStateTaskStore {
 	return &MutableStateTaskStore{
 		Session:    session,
 		serializer: serializer,
+		compressor: selectBlobCompressor(compressors),
 	}
 }
 
@@ -184,6 +190,7 @@ func (d *MutableStateTaskStore) AddHistoryTasks(
 		batch,
 		request.ShardID,
 		request.Tasks,
+		d.compressor,
 	); err != nil {
 		return err
 	}
@@ -305,9 +312,13 @@ func (d *MutableStateTaskStore) getTransferTasks(
 	var encoding string
 
 	for iter.Scan(&taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewImmediateKey(taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		taskID = 0
@@ -387,9 +398,13 @@ func (d *MutableStateTaskStore) getTimerTasks(
 	var encoding string
 
 	for iter.Scan(&timestamp, &taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewKey(timestamp, taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		timestamp = time.Time{}
@@ -513,6 +528,10 @@ func (d *MutableStateTaskStore) PutReplicationTaskToDLQ(
 	if err != nil {
 		return gocql.ConvertError("PutReplicationTaskToDLQ", err)
 	}
+	data, encoding, err := d.compressor.compressBlob(datablob)
+	if err != nil {
+		return err
+	}
 
 	// Use source cluster name as the workflow id for replication dlq
 	query := d.Session.Query(templateCreateReplicationTaskQuery,
@@ -521,8 +540,8 @@ func (d *MutableStateTaskStore) PutReplicationTaskToDLQ(
 		rowTypeDLQNamespaceID,
 		request.SourceClusterName,
 		rowTypeDLQRunID,
-		datablob.Data,
-		datablob.EncodingType.String(),
+		data,
+		encoding,
 		defaultVisibilityTimestamp,
 		task.GetTaskId(),
 	).WithContext(ctx)
@@ -641,9 +660,13 @@ func (d *MutableStateTaskStore) getVisibilityTasks(
 	var encoding string
 
 	for iter.Scan(&taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewImmediateKey(taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		taskID = 0
@@ -710,9 +733,13 @@ func (d *MutableStateTaskStore) populateGetReplicationTasksResponse(
 	var encoding string
 
 	for iter.Scan(&taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewImmediateKey(taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		taskID = 0
@@ -770,9 +797,13 @@ func (d *MutableStateTaskStore) getHistoryImmedidateTasks(
 	var encoding string
 
 	for iter.Scan(&taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewImmediateKey(taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		taskID = 0
@@ -818,9 +849,13 @@ func (d *MutableStateTaskStore) getHistoryScheduledTasks(
 	var encoding string
 
 	for iter.Scan(&timestamp, &taskID, &data, &encoding) {
+		blob, err := d.compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
 		response.Tasks = append(response.Tasks, p.InternalHistoryTask{
 			Key:  tasks.NewKey(timestamp, taskID),
-			Blob: p.NewDataBlob(data, encoding),
+			Blob: blob,
 		})
 
 		timestamp = time.Time{}

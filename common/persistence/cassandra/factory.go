@@ -23,6 +23,7 @@ type (
 		logger      log.Logger
 		session     commongocql.Session
 		serializer  serialization.Serializer
+		compressor  *blobCompressor
 	}
 )
 
@@ -63,59 +64,64 @@ func NewFactoryFromSession(
 	session commongocql.Session,
 	serializer serialization.Serializer,
 ) *Factory {
+	compressor, err := newBlobCompressor(cfg.BlobCompressionEnabled)
+	if err != nil {
+		logger.Fatal("unable to initialize cassandra blob compressor", tag.Error(err))
+	}
 	return &Factory{
 		cfg:         cfg,
 		clusterName: clusterName,
 		logger:      logger,
 		session:     session,
 		serializer:  serializer,
+		compressor:  compressor,
 	}
 }
 
 // NewTaskStore returns a new task store
 func (f *Factory) NewTaskStore() (p.TaskStore, error) {
-	return NewMatchingTaskStore(f.session, f.logger, false), nil
+	return NewMatchingTaskStore(f.session, f.logger, false, f.compressor), nil
 }
 
 // NewTaskStore returns a new task store
 func (f *Factory) NewFairTaskStore() (p.TaskStore, error) {
-	return NewMatchingTaskStore(f.session, f.logger, true), nil
+	return NewMatchingTaskStore(f.session, f.logger, true, f.compressor), nil
 }
 
 // NewShardStore returns a new shard store
 func (f *Factory) NewShardStore() (p.ShardStore, error) {
-	return NewShardStore(f.clusterName, f.session, f.logger), nil
+	return NewShardStore(f.clusterName, f.session, f.logger, f.compressor), nil
 }
 
 // NewMetadataStore returns a metadata store
 func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
-	return NewMetadataStore(f.clusterName, f.session, f.logger)
+	return NewMetadataStore(f.clusterName, f.session, f.logger, f.compressor)
 }
 
 // NewClusterMetadataStore returns a metadata store
 func (f *Factory) NewClusterMetadataStore() (p.ClusterMetadataStore, error) {
-	return NewClusterMetadataStore(f.session, f.logger)
+	return NewClusterMetadataStore(f.session, f.logger, f.compressor)
 }
 
 // NewExecutionStore returns a new ExecutionStore.
 func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
-	return NewExecutionStore(f.session, f.serializer, f.logger), nil
+	return NewExecutionStore(f.session, f.serializer, f.logger, f.compressor), nil
 }
 
 // NewQueue returns a new queue backed by cassandra
 func (f *Factory) NewQueue(queueType p.QueueType) (p.Queue, error) {
-	return NewQueueStore(queueType, f.session, f.logger)
+	return NewQueueStore(queueType, f.session, f.logger, f.compressor)
 }
 
 // NewQueueV2 returns a new data-access object for queues and messages stored in Cassandra. It will never return an
 // error.
 func (f *Factory) NewQueueV2() (p.QueueV2, error) {
-	return NewQueueV2Store(f.session, f.logger), nil
+	return NewQueueV2Store(f.session, f.logger, f.compressor), nil
 }
 
 // NewNexusEndpointStore returns a new NexusEndpointStore
 func (f *Factory) NewNexusEndpointStore() (p.NexusEndpointStore, error) {
-	return NewNexusEndpointStore(f.session, f.logger), nil
+	return NewNexusEndpointStore(f.session, f.logger, f.compressor), nil
 }
 
 // Close closes the factory
@@ -123,4 +129,5 @@ func (f *Factory) Close() {
 	f.Lock()
 	defer f.Unlock()
 	f.session.Close()
+	f.compressor.close()
 }

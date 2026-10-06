@@ -351,6 +351,11 @@ func MatchingClientProvider(matchingRawClient MatchingRawClient, dc *dynamicconf
 
 func PersistenceConfigProvider(persistenceConfig config.Persistence, dc *dynamicconfig.Collection) *config.Persistence {
 	persistenceConfig.TransactionSizeLimit = dynamicconfig.TransactionSizeLimit.Get(dc)
+	for _, dataStore := range persistenceConfig.DataStores {
+		if dataStore.Cassandra != nil {
+			dataStore.Cassandra.BlobCompressionEnabled = dynamicconfig.CassandraBlobCompressionEnabled.Get(dc)
+		}
+	}
 	return &persistenceConfig
 }
 

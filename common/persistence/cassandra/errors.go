@@ -209,6 +209,7 @@ func extractCurrentWorkflowConflictError(
 		binary, _ := conflictRecord["execution_state"].([]byte)
 		encoding, _ := conflictRecord["execution_state_encoding"].(string)
 		executionState := &persistencespb.WorkflowExecutionState{}
+		binary, _ = defaultBlobCompressor.decompressData(binary)
 		if state, err := serialization.DefaultDecoder.WorkflowExecutionStateFromBlob(p.NewDataBlob(binary, encoding)); err == nil {
 			executionState = state
 		}

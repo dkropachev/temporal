@@ -50,8 +50,13 @@ type (
 )
 
 func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
+	return setUpCassandraTestWithBlobCompression(t, false)
+}
+
+func setUpCassandraTestWithBlobCompression(t *testing.T, blobCompressionEnabled bool) (CassandraTestData, func()) {
 	var testData CassandraTestData
 	testData.Cfg = NewCassandraConfig()
+	testData.Cfg.BlobCompressionEnabled = func() bool { return blobCompressionEnabled }
 	testData.Logger = log.NewZapLogger(zaptest.NewLogger(t))
 	SetUpCassandraDatabase(t, testData.Cfg, testData.Logger)
 	SetUpCassandraSchema(t, testData.Cfg, testData.Logger)
@@ -73,7 +78,7 @@ func setUpCassandraTest(t *testing.T) (CassandraTestData, func()) {
 	return testData, tearDown
 }
 
-func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func SetUpCassandraDatabase(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"
@@ -101,11 +106,11 @@ func SetUpCassandraDatabase(t *testing.T, cfg *config.Cassandra, logger log.Logg
 	}
 }
 
-func SetUpCassandraSchema(t *testing.T, cfg *config.Cassandra, logger log.Logger) {
+func SetUpCassandraSchema(t testing.TB, cfg *config.Cassandra, logger log.Logger) {
 	ApplySchemaUpdate(t, cfg, testCassandraExecutionSchema, logger)
 }
 
-func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
+func ApplySchemaUpdate(t testing.TB, cfg *config.Cassandra, schemaFile string, logger log.Logger) {
 	session, err := commongocql.NewSession(
 		func() (*gocql.ClusterConfig, error) {
 			return commongocql.NewCassandraCluster(*cfg, resolver.NewNoopResolver())
@@ -136,7 +141,7 @@ func ApplySchemaUpdate(t *testing.T, cfg *config.Cassandra, schemaFile string, l
 	}
 }
 
-func TearDownCassandraKeyspace(t *testing.T, cfg *config.Cassandra) {
+func TearDownCassandraKeyspace(t testing.TB, cfg *config.Cassandra) {
 	adminCfg := *cfg
 	// NOTE need to connect with empty name to create new database
 	adminCfg.Keyspace = "system"

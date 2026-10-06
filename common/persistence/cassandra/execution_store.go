@@ -86,11 +86,17 @@ type (
 
 var _ p.ExecutionStore = (*ExecutionStore)(nil)
 
-func NewExecutionStore(session gocql.Session, serializer serialization.Serializer, logger log.Logger) *ExecutionStore {
+func NewExecutionStore(
+	session gocql.Session,
+	serializer serialization.Serializer,
+	logger log.Logger,
+	compressors ...*blobCompressor,
+) *ExecutionStore {
+	compressor := selectBlobCompressor(compressors)
 	return &ExecutionStore{
-		HistoryStore:          NewHistoryStore(session, serializer),
-		MutableStateStore:     NewMutableStateStore(session, serializer, logger),
-		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer),
+		HistoryStore:          NewHistoryStore(session, serializer, compressor),
+		MutableStateStore:     NewMutableStateStore(session, serializer, logger, compressor),
+		MutableStateTaskStore: NewMutableStateTaskStore(session, serializer, compressor),
 	}
 }
 

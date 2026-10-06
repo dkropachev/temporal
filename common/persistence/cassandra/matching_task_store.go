@@ -14,11 +14,13 @@ func NewMatchingTaskStore(
 	session gocql.Session,
 	logger log.Logger,
 	enableFairness bool,
+	compressors ...*blobCompressor,
 ) p.TaskStore {
+	compressor := selectBlobCompressor(compressors)
 	if enableFairness {
-		return newMatchingTaskStoreV2(session)
+		return newMatchingTaskStoreV2(session, compressor)
 	}
-	return newMatchingTaskStoreV1(session)
+	return newMatchingTaskStoreV1(session, compressor)
 }
 
 const (

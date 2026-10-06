@@ -33,6 +33,7 @@ type (
 		session    gocql.Session
 		logger     log.Logger
 		serializer serialization.Serializer
+		compressor *blobCompressor
 	}
 )
 
@@ -40,12 +41,14 @@ func NewQueueStore(
 	queueType persistence.QueueType,
 	session gocql.Session,
 	logger log.Logger,
+	compressors ...*blobCompressor,
 ) (persistence.Queue, error) {
 	return &QueueStore{
 		queueType:  queueType,
 		session:    session,
 		logger:     logger,
 		serializer: serialization.NewSerializer(),
+		compressor: selectBlobCompressor(compressors),
 	}, nil
 }
 
@@ -92,7 +95,11 @@ func (q *QueueStore) tryEnqueue(
 	messageID int64,
 	blob *commonpb.DataBlob,
 ) (int64, error) {
-	query := q.session.Query(templateEnqueueMessageQuery, queueType, messageID, blob.Data, blob.EncodingType.String()).WithContext(ctx)
+	data, encoding, err := q.compressor.compressBlob(blob)
+	if err != nil {
+		return persistence.EmptyQueueMessageID, err
+	}
+	query := q.session.Query(templateEnqueueMessageQuery, queueType, messageID, data, encoding).WithContext(ctx)
 	previous := make(map[string]any)
 	applied, err := query.MapScanCAS(previous)
 	if err != nil {
@@ -140,7 +147,10 @@ func (q *QueueStore) ReadMessages(
 	var result []*persistence.QueueMessage
 	message := make(map[string]any)
 	for iter.MapScan(message) {
-		queueMessage := convertQueueMessage(message)
+		queueMessage, err := convertQueueMessage(message, q.compressor)
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, queueMessage)
 		message = make(map[string]any)
 	}
@@ -171,7 +181,10 @@ func (q *QueueStore) ReadMessagesFromDLQ(
 	var result []*persistence.QueueMessage
 	message := make(map[string]any)
 	for iter.MapScan(message) {
-		queueMessage := convertQueueMessage(message)
+		queueMessage, err := convertQueueMessage(message, q.compressor)
+		if err != nil {
+			return nil, nil, err
+		}
 		result = append(result, queueMessage)
 		message = make(map[string]any)
 	}
@@ -272,16 +285,20 @@ func (q *QueueStore) insertInitialQueueMetadataRecord(
 ) error {
 
 	version := 0
+	data, encoding, err := q.compressor.compressBlob(blob)
+	if err != nil {
+		return err
+	}
 	// TODO: remove once cluster_ack_level is removed from DB
 	clusterAckLevels := map[string]int64{}
 	query := q.session.Query(templateInsertQueueMetadataQuery,
 		queueType,
 		clusterAckLevels,
-		blob.Data,
-		blob.EncodingType.String(),
+		data,
+		encoding,
 		version,
 	).WithContext(ctx)
-	_, err := query.MapScanCAS(make(map[string]any))
+	_, err = query.MapScanCAS(make(map[string]any))
 	if err != nil {
 		return fmt.Errorf("failed to insert initial queue metadata record: %v, Type: %v", err, queueType)
 	}
@@ -301,7 +318,7 @@ func (q *QueueStore) getQueueMetadata(
 		return nil, err
 	}
 
-	return convertQueueMetadata(message, q.serializer)
+	return convertQueueMetadata(message, q.serializer, q.compressor)
 }
 
 func (q *QueueStore) updateAckLevel(
@@ -315,11 +332,15 @@ func (q *QueueStore) updateAckLevel(
 	if err != nil {
 		return gocql.ConvertError("updateAckLevel", err)
 	}
+	data, encoding, err := q.compressor.compressBlob(metadata.Blob)
+	if err != nil {
+		return err
+	}
 
 	query := q.session.Query(templateUpdateQueueMetadataQuery,
 		metadataStruct.ClusterAckLevels,
-		metadata.Blob.Data,
-		metadata.Blob.EncodingType.String(),
+		data,
+		encoding,
 		metadata.Version+1, // always increase version number on update
 		queueType,
 		metadata.Version, // condition update
@@ -369,7 +390,8 @@ func (q *QueueStore) initializeDLQMetadata(
 
 func convertQueueMessage(
 	message map[string]any,
-) *persistence.QueueMessage {
+	compressor *blobCompressor,
+) (*persistence.QueueMessage, error) {
 
 	id := message["message_id"].(int64)
 	data := message["message_payload"].([]byte)
@@ -377,16 +399,21 @@ func convertQueueMessage(
 	if encoding == "" {
 		encoding = enumspb.ENCODING_TYPE_PROTO3.String()
 	}
+	data, err := compressor.decompressData(data)
+	if err != nil {
+		return nil, err
+	}
 	return &persistence.QueueMessage{
 		ID:       id,
 		Data:     data,
 		Encoding: encoding,
-	}
+	}, nil
 }
 
 func convertQueueMetadata(
 	message map[string]any,
 	serializer serialization.Serializer,
+	compressor *blobCompressor,
 ) (*persistence.InternalQueueMetadata, error) {
 
 	metadata := &persistence.InternalQueueMetadata{
@@ -405,7 +432,11 @@ func convertQueueMetadata(
 		data := message["data"].([]byte)
 		encoding := message["data_encoding"].(string)
 
-		metadata.Blob = persistence.NewDataBlob(data, encoding)
+		blob, err := compressor.newDataBlob(data, encoding)
+		if err != nil {
+			return nil, err
+		}
+		metadata.Blob = blob
 	}
 
 	return metadata, nil

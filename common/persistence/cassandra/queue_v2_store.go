@@ -18,8 +18,9 @@ type (
 	// queue_messages tables that implement the QueueV2 interface. The schema is located at:
 	//	schema/cassandra/temporal/versioned/v1.9/queues.cql
 	queueV2Store struct {
-		session gocql.Session
-		logger  log.Logger
+		session    gocql.Session
+		logger     log.Logger
+		compressor *blobCompressor
 	}
 
 	Queue struct {
@@ -101,10 +102,15 @@ var (
 	}
 )
 
-func NewQueueV2Store(session gocql.Session, logger log.Logger) persistence.QueueV2 {
+func NewQueueV2Store(
+	session gocql.Session,
+	logger log.Logger,
+	compressors ...*blobCompressor,
+) persistence.QueueV2 {
 	return &queueV2Store{
-		session: session,
-		logger:  logger,
+		session:    session,
+		logger:     logger,
+		compressor: selectBlobCompressor(compressors),
 	}
 }
 
@@ -182,6 +188,10 @@ func (s *queueV2Store) ReadMessages(
 		}
 
 		encodingType := enumspb.EncodingType(encoding)
+		messagePayload, err = s.compressor.decompressData(messagePayload)
+		if err != nil {
+			return nil, err
+		}
 
 		message := persistence.QueueV2Message{
 			MetaData: persistence.MessageMetadata{ID: messageID},
@@ -218,6 +228,10 @@ func (s *queueV2Store) CreateQueue(
 		},
 	}
 	bytes, _ := q.Marshal()
+	bytes, err := s.compressor.compressData(bytes)
+	if err != nil {
+		return nil, err
+	}
 	applied, err := s.session.Query(
 		TemplateCreateQueueQuery,
 		queueType,
@@ -309,6 +323,10 @@ func (s *queueV2Store) updateQueue(
 	queueName string,
 ) error {
 	bytes, _ := q.Metadata.Marshal()
+	bytes, err := s.compressor.compressData(bytes)
+	if err != nil {
+		return err
+	}
 	version := q.Version
 	nextVersion := version + 1
 	q.Version = nextVersion
@@ -342,14 +360,18 @@ func (s *queueV2Store) tryInsert(
 	blob *commonpb.DataBlob,
 	messageID int64,
 ) error {
+	data, encoding, err := s.compressor.compressBlob(blob)
+	if err != nil {
+		return err
+	}
 	applied, err := s.session.Query(
 		TemplateEnqueueMessageQuery,
 		queueType,
 		queueName,
 		0,
 		messageID,
-		blob.Data,
-		blob.EncodingType.String(),
+		data,
+		encoding,
 	).WithContext(ctx).MapScanCAS(make(map[string]any))
 	if err != nil {
 		return gocql.ConvertError("QueueV2EnqueueMessage", err)
@@ -372,7 +394,7 @@ func (s *queueV2Store) getQueue(
 	queueType persistence.QueueV2Type,
 	name string,
 ) (*Queue, error) {
-	return GetQueue(ctx, s.session, name, queueType)
+	return getQueue(ctx, s.session, name, queueType, s.compressor)
 }
 
 func GetQueue(
@@ -380,6 +402,16 @@ func GetQueue(
 	session gocql.Session,
 	queueName string,
 	queueType persistence.QueueV2Type,
+) (*Queue, error) {
+	return getQueue(ctx, session, queueName, queueType, defaultBlobCompressor)
+}
+
+func getQueue(
+	ctx context.Context,
+	session gocql.Session,
+	queueName string,
+	queueType persistence.QueueV2Type,
+	compressor *blobCompressor,
 ) (*Queue, error) {
 	var (
 		queueBytes       []byte
@@ -398,7 +430,7 @@ func GetQueue(
 		}
 		return nil, gocql.ConvertError("QueueV2GetQueue", err)
 	}
-	return getQueueFromMetadata(queueType, queueName, queueBytes, queueEncodingStr, version)
+	return getQueueFromMetadata(queueType, queueName, queueBytes, queueEncodingStr, version, compressor)
 }
 
 func getQueueFromMetadata(
@@ -407,6 +439,7 @@ func getQueueFromMetadata(
 	queueBytes []byte,
 	queueEncodingStr string,
 	version int64,
+	compressor *blobCompressor,
 ) (*Queue, error) {
 	if queueEncodingStr != enumspb.ENCODING_TYPE_PROTO3.String() {
 		return nil, fmt.Errorf(
@@ -416,9 +449,13 @@ func getQueueFromMetadata(
 			queueName,
 		)
 	}
+	queueBytes, err := compressor.decompressData(queueBytes)
+	if err != nil {
+		return nil, err
+	}
 
 	q := &persistencespb.Queue{}
-	err := q.Unmarshal(queueBytes)
+	err = q.Unmarshal(queueBytes)
 	if err != nil {
 		return nil, serialization.NewDeserializationError(
 			enumspb.ENCODING_TYPE_PROTO3,
@@ -496,7 +533,7 @@ func (s *queueV2Store) ListQueues(
 			if !iter.Scan(&queueName, &metadataBytes, &metadataEncoding, &version) {
 				break
 			}
-			q, err := getQueueFromMetadata(request.QueueType, queueName, metadataBytes, metadataEncoding, version)
+			q, err := getQueueFromMetadata(request.QueueType, queueName, metadataBytes, metadataEncoding, version, s.compressor)
 			if err != nil {
 				return nil, err
 			}

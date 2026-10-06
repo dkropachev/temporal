@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"slices"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	cql "github.com/gocql/gocql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,6 +21,7 @@ import (
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
+	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/cassandra"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
@@ -26,6 +29,7 @@ import (
 	"go.temporal.io/server/common/persistence/persistencetest"
 	"go.temporal.io/server/common/persistence/serialization"
 	_ "go.temporal.io/server/common/persistence/sql/sqlplugin/mysql"
+	"go.temporal.io/server/common/resolver"
 )
 
 type (
@@ -137,6 +141,60 @@ func TestCassandraShardStoreSuite(t *testing.T) {
 		testData.Logger,
 	)
 	suite.Run(t, s)
+}
+
+func TestCassandraBlobCompressionShardStore(t *testing.T) {
+	t.Parallel()
+	testData, tearDown := setUpCassandraTestWithBlobCompression(t, true)
+	defer tearDown()
+
+	shardStore, err := testData.Factory.NewShardStore()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	shardID := int32(32001)
+	shardInfo := persistence.NewDataBlob(
+		bytes.Repeat([]byte("compressible-shard-info-"), 1024),
+		enumspb.ENCODING_TYPE_PROTO3.String(),
+	)
+	resp, err := shardStore.GetOrCreateShard(ctx, &persistence.InternalGetOrCreateShardRequest{
+		ShardID:          shardID,
+		LifecycleContext: ctx,
+		CreateShardInfo: func() (int64, *commonpb.DataBlob, error) {
+			return 1, shardInfo, nil
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, shardInfo, resp.ShardInfo)
+
+	resp, err = shardStore.GetOrCreateShard(ctx, &persistence.InternalGetOrCreateShardRequest{
+		ShardID:          shardID,
+		LifecycleContext: ctx,
+	})
+	require.NoError(t, err)
+	require.Equal(t, shardInfo, resp.ShardInfo)
+
+	rawSession, err := gocql.NewSession(
+		func() (*cql.ClusterConfig, error) {
+			return gocql.NewCassandraCluster(*testData.Cfg, resolver.NewNoopResolver())
+		},
+		testData.Logger,
+		metrics.NoopMetricsHandler,
+	)
+	require.NoError(t, err)
+	defer rawSession.Close()
+
+	var rawShard []byte
+	var rawEncoding string
+	err = rawSession.Query(
+		`SELECT shard, shard_encoding FROM executions WHERE shard_id = ? AND type = ? LIMIT 1`,
+		shardID,
+		0,
+	).WithContext(ctx).Scan(&rawShard, &rawEncoding)
+	require.NoError(t, err)
+	require.Equal(t, enumspb.ENCODING_TYPE_PROTO3.String(), rawEncoding)
+	require.True(t, bytes.HasPrefix(rawShard, []byte{0x89, 'T', 'C', 'B', 'L', 'O', 'B', '\n'}))
+	require.NotEqual(t, shardInfo.Data, rawShard)
 }
 
 func TestCassandraExecutionMutableStateStoreSuite(t *testing.T) {
