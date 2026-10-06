@@ -18,6 +18,8 @@ import (
 	"go.temporal.io/server/common/resolver"
 )
 
+const defaultMaxPreparedStmts = 6000
+
 func NewCassandraCluster(
 	cfg config.Cassandra,
 	resolver resolver.ServiceResolver,
@@ -126,6 +128,10 @@ func ConfigureCassandraCluster(cfg config.Cassandra, cluster *gocql.ClusterConfi
 
 	if cfg.MaxConns > 0 {
 		cluster.NumConns = cfg.MaxConns
+	}
+	cluster.MaxPreparedStmts = defaultMaxPreparedStmts
+	if cfg.MaxPreparedStmts > 0 {
+		cluster.MaxPreparedStmts = cfg.MaxPreparedStmts
 	}
 
 	cluster.ConnectTimeout = 10 * time.Second * debug.TimeoutMultiplier

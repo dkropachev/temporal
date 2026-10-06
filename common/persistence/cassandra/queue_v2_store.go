@@ -1,6 +1,7 @@
 package cassandra
 
 import (
+	stdbytes "bytes"
 	"context"
 	"fmt"
 
@@ -477,14 +478,15 @@ func (s *queueV2Store) ListQueues(
 	// only on queue_type. Keep fetching pages until we have enough rows or
 	// exhaust the result set.
 	var queues []persistence.QueueInfo
-	pageToken := request.NextPageToken
+	nextPageToken := request.NextPageToken
 
 	for len(queues) < request.PageSize {
+		initialQueueCount := len(queues)
 		remaining := request.PageSize - len(queues)
 		iter := s.session.Query(
 			templateGetQueueNamesQuery,
 			request.QueueType,
-		).PageSize(remaining).PageState(pageToken).WithContext(ctx).Iter()
+		).PageSize(remaining).PageState(nextPageToken).WithContext(ctx).Iter()
 
 		for {
 			var (
@@ -514,17 +516,23 @@ func (s *queueV2Store) ListQueues(
 				LastMessageID: lastMessageID,
 			})
 		}
-		pageToken = iter.PageState()
+		iterPageToken := iter.PageState()
 		if err := iter.Close(); err != nil {
 			return nil, gocql.ConvertError("QueueV2ListQueues", err)
 		}
-		if len(pageToken) == 0 {
+		if len(iterPageToken) == 0 {
+			nextPageToken = nil
 			break
 		}
+		if stdbytes.Equal(iterPageToken, nextPageToken) && len(queues) == initialQueueCount {
+			nextPageToken = nil
+			break
+		}
+		nextPageToken = iterPageToken
 	}
 
 	return &persistence.InternalListQueuesResponse{
 		Queues:        queues,
-		NextPageToken: pageToken,
+		NextPageToken: nextPageToken,
 	}, nil
 }

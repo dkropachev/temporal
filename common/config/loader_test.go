@@ -162,6 +162,37 @@ services:
 	}
 }
 
+func TestLoadEmbeddedCassandraMaxPreparedStmts(t *testing.T) {
+	testCases := []struct {
+		name     string
+		envValue string
+		expected int
+	}{
+		{
+			name:     "default",
+			envValue: "",
+			expected: 6000,
+		},
+		{
+			name:     "override",
+			envValue: "1234",
+			expected: 1234,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DB", "cassandra")
+			t.Setenv("CASSANDRA_SEEDS", "127.0.0.1")
+			t.Setenv("CASSANDRA_MAX_PREPARED_STMTS", tc.envValue)
+
+			cfg, err := Load(WithEmbedded())
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, cfg.Persistence.DataStores["default"].Cassandra.MaxPreparedStmts)
+		})
+	}
+}
+
 func createFile(t *testing.T, dir string, file string, uid, uid2 string) {
 	err := os.WriteFile(path(dir, file), []byte(buildConfig(uid, uid2)), fileMode)
 	require.NoError(t, err)

@@ -159,6 +159,9 @@ func TestMixedBrain(t *testing.T) {
 			ClusterEndpoint: devserver.ClusterEndpoint{
 				RPCAddress: currentSrv.FrontendHostPort(),
 			},
+			DynamicConfigValues: map[string]any{
+				"activity.enableStandalone": true,
+			},
 		})
 	})
 	if t.Failed() {
